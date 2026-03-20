@@ -22,6 +22,17 @@ navigation:
     contents:
       - page: Quickstart
         path: ../pages-dev/getting-started/quickstart.md
+      - page: Introduction
+        path: ../pages-dev/getting-started/introduction.md
+      - page: Local Installation
+        path: ../pages-dev/getting-started/local-installation.md
+      - page: Building from Source
+        path: ../pages-dev/getting-started/building-from-source.md
+      - page: Contribution Guide
+        path: ../pages-dev/contribution-guide.md
+  # ==================== Resources ====================
+  - section: Resources
+    contents:
       - page: Support Matrix
         path: ../pages-dev/reference/support-matrix.md
       - page: Feature Matrix
@@ -30,6 +41,8 @@ navigation:
         path: ../pages-dev/reference/release-artifacts.md
       - page: Examples
         path: ../pages-dev/getting-started/examples.md
+      - page: Glossary
+        path: ../pages-dev/reference/glossary.md
   # ==================== Kubernetes Deployment ====================
   - section: Kubernetes Deployment
     contents:
@@ -38,6 +51,8 @@ navigation:
         contents:
           - page: Detailed Installation Guide
             path: ../pages-dev/kubernetes/installation-guide.md
+          - page: Deploying Your First Model
+            path: ../pages-dev/kubernetes/dgdr.md
           - page: Dynamo Operator
             path: ../pages-dev/kubernetes/dynamo-operator.md
           - page: Service Discovery
@@ -50,13 +65,14 @@ navigation:
             path: ../pages-dev/kubernetes/deployment/dynamomodel-guide.md
           - page: Autoscaling
             path: ../pages-dev/kubernetes/autoscaling.md
+          - page: Rolling Update
+            path: ../pages-dev/kubernetes/rolling-update.md
+          - page: Developing with Tilt
+            path: ../pages-dev/kubernetes/tilt-dev-setup.md
           - page: Inference Gateway (GAIE)
             path: ../pages-dev/kubernetes/inference-gateway.md
-          - section: Checkpointing
-            path: ../pages-dev/kubernetes/snapshot/README.md
-            contents:
-              - page: Integration with Dynamo
-                path: ../pages-dev/kubernetes/snapshot/dynamo.md
+          - page: Snapshot
+            path: ../pages-dev/kubernetes/snapshot.md
       - section: Observability (K8s)
         contents:
           - page: Metrics
@@ -82,30 +98,42 @@ navigation:
         path: ../pages-dev/components/kvbm/kvbm-guide.md
       - page: Dynamo Benchmarking
         path: ../pages-dev/benchmarks/benchmarking.md
-      - section: Multimodal Model Serving
+      - section: Testing
         contents:
-          - section: Vision Language Models (VLMs)
-            path: ../pages-dev/features/multimodal/README.md
-            contents:
-              - page: Embedding Cache
-                path: ../pages-dev/features/multimodal/embedding-cache.md
-              - page: Encoder Disaggregation
-                path: ../pages-dev/features/multimodal/encoder-disaggregation.md
-              - page: Multimodal KV Routing
-                path: ../pages-dev/features/multimodal/multimodal-kv-routing.md
-          - section: Diffusion (Experimental)
-            path: ../pages-dev/features/multimodal/diffusion.md
-            contents:
-              - page: vLLM-Omni
-                path: ../pages-dev/backends/vllm/vllm-omni.md
-              - page: SGLang Diffusion
-                path: ../pages-dev/backends/sglang/sglang-diffusion.md
-              - page: TRT-LLM Diffusion
-                path: ../pages-dev/backends/trtllm/trtllm-video-diffusion.md
+          - page: Mocker
+            path: ../pages-dev/mocker/mocker.md
+      - section: Multimodal
+        path: ../pages-dev/features/multimodal/README.md
+        contents:
+          - page: Embedding Cache
+            path: ../pages-dev/features/multimodal/embedding-cache.md
+          - page: Encoder Disaggregation
+            path: ../pages-dev/features/multimodal/encoder-disaggregation.md
+          - page: Multimodal KV Routing
+            path: ../pages-dev/features/multimodal/multimodal-kv-routing.md
+      - section: Diffusion (Preview)
+        slug: diffusion
+        path: ../pages-dev/features/diffusion/README.md
+        contents:
+          - page: FastVideo
+            slug: fastvideo
+            path: ../pages-dev/features/diffusion/fastvideo.md
+          - page: vLLM-Omni
+            path: ../pages-dev/backends/vllm/vllm-omni.md
+          - page: SGLang Diffusion
+            path: ../pages-dev/backends/sglang/sglang-diffusion.md
+          - page: TRT-LLM Diffusion
+            path: ../pages-dev/backends/trtllm/trtllm-video-diffusion.md
       - page: Tool Calling
         path: ../pages-dev/agents/tool-calling.md
       - page: LoRA Adapters
         path: ../pages-dev/features/lora/README.md
+      - section: Agents
+        slug: agents
+        path: ../pages-dev/features/agentic_workloads.md
+        contents:
+          - page: SGLang for Agentic Workloads
+            path: ../pages-dev/backends/sglang/agents.md
       - section: Observability (Local)
         path: ../pages-dev/observability/README.md
         contents:
@@ -128,13 +156,13 @@ navigation:
             path: ../pages-dev/fault-tolerance/request-migration.md
           - page: Request Cancellation
             path: ../pages-dev/fault-tolerance/request-cancellation.md
-          - page: Graceful Shutdown
-            path: ../pages-dev/fault-tolerance/graceful-shutdown.md
           - page: Request Rejection
             path: ../pages-dev/fault-tolerance/request-rejection.md
+          - page: Graceful Shutdown
+            path: ../pages-dev/fault-tolerance/graceful-shutdown.md
           - page: Testing
             path: ../pages-dev/fault-tolerance/testing.md
-      - page: Writing Python Workers in Dynamo
+      - page: Writing Python Workers
         path: ../pages-dev/development/backend-guide.md
   # ==================== Backends ====================
   - section: Backends
@@ -144,6 +172,8 @@ navigation:
         contents:
           - page: Reference Guide
             path: ../pages-dev/backends/sglang/sglang-reference-guide.md
+          - page: Chat Processor
+            path: ../pages-dev/backends/sglang/sglang-chat-processor.md
           - page: Examples
             path: ../pages-dev/backends/sglang/sglang-examples.md
           - page: Disaggregation
@@ -227,24 +257,31 @@ navigation:
         path: ../pages-dev/design-docs/disagg-serving.md
       - page: Distributed Runtime
         path: ../pages-dev/design-docs/distributed-runtime.md
-      - page: Discovery Plane
-        path: ../pages-dev/design-docs/discovery-plane.md
-      - page: Request Plane
-        path: ../pages-dev/design-docs/request-plane.md
-      - page: Event Plane
-        path: ../pages-dev/design-docs/event-plane.md
-      - page: Router Design
-        path: ../pages-dev/design-docs/router-design.md
-      - page: KVBM Design
-        path: ../pages-dev/design-docs/kvbm-design.md
-      - page: Planner Design
-        path: ../pages-dev/design-docs/planner-design.md
+      - section: Communication Planes
+        contents:
+          - page: Discovery Plane
+            path: ../pages-dev/design-docs/discovery-plane.md
+          - page: Request Plane
+            path: ../pages-dev/design-docs/request-plane.md
+          - page: Event Plane
+            path: ../pages-dev/design-docs/event-plane.md
+      - section: Component Design
+        contents:
+          - page: Router Design
+            path: ../pages-dev/design-docs/router-design.md
+          - page: KVBM Design
+            path: ../pages-dev/design-docs/kvbm-design.md
+          - page: Planner Design
+            path: ../pages-dev/design-docs/planner-design.md
   # ==================== Blog ====================
   - section: Blog
-    hidden: true
+    collapsed: true
     path: ../blogs/index.mdx
     slug: blog
     contents:
+      - page: "Full-Stack Optimizations for Agentic Inference"
+        path: ../blogs/agentic-inference/agentic-inference.md
+        slug: agentic-inference
       - page: "Flash Indexer: Inter-Galactic KV Routing"
         path: ../blogs/flash-indexer/flash-indexer.md
         slug: flash-indexer
@@ -299,10 +336,11 @@ navigation:
       - page: Model Caching with Fluid
         path: ../pages-dev/kubernetes/model-caching-with-fluid.md
       # -- Reference --
-      - page: Glossary
-        path: ../pages-dev/reference/glossary.md
       - page: Tuning Disaggregated Performance
         path: ../pages-dev/performance/tuning.md
+      # -- Frontend (hidden sub-pages) --
+      - page: NVIDIA Request Extensions (nvext)
+        path: ../pages-dev/components/frontend/nvext.md
       # -- Backend detail pages --
       - section: vLLM Details
         contents:
