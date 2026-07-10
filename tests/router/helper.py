@@ -146,41 +146,56 @@ def verify_response_worker_ids(
     )
 
 
-def verify_response_timing(timing_info: dict[str, Any], disagg: bool = False) -> None:
-    """Verify timing info has valid values (ttft_ms > 0, total_time_ms > 0).
-
-    Args:
-        timing_info: Dict of timing fields from nvext.timing in the response.
-        disagg: If True, also verify kv_transfer_estimated_latency_ms > 0 (disaggregated mode only).
-    """
+def verify_response_timing(
+    timing_info: dict[str, Any],
+    disagg: bool = False,
+    *,
+    require_ttft: bool = True,
+    require_kv_transfer_latency: bool = True,
+) -> None:
+    """Verify response timing, with explicit controls for optional fields."""
     ttft_ms = timing_info.get("ttft_ms")
     total_time_ms = timing_info.get("total_time_ms")
 
-    assert ttft_ms is not None and ttft_ms > 0, f"Expected ttft_ms > 0, got: {ttft_ms}"
     assert (
         total_time_ms is not None and total_time_ms > 0
     ), f"Expected total_time_ms > 0, got: {total_time_ms}"
-    assert (
-        total_time_ms >= ttft_ms
-    ), f"Expected total_time_ms >= ttft_ms, got {total_time_ms} < {ttft_ms}"
+    if require_ttft:
+        assert ttft_ms is not None and ttft_ms > 0, (
+            f"Expected ttft_ms > 0, got: {ttft_ms}"
+        )
+    if ttft_ms is not None:
+        assert ttft_ms > 0, f"Expected present ttft_ms > 0, got: {ttft_ms}"
+        assert total_time_ms >= ttft_ms, (
+            f"Expected total_time_ms >= ttft_ms, got {total_time_ms} < {ttft_ms}"
+        )
     logger.info(
-        f"✓ Verified timing: ttft_ms={ttft_ms:.2f}, total_time_ms={total_time_ms:.2f}"
+        "✓ Verified timing: ttft_ms=%s, total_time_ms=%.2f",
+        f"{ttft_ms:.2f}" if ttft_ms is not None else "absent",
+        total_time_ms,
     )
 
     if disagg:
         kv_transfer_estimated_latency_ms = timing_info.get(
             "kv_transfer_estimated_latency_ms"
         )
-        assert (
-            kv_transfer_estimated_latency_ms is not None
-            and kv_transfer_estimated_latency_ms > 0
-        ), (
-            f"Expected kv_transfer_estimated_latency_ms > 0 in disaggregated mode, "
-            f"got: {kv_transfer_estimated_latency_ms}"
-        )
-        logger.info(
-            f"✓ Verified kv_transfer_estimated_latency_ms={kv_transfer_estimated_latency_ms:.2f}"
-        )
+        if require_kv_transfer_latency:
+            assert (
+                kv_transfer_estimated_latency_ms is not None
+                and kv_transfer_estimated_latency_ms > 0
+            ), (
+                "Expected kv_transfer_estimated_latency_ms > 0 in "
+                f"disaggregated mode, got: {kv_transfer_estimated_latency_ms}"
+            )
+        if kv_transfer_estimated_latency_ms is not None:
+            assert kv_transfer_estimated_latency_ms > 0, (
+                "Expected present kv_transfer_estimated_latency_ms > 0, got: "
+                f"{kv_transfer_estimated_latency_ms}"
+            )
+            logger.info(
+                "✓ Verified kv_transfer_estimated_latency_ms=%.2f",
+                kv_transfer_estimated_latency_ms,
+            )
 
 
 ########################################################
