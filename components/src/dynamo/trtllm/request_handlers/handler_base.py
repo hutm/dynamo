@@ -40,6 +40,10 @@ from dynamo.common.constants import DisaggregationMode as CommonDisaggregationMo
 from dynamo.common.multimodal.cache_uuid import reject_unsupported_multimodal_uuids
 from dynamo.common.gms_failover import release_attached_gms_failover_lock
 from dynamo.common.utils.structural_tag import serialize_structural_tag
+from dynamo.gms_router_policy import (
+    maybe_fetch_gms_placement,
+    resolve_env_gms_daemon_socket,
+)
 from dynamo.health_check import HEALTH_CHECK_KEY
 from dynamo.llm.exceptions import EngineShutdown
 from dynamo.logits_processing.examples import HelloWorldLogitsProcessor
@@ -1119,6 +1123,16 @@ class HandlerBase(BaseGenerativeHandler):
                 request_id,
             )
             request["disaggregated_params"] = {"request_type": "context_and_generation"}
+
+        await maybe_fetch_gms_placement(
+            request,
+            resolve_env_gms_daemon_socket(
+                "GMS_TRTLLM_DAEMON_SOCKET",
+                default_when_cross_node="/tmp/gms.sock",
+            ),
+            logger=logging.getLogger(__name__),
+            request_id=context.id(),
+        )
 
         # Setup disaggregated params based on PREFILL/DECODE mode
         (

@@ -18,9 +18,9 @@ use dynamo_kv_router::{
     },
     protocols::KV_EVENT_SUBJECT,
     protocols::{
-        BlockExtraInfo, BlockHashOptions, LocalBlockHash, PrefillLoadHint, RouterEvent,
-        RouterRequest, RouterResponse, RoutingConstraints, TokensWithHashes, WorkerConfigLike,
-        WorkerId, WorkerWithDpRank, compute_block_hash_for_seq,
+        BlockExtraInfo, BlockHashOptions, GmsPlacementMatch, LocalBlockHash, PrefillLoadHint,
+        RouterEvent, RouterRequest, RouterResponse, RoutingConstraints, TokensWithHashes,
+        WorkerConfigLike, WorkerId, WorkerWithDpRank, compute_block_hash_for_seq,
     },
     router_hint::{RouterHint, RouterHintCandidateSource, RouterHintRootCandidates},
     scheduling::{
@@ -44,6 +44,7 @@ use dynamo_runtime::{
     traits::DistributedRuntimeProvider,
 };
 use futures::stream;
+use sha2::{Digest, Sha256};
 use tracing::Instrument;
 
 // Re-export from dynamo-kv-router crate
@@ -78,12 +79,13 @@ pub use routing_load::{
 };
 
 use crate::{
-    discovery::{KvSourceMembershipWatch, RuntimeConfigWatch},
+    discovery::{KvSourceMembershipWatch, RuntimeConfigWatch, WORKER_TYPE_DECODE},
     kv_router::{
         scheduler::{DefaultWorkerSelector, KvScheduler, PotentialLoad},
         sequence::{SequenceError, SequenceRequest},
     },
     local_model::runtime_config::ModelRuntimeConfig,
+    protocols::common::preprocessor::{GmsBlockDescriptor, GmsMemoryRegion, GmsPlacementInfo},
     worker_type::WorkerType,
 };
 use route_lookup::{
@@ -354,6 +356,8 @@ pub enum FindBestMatchOutcome {
         potential_decode_blocks: u64,
         routing_hashes: Option<RoutingDecisionHashes>,
         router_hint: Option<RouterHint>,
+        gms_transfer: Option<GmsTransferDecision>,
+        gms_placement: Option<Box<GmsPlacementInfo>>,
     },
     QueueRejected {
         rejection: scheduling::QueueRejection,
@@ -447,6 +451,136 @@ pub const RADIX_STATE_FILE: &str = "radix-state";
 
 // for worker-local kvindexer query
 pub const WORKER_KV_INDEXER_BUFFER_SIZE: usize = 1024; // store 1024 most recent events in worker buffer
+
+#[derive(Debug, Clone, Copy)]
+pub struct GmsTransferDecision {
+    pub source_worker: WorkerWithDpRank,
+    pub destination_worker: WorkerWithDpRank,
+    pub source_overlap_blocks: f64,
+    pub source_load_blocks: usize,
+    pub destination_load_blocks: usize,
+}
+
+type GmsTransferCandidate = GmsTransferDecision;
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn gms_prefix_block_hashes_hex(
+    tokens: &[u32],
+    block_size: u32,
+    cache_salt: Option<&str>,
+) -> Vec<String> {
+    if block_size == 0 {
+        return Vec::new();
+    }
+    let block_size = block_size as usize;
+    let full_blocks = tokens.len() / block_size;
+    if full_blocks == 0 {
+        return Vec::new();
+    }
+
+    let salt = cache_salt.unwrap_or("").as_bytes();
+    let mut hasher = Sha256::new();
+    hasher.update(b"GMSKVRv1\0");
+    hasher.update((salt.len() as u32).to_be_bytes());
+    hasher.update(salt);
+    hasher.update((block_size as u32).to_be_bytes());
+
+    let mut hashes = Vec::with_capacity(full_blocks);
+    for block in tokens.chunks_exact(block_size) {
+        for token in block {
+            hasher.update((*token as u64).to_be_bytes());
+        }
+        let digest = hasher.clone().finalize();
+        hashes.push(hex_encode(&digest));
+    }
+
+    hashes
+}
+
+fn gms_worker_load_score(load: &PotentialLoad, block_size: u32) -> usize {
+    let block_size = block_size.max(1) as usize;
+    load.potential_decode_blocks + load.potential_prefill_tokens.div_ceil(block_size)
+}
+
+fn gms_decode_transfer_allowed(
+    worker_type: &str,
+    kv_router_config: &KvRouterConfig,
+    router_config_override: Option<&RouterConfigOverride>,
+) -> bool {
+    let overlap_score_credit = router_config_override
+        .and_then(|config| config.overlap_score_credit)
+        .unwrap_or(kv_router_config.overlap_score_credit);
+
+    kv_router_config.router_gms_decode_transfer
+        && worker_type == WORKER_TYPE_DECODE
+        && overlap_score_credit > 0.0
+        && kv_router_config.assume_kv_reuse(router_config_override)
+        && kv_router_config.track_prefill_tokens(router_config_override)
+}
+
+fn choose_gms_transfer_candidate(
+    cache_hit_estimates: &CacheHitEstimates,
+    potential_loads: &[PotentialLoad],
+    block_size: u32,
+    eligible_workers: &HashSet<WorkerWithDpRank>,
+    pinned_worker: Option<WorkerWithDpRank>,
+    allowed_worker_ids: Option<&HashSet<WorkerId>>,
+) -> Option<GmsTransferCandidate> {
+    if pinned_worker.is_some() || eligible_workers.len() < 2 {
+        return None;
+    }
+
+    let is_allowed = |worker: WorkerWithDpRank| {
+        allowed_worker_ids.is_none_or(|ids| ids.contains(&worker.worker_id))
+    };
+
+    let (&source_worker, &source_overlap_blocks) = cache_hit_estimates
+        .effective_overlap_blocks
+        .iter()
+        .filter(|(worker, overlap)| {
+            **overlap > 0.0 && eligible_workers.contains(worker) && is_allowed(**worker)
+        })
+        .max_by(|(_, left), (_, right)| left.total_cmp(right))?;
+
+    let load_for_worker: HashMap<WorkerWithDpRank, &PotentialLoad> = potential_loads
+        .iter()
+        .map(|load| (WorkerWithDpRank::new(load.worker_id, load.dp_rank), load))
+        .collect();
+    let source_load = *load_for_worker.get(&source_worker)?;
+    let source_load_blocks = gms_worker_load_score(source_load, block_size);
+
+    let destination_load = potential_loads
+        .iter()
+        .filter(|load| {
+            let worker = WorkerWithDpRank::new(load.worker_id, load.dp_rank);
+            eligible_workers.contains(&worker) && is_allowed(worker)
+        })
+        .min_by_key(|load| gms_worker_load_score(load, block_size))?;
+    let destination_worker =
+        WorkerWithDpRank::new(destination_load.worker_id, destination_load.dp_rank);
+    let destination_load_blocks = gms_worker_load_score(destination_load, block_size);
+
+    if destination_worker == source_worker || source_load_blocks <= destination_load_blocks {
+        return None;
+    }
+
+    Some(GmsTransferCandidate {
+        source_worker,
+        destination_worker,
+        source_overlap_blocks,
+        source_load_blocks,
+        destination_load_blocks,
+    })
+}
+
+fn cached_tokens_from_effective_overlap(block_size: u32, effective_overlap_blocks: f64) -> usize {
+    (effective_overlap_blocks * block_size as f64)
+        .round()
+        .max(0.0) as usize
+}
 
 fn map_scheduler_error(error: scheduling::KvSchedulerError) -> anyhow::Error {
     // Keep the two overload cases apart. A single overloaded worker can be
@@ -1089,6 +1223,79 @@ where
         })
     }
 
+    fn gms_eligible_workers(&self) -> HashSet<WorkerWithDpRank> {
+        let configs = self.workers_with_configs.borrow();
+        let mut workers = HashSet::new();
+        for (worker_id, config) in configs.iter() {
+            let Some(runtime) = config.gms_runtime_config() else {
+                continue;
+            };
+            if !runtime.control_enabled {
+                continue;
+            }
+            for dp_rank_offset in 0..config.data_parallel_size.max(1) {
+                workers.insert(WorkerWithDpRank::new(
+                    *worker_id,
+                    config.data_parallel_start_rank + dp_rank_offset,
+                ));
+            }
+        }
+        workers
+    }
+
+    fn gms_placement_from_indexed_match(
+        &self,
+        hashes: Vec<String>,
+        placement: GmsPlacementMatch,
+    ) -> Option<GmsPlacementInfo> {
+        if hashes.is_empty() || placement.source_nixl_agent_name.is_empty() {
+            return None;
+        }
+        if placement.descriptors.len() != hashes.len() {
+            tracing::debug!(
+                expected = hashes.len(),
+                actual = placement.descriptors.len(),
+                "GMS placement index returned descriptor count mismatch"
+            );
+            return None;
+        }
+        if placement.descriptors.iter().all(Option::is_none) {
+            return None;
+        }
+
+        Some(GmsPlacementInfo {
+            source_nixl_agent_name: placement.source_nixl_agent_name,
+            source_nixl_agent_metadata_hex: placement.source_nixl_agent_metadata_hex,
+            source_nixl_ip: placement.source_nixl_ip,
+            source_nixl_listen_port: placement.source_nixl_listen_port,
+            descriptors: placement
+                .descriptors
+                .into_iter()
+                .map(|descriptor| {
+                    descriptor.map(|descriptor| GmsBlockDescriptor {
+                        remote_ptr: descriptor.remote_ptr,
+                        size: descriptor.size,
+                        tier: descriptor.tier,
+                        ranges: descriptor
+                            .ranges
+                            .into_iter()
+                            .map(|region| GmsMemoryRegion {
+                                remote_ptr: region.remote_ptr,
+                                size: region.size,
+                                tier: region.tier,
+                                layer: region.layer,
+                                offset: region.offset,
+                            })
+                            .collect(),
+                        generation: descriptor.generation,
+                        sealed: descriptor.sealed,
+                    })
+                })
+                .collect(),
+            hashes,
+        })
+    }
+
     pub async fn record_routing_decision(
         &self,
         mut tokens_with_hashes: TokensWithHashes,
@@ -1597,6 +1804,21 @@ where
             });
         }
 
+        // GMS decode-to-decode transfer uses the same KV event/indexer plane as
+        // normal routing. When enabled, include stable GMS content hashes in
+        // the index query so local and served-indexer modes can attach any
+        // already-published NIXL descriptors to the tiered match result.
+        let allow_gms_decode_transfer = gms_decode_transfer_allowed(
+            self.scheduler.worker_type(),
+            &self.kv_router_config,
+            router_config_override,
+        );
+        let gms_content_hashes = (update_states
+            && is_admitted_routing
+            && pinned_worker.is_none()
+            && allow_gms_decode_transfer)
+            .then(|| gms_prefix_block_hashes_hex(tokens, self.block_size, None));
+
         let TieredLookupResult {
             tiered_matches,
             shared_cache_hits,
@@ -1613,6 +1835,7 @@ where
                 cache_namespace: cache_namespace.as_deref(),
                 retain_block_hashes,
                 retain_router_hint_chain,
+                gms_content_hashes_hex: gms_content_hashes.as_deref(),
             },
         )
         .await?;
@@ -1627,6 +1850,24 @@ where
             })
             .unwrap_or((None, None));
 
+        // Keep the GMS-only placement inputs across the scheduler await without
+        // retaining the full indexer response. The unified scheduler still owns
+        // admission and queueing; GMS only supplies an optional pinned worker.
+        let gms_lookup = (update_states
+            && is_admitted_routing
+            && pinned_worker.is_none()
+            && allow_gms_decode_transfer)
+            .then(|| {
+                (
+                    cache_hit_estimates_from_tiered_matches(
+                        &self.kv_router_config,
+                        self.block_size,
+                        &tiered_matches,
+                    ),
+                    tiered_matches.gms_placements.clone(),
+                )
+            });
+
         let overlap =
             OverlapAnalysis::new(&self.kv_router_config, self.block_size, &tiered_matches)
                 .signals();
@@ -1636,12 +1877,6 @@ where
         drop(tiered_matches);
         let find_matches_elapsed = start.elapsed();
 
-        // Capture shared cache info for metrics before moving into schedule().
-        // Clone the hits so we can compute `hits_beyond(overlap_blocks)` after
-        // scheduling returns, since `overlap_blocks` isn't known until then.
-        let num_blocks = isl_tokens / self.block_size as usize;
-        let sc_hits_for_metrics = shared_cache_hits.clone();
-
         // LoRA-aware candidate narrowing: restrict to this LoRA's allocated/loaded replicas,
         // strictly within the existing candidate universe (never widening). Covers both the
         // decode and prefill routers, since both flow through this method.
@@ -1650,6 +1885,63 @@ where
             allowed_worker_ids,
             pinned_worker.as_ref(),
         );
+
+        // Reference GMS decode-to-decode policy: when the worker holding the
+        // best KV prefix is busier than another GMS-backed worker, route the
+        // request to the least busy GMS-backed worker and attach placement
+        // metadata so that worker can pull the prefix from the source daemon.
+        // Keep this aligned with vanilla Dynamo UX: only agg-like main decode
+        // routing enables it. Disaggregated prefill/decode routing disables KV
+        // reuse/overlap scoring through router overrides and should not trigger
+        // decode-to-decode GMS movement.
+        let track_prefill_tokens = self
+            .kv_router_config
+            .track_prefill_tokens(router_config_override);
+        let gms_candidate = if let Some((cache_hit_estimates, gms_placements)) = &gms_lookup {
+            let potential_loads = self.scheduler.get_potential_loads(
+                maybe_seq_hashes.clone(),
+                isl_tokens,
+                cache_hit_estimates
+                    .cached_tokens
+                    .clone()
+                    .into_iter()
+                    .collect(),
+                track_prefill_tokens,
+            );
+            let eligible_workers = self.gms_eligible_workers();
+            choose_gms_transfer_candidate(
+                cache_hit_estimates,
+                &potential_loads,
+                self.block_size,
+                &eligible_workers,
+                pinned_worker,
+                allowed_worker_ids.as_ref(),
+            )
+            .and_then(|candidate| {
+                let overlap_blocks = candidate.source_overlap_blocks.floor().max(0.0) as usize;
+                let hashes: Vec<String> = gms_content_hashes
+                    .as_ref()
+                    .map(|hashes| hashes.iter().take(overlap_blocks).cloned().collect())
+                    .unwrap_or_default();
+                gms_placements
+                    .get(&candidate.source_worker)
+                    .cloned()
+                    .and_then(|placement| self.gms_placement_from_indexed_match(hashes, placement))
+                    .map(|placement| (candidate, Box::new(placement)))
+            })
+        } else {
+            None
+        };
+        let scheduler_pinned_worker = gms_candidate
+            .as_ref()
+            .map(|(candidate, _)| candidate.destination_worker)
+            .or(pinned_worker);
+
+        // Capture shared cache info for metrics before moving into schedule().
+        // Clone the hits so we can compute `hits_beyond(overlap_blocks)` after
+        // scheduling returns, since `overlap_blocks` isn't known until then.
+        let num_blocks = isl_tokens / self.block_size as usize;
+        let sc_hits_for_metrics = shared_cache_hits.clone();
 
         let schedule_request = ScheduleRequest {
             mode,
@@ -1667,7 +1959,7 @@ where
             session_context,
             expected_output_tokens,
             affinity_target,
-            pinned_worker,
+            pinned_worker: scheduler_pinned_worker,
             allowed_worker_ids,
             routing_constraints,
             shared_cache_hits,
@@ -1719,6 +2011,41 @@ where
             None
         };
 
+        let mut selected_cache_hit = WorkerCacheHitEstimate {
+            effective_overlap_blocks: response.effective_overlap_blocks,
+        };
+        let mut selected_cached_tokens = response.cached_tokens;
+        let mut gms_transfer = None;
+        let mut gms_placement = None;
+        if let Some((candidate, placement)) = gms_candidate
+            && candidate.destination_worker == response.best_worker
+        {
+            selected_cache_hit = WorkerCacheHitEstimate {
+                effective_overlap_blocks: candidate.source_overlap_blocks,
+            };
+            selected_cached_tokens = cached_tokens_from_effective_overlap(
+                self.block_size,
+                candidate.source_overlap_blocks,
+            );
+            gms_transfer = Some(GmsTransferDecision {
+                source_worker: candidate.source_worker,
+                destination_worker: candidate.destination_worker,
+                source_overlap_blocks: candidate.source_overlap_blocks,
+                source_load_blocks: candidate.source_load_blocks,
+                destination_load_blocks: candidate.destination_load_blocks,
+            });
+            gms_placement = Some(placement);
+            tracing::info!(
+                source_worker_id = candidate.source_worker.worker_id,
+                source_dp_rank = candidate.source_worker.dp_rank,
+                destination_worker_id = candidate.destination_worker.worker_id,
+                destination_dp_rank = candidate.destination_worker.dp_rank,
+                source_overlap_blocks = candidate.source_overlap_blocks,
+                source_load_blocks = candidate.source_load_blocks,
+                destination_load_blocks = candidate.destination_load_blocks,
+                "GMS router policy selected decode-to-decode KV transfer"
+            );
+        }
         let total_elapsed = start.elapsed();
         let routing_hashes = routing_block_hashes.map(RoutingDecisionHashes::from_local_hashes);
 
@@ -1743,7 +2070,7 @@ where
                 m.shared_cache_hit_rate
                     .observe(hits.total_hits as f64 / num_blocks as f64);
             }
-            let beyond = hits.hits_beyond(response.effective_overlap_blocks.round() as u32);
+            let beyond = hits.hits_beyond(selected_cache_hit.rounded_overlap_blocks());
             m.shared_cache_beyond_blocks.observe(beyond as f64);
         }
 
@@ -1763,12 +2090,14 @@ where
                 FindBestMatchInnerOutcome::WithAdmission(AdmittedFindBestMatchOutcome {
                     outcome: FindBestMatchOutcome::Routed {
                         worker: response.best_worker,
-                        overlap_blocks: response.effective_overlap_blocks.round() as u32,
-                        effective_overlap_blocks: response.effective_overlap_blocks,
-                        cached_tokens: response.cached_tokens,
+                        overlap_blocks: selected_cache_hit.rounded_overlap_blocks(),
+                        effective_overlap_blocks: selected_cache_hit.effective_overlap_blocks,
+                        cached_tokens: selected_cached_tokens,
                         potential_decode_blocks: response.potential_decode_blocks as u64,
                         routing_hashes,
                         router_hint,
+                        gms_transfer,
+                        gms_placement,
                     },
                     attempt,
                 }),
@@ -2375,6 +2704,7 @@ mod tests {
     use dynamo_runtime::{DistributedRuntime, Runtime, distributed::DistributedConfig};
     use tokio::sync::watch;
 
+    use crate::discovery::{WORKER_TYPE_DECODE, WORKER_TYPE_PREFILL};
     use crate::kv_router::scheduler::KvSchedulerError;
     use crate::local_model::runtime_config::ModelRuntimeConfig;
 
@@ -2539,6 +2869,180 @@ mod tests {
     }
 
     #[test]
+    fn gms_prefix_block_hashes_match_shared_contract() {
+        assert_eq!(
+            gms_prefix_block_hashes_hex(&[11, 12, 21, 22], 2, None),
+            vec![
+                "27633adc838d290bfe4130a375197a136e5645f3ff1bd0d5904da56154fbbba1".to_string(),
+                "bd4400b4f97544846c8f83979d2907c784d6715516ba7bbf3e9fbbfc68f2f723".to_string(),
+            ]
+        );
+        assert_eq!(
+            gms_prefix_block_hashes_hex(&[11, 12, 21, 22], 2, Some("salt")),
+            vec![
+                "acd28c255e6db179ed1d9b959db9aa5b2b9f649a8895f9035fad787cabb036cf".to_string(),
+                "8b35efff2c76c7bd0081b968c92f47555874da0312630d9682f5bc0ca5a1ec89".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn gms_decode_transfer_gate_skips_by_default() {
+        let config = KvRouterConfig::default();
+
+        assert!(!gms_decode_transfer_allowed(
+            WORKER_TYPE_DECODE,
+            &config,
+            None
+        ));
+    }
+
+    #[test]
+    fn gms_decode_transfer_gate_allows_explicitly_enabled_aggregated_decode() {
+        let config = KvRouterConfig {
+            router_gms_decode_transfer: true,
+            ..Default::default()
+        };
+
+        assert!(gms_decode_transfer_allowed(
+            WORKER_TYPE_DECODE,
+            &config,
+            None
+        ));
+    }
+
+    #[test]
+    fn gms_decode_transfer_gate_skips_disaggregated_decode_override() {
+        let config = KvRouterConfig {
+            router_gms_decode_transfer: true,
+            ..Default::default()
+        };
+        let disaggregated_decode_override = RouterConfigOverride {
+            overlap_score_credit: Some(0.0),
+            assume_kv_reuse: Some(false),
+            track_prefill_tokens: Some(false),
+            ..Default::default()
+        };
+
+        assert!(!gms_decode_transfer_allowed(
+            WORKER_TYPE_DECODE,
+            &config,
+            Some(&disaggregated_decode_override)
+        ));
+    }
+
+    #[test]
+    fn gms_decode_transfer_gate_skips_prefill_router() {
+        let config = KvRouterConfig {
+            router_gms_decode_transfer: true,
+            ..Default::default()
+        };
+
+        assert!(!gms_decode_transfer_allowed(
+            WORKER_TYPE_PREFILL,
+            &config,
+            None
+        ));
+    }
+
+    #[test]
+    fn gms_decode_transfer_gate_skips_when_overlap_scoring_is_disabled() {
+        let config = KvRouterConfig {
+            overlap_score_credit: 0.0,
+            router_gms_decode_transfer: true,
+            ..Default::default()
+        };
+
+        assert!(!gms_decode_transfer_allowed(
+            WORKER_TYPE_DECODE,
+            &config,
+            None
+        ));
+    }
+
+    #[test]
+    fn gms_transfer_policy_targets_least_busy_worker() {
+        let source = WorkerWithDpRank::new(0, 0);
+        let destination = WorkerWithDpRank::new(1, 0);
+        let cache_hit_estimates = CacheHitEstimates {
+            effective_overlap_blocks: [(source, 4.0)].into_iter().collect(),
+            cached_tokens: Default::default(),
+        };
+        let loads = vec![
+            PotentialLoad {
+                worker_id: source.worker_id,
+                dp_rank: source.dp_rank,
+                potential_prefill_tokens: 32,
+                potential_decode_blocks: 6,
+                active_requests: 0,
+            },
+            PotentialLoad {
+                worker_id: destination.worker_id,
+                dp_rank: destination.dp_rank,
+                potential_prefill_tokens: 0,
+                potential_decode_blocks: 1,
+                active_requests: 0,
+            },
+        ];
+        let eligible_workers = HashSet::from([source, destination]);
+
+        let candidate = choose_gms_transfer_candidate(
+            &cache_hit_estimates,
+            &loads,
+            16,
+            &eligible_workers,
+            None,
+            None,
+        )
+        .expect("expected GMS transfer candidate");
+
+        assert_eq!(candidate.source_worker, source);
+        assert_eq!(candidate.destination_worker, destination);
+        assert_eq!(candidate.source_overlap_blocks, 4.0);
+        assert_eq!(candidate.source_load_blocks, 8);
+        assert_eq!(candidate.destination_load_blocks, 1);
+    }
+
+    #[test]
+    fn gms_transfer_policy_skips_when_source_is_not_busier() {
+        let source = WorkerWithDpRank::new(0, 0);
+        let destination = WorkerWithDpRank::new(1, 0);
+        let cache_hit_estimates = CacheHitEstimates {
+            effective_overlap_blocks: [(source, 4.0)].into_iter().collect(),
+            cached_tokens: Default::default(),
+        };
+        let loads = vec![
+            PotentialLoad {
+                worker_id: source.worker_id,
+                dp_rank: source.dp_rank,
+                potential_prefill_tokens: 0,
+                potential_decode_blocks: 1,
+                active_requests: 0,
+            },
+            PotentialLoad {
+                worker_id: destination.worker_id,
+                dp_rank: destination.dp_rank,
+                potential_prefill_tokens: 0,
+                potential_decode_blocks: 4,
+                active_requests: 0,
+            },
+        ];
+        let eligible_workers = HashSet::from([source, destination]);
+
+        assert!(
+            choose_gms_transfer_candidate(
+                &cache_hit_estimates,
+                &loads,
+                16,
+                &eligible_workers,
+                None,
+                None,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn weighted_cache_hit_estimates_include_lower_tiers() {
         let worker_1 = WorkerWithDpRank::new(1, 0);
         let worker_2 = WorkerWithDpRank::new(2, 0);
@@ -2559,6 +3063,7 @@ mod tests {
                 (StorageTier::HostPinned, host_match_details),
                 (StorageTier::Disk, disk_match_details),
             ]),
+            gms_placements: Default::default(),
         };
 
         let estimates = cache_hit_estimates_from_tiered_matches(

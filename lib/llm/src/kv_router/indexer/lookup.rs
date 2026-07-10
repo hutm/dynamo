@@ -142,10 +142,24 @@ impl Indexer {
         sequence: Vec<LocalBlockHash>,
         gms_content_hashes_hex: Option<&[String]>,
     ) -> Result<TieredMatchDetails, KvRouterError> {
+        self.find_matches_by_tier_with_options_and_gms_placements(
+            sequence,
+            LowerTierQueryOptions::default(),
+            gms_content_hashes_hex,
+        )
+        .await
+    }
+
+    pub(crate) async fn find_matches_by_tier_with_options_and_gms_placements(
+        &self,
+        sequence: Vec<LocalBlockHash>,
+        lower_tier_options: LowerTierQueryOptions,
+        gms_content_hashes_hex: Option<&[String]>,
+    ) -> Result<TieredMatchDetails, KvRouterError> {
         self.lookup_pipeline()
             .find_matches_by_tier(
                 HashInput::Owned(sequence),
-                LowerTierQueryOptions::default(),
+                lower_tier_options,
                 gms_content_hashes_hex,
             )
             .await

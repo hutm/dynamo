@@ -24,7 +24,10 @@ use crate::{
     preprocessor::PreprocessedRequest,
     protocols::{
         TokenIdType,
-        common::{preprocessor::RoutingHints, timing::RequestPhase},
+        common::{
+            preprocessor::{GmsPlacementInfo, RoutingHints},
+            timing::RequestPhase,
+        },
     },
     session_affinity::AffinityTarget,
 };
@@ -39,6 +42,8 @@ pub(super) struct WorkerSelection {
     pub(super) selected_worker_load: Option<AdvisoryWorkerLoad>,
     pub(super) routing_hashes: Option<RoutingDecisionHashes>,
     pub(super) router_hint: Option<RouterHint>,
+    /// Optional GMS source metadata for a destination-side KV pull.
+    pub(super) gms_placement: Option<Box<GmsPlacementInfo>>,
 }
 
 pub(super) enum SelectionOutcome {
@@ -138,17 +143,35 @@ where
                     potential_decode_blocks,
                     routing_hashes,
                     router_hint,
-                } => Ok(SelectionOutcome::Routed(WorkerSelection {
-                    worker,
-                    attempt: admitted.attempt,
-                    overlap_amount: overlap_blocks,
-                    effective_overlap_blocks,
-                    cached_tokens,
-                    potential_decode_blocks,
-                    selected_worker_load: None,
-                    routing_hashes,
-                    router_hint,
-                })),
+                    gms_transfer,
+                    gms_placement,
+                } => {
+                    if let Some(transfer) = gms_transfer {
+                        tracing::debug!(
+                            request_id = %args.context_id,
+                            source_worker_id = transfer.source_worker.worker_id,
+                            source_dp_rank = transfer.source_worker.dp_rank,
+                            destination_worker_id = transfer.destination_worker.worker_id,
+                            destination_dp_rank = transfer.destination_worker.dp_rank,
+                            source_overlap_blocks = transfer.source_overlap_blocks,
+                            source_load_blocks = transfer.source_load_blocks,
+                            destination_load_blocks = transfer.destination_load_blocks,
+                            "Routing request with GMS KV transfer placement"
+                        );
+                    }
+                    Ok(SelectionOutcome::Routed(WorkerSelection {
+                        worker,
+                        attempt: admitted.attempt,
+                        overlap_amount: overlap_blocks,
+                        effective_overlap_blocks,
+                        cached_tokens,
+                        potential_decode_blocks,
+                        selected_worker_load: None,
+                        routing_hashes,
+                        router_hint,
+                        gms_placement,
+                    }))
+                }
                 FindBestMatchOutcome::QueueRejected { rejection } => {
                     Ok(SelectionOutcome::QueueRejected(rejection))
                 }
@@ -172,6 +195,7 @@ where
                     selected_worker_load: Some(selected_worker_load),
                     routing_hashes,
                     router_hint: None,
+                    gms_placement: None,
                 })),
                 crate::kv_router::FindBestMatchAdvisoryOutcome::QueueRejected { rejection } => {
                     Ok(SelectionOutcome::QueueRejected(rejection))

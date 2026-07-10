@@ -22,6 +22,10 @@ from dynamo.common.utils.engine_response import (
     normalize_finish_reason,
     trailing_stop_prefix_len,
 )
+from dynamo.gms_router_policy import (
+    maybe_fetch_gms_placement,
+    resolve_env_gms_daemon_socket,
+)
 from dynamo.llm import HttpError
 from dynamo.llm.exceptions import EngineShutdown
 from dynamo.sglang._compat import (
