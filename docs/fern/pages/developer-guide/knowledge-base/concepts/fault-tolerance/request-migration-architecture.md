@@ -27,6 +27,15 @@ Key responsibilities:
 
 The migration limit and max sequence length are configured at the **frontend** level and apply globally to all models served by that frontend. See [Enable migration on the Frontend](../../../../kubernetes/fault-tolerance/request-migration.md) in the use-case guide for the flags and environment variables.
 
+### Retry concurrency
+
+During failover, many in-flight streams can retry against the newly active worker at once. `DYN_MIGRATION_RETRY_CONCURRENCY` optionally caps concurrent migrated retry streams within a frontend process:
+
+- `0` or unset leaves retry concurrency unlimited.
+- The cap applies only after a request enters migration; first attempts are not throttled.
+- A retry holds its permit until its stream completes, preventing a replay burst from overwhelming a warm shadow.
+
+
 ## Token State Tracking and Request Migration
 
 The core of the migration system is the ability to preserve and continue partial generations through token state management. This ensures that when a worker fails mid-generation, the new worker can seamlessly continue from the exact point of failure.
