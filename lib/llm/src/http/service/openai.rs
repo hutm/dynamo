@@ -49,6 +49,7 @@ use super::{
     },
     service_v2,
 };
+use crate::discovery::ModelManagerError;
 use crate::engines::ValidateRequest;
 use crate::preprocessor::{PRESERVE_OMITTED_MAX_TOKENS_CONTEXT_KEY, decode_base64_to_floats};
 use crate::protocols::common::extensions::{
@@ -59,6 +60,7 @@ use crate::protocols::common::extensions::{
 use crate::protocols::common::input_trigger::{
     classify_chat_request, classify_completion_request, classify_response_request,
 };
+use crate::protocols::openai::ParsingOptions;
 use crate::protocols::openai::chat_completions::aggregator::ChatCompletionAggregator;
 use crate::protocols::openai::{
     ParsingOptions,
@@ -96,7 +98,6 @@ use dynamo_runtime::logging::get_distributed_tracing_context;
 use tracing::Instrument;
 
 pub const DYNAMO_REQUEST_ID_HEADER: &str = "x-dynamo-request-id";
-
 /// Dynamo Annotation for the request ID
 pub const ANNOTATION_REQUEST_ID: &str = "request_id";
 
@@ -118,6 +119,55 @@ pub(super) fn rl_router(
     let config = dynamo_rl::RlDiscoveryConfig::from_env(drt);
     let state = dynamo_rl::RlDiscoveryState::new(config);
     Ok(dynamo_rl::rl_router(state))
+}
+
+fn is_transient_model_lookup_error(error: &ModelManagerError) -> bool {
+    matches!(
+        error,
+        ModelManagerError::ModelNotFound(_) | ModelManagerError::ModelUnavailable(_)
+    )
+}
+
+async fn get_chat_completions_engine_with_failover_wait(
+    state: &Arc<service_v2::State>,
+    model: &str,
+) -> Result<
+    (
+        crate::types::openai::chat_completions::OpenAIChatCompletionsStreamingEngine,
+        ParsingOptions,
+    ),
+    ModelManagerError,
+> {
+    service_v2::wait_for_failover(
+        "model",
+        model,
+        || {
+            state
+                .manager()
+                .get_chat_completions_engine_with_parsing(model)
+        },
+        is_transient_model_lookup_error,
+    )
+    .await
+}
+
+async fn get_completions_engine_with_failover_wait(
+    state: &Arc<service_v2::State>,
+    model: &str,
+) -> Result<
+    (
+        crate::types::openai::completions::OpenAICompletionsStreamingEngine,
+        ParsingOptions,
+    ),
+    ModelManagerError,
+> {
+    service_v2::wait_for_failover(
+        "model",
+        model,
+        || state.manager().get_completions_engine_with_parsing(model),
+        is_transient_model_lookup_error,
+    )
+    .await
 }
 
 // Default axum max body limit without configuring is 2MB: https://docs.rs/axum/latest/axum/extract/struct.DefaultBodyLimit.html
@@ -950,9 +1000,8 @@ async fn completions_single(
     let http_queue_guard = state.metrics_clone().create_http_queue_guard(&metric_model);
 
     // todo - error handling should be more robust
-    let (engine, parsing_options) = state
-        .manager()
-        .get_completions_engine_with_parsing(&model)
+    let (engine, parsing_options) = get_completions_engine_with_failover_wait(&state, &model)
+        .await
         .map_err(|e| {
             let err_response = ErrorMessage::from_model_error(&e);
             inflight_guard.mark_error(extract_error_type_from_response(&err_response));
@@ -1218,9 +1267,8 @@ async fn completions_batch(
     // Create http_queue_guard early - tracks time waiting to be processed
     let http_queue_guard = state.metrics_clone().create_http_queue_guard(&metric_model);
 
-    let (engine, parsing_options) = state
-        .manager()
-        .get_completions_engine_with_parsing(&model)
+    let (engine, parsing_options) = get_completions_engine_with_failover_wait(&state, &model)
+        .await
         .map_err(|e| {
             let err_response = ErrorMessage::from_model_error(&e);
             inflight_guard.mark_error(extract_error_type_from_response(&err_response));
@@ -2868,9 +2916,8 @@ async fn chat_completions(
 
     tracing::trace!("Getting chat completions engine for model: {}", model);
 
-    let (engine, parsing_options) = state
-        .manager()
-        .get_chat_completions_engine_with_parsing(&model)
+    let (engine, parsing_options) = get_chat_completions_engine_with_failover_wait(&state, &model)
+        .await
         .map_err(|e| {
             let err_response = ErrorMessage::from_model_error(&e);
             inflight_guard.mark_error(extract_error_type_from_response(&err_response));
@@ -3503,9 +3550,8 @@ async fn responses(
 
     tracing::trace!("Getting chat completions engine for model: {}", model);
 
-    let (engine, parsing_options) = state
-        .manager()
-        .get_chat_completions_engine_with_parsing(&model)
+    let (engine, parsing_options) = get_chat_completions_engine_with_failover_wait(&state, &model)
+        .await
         .map_err(|e| {
             let err_response = ErrorMessage::from_model_error(&e);
             inflight_guard.mark_error(extract_error_type_from_response(&err_response));
