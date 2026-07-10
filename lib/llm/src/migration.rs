@@ -81,10 +81,10 @@ fn is_migratable(err: &(dyn StdError + 'static)) -> bool {
         ErrorType::CannotConnect,
         ErrorType::Disconnected,
         ErrorType::ConnectionTimeout,
-        // a stalled/frozen worker's stream-inactivity timeout surfaces
-        // as ResponseTimeout (push_router fault detection quarantines the worker
-        // via the same signal); migrate instead of hanging to the stream timeout.
+        // A stalled/frozen worker's inactivity timeout is worker-scoped.
         ErrorType::ResponseTimeout,
+        // Discovery may report a temporary gap while the shadow takes over.
+        ErrorType::Unavailable,
         ErrorType::Backend(BackendError::EngineShutdown),
         // A truncated stream from a departed worker is recoverable by failover.
         ErrorType::Backend(BackendError::StreamIncomplete),
@@ -1736,6 +1736,16 @@ mod tests {
         );
 
         assert!(is_migratable(err.as_ref()));
+    }
+
+    #[test]
+    fn test_typed_unavailable_worker_set_is_migratable() {
+        let err = DynamoError::builder()
+            .error_type(ErrorType::Unavailable)
+            .message("No workers available for endpoint dynamo/backend/generate")
+            .build();
+
+        assert!(is_migratable(&err));
     }
 
     #[test]
