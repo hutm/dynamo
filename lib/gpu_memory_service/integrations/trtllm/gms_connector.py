@@ -16,6 +16,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from gms_kv_ring.common.content_directory import ContentDirectory
 from gms_kv_ring.common.prefix_hashes import prefix_block_hashes
 from gms_kv_ring.common.prefix_index import PrefixIndex
 from gms_kv_ring.engines.gds_block_connector import BlockGdsConnector
@@ -181,6 +182,17 @@ class GMSTrtllmKvCacheScheduler:
         self._pending_restore: dict[str, list[tuple[int, int]]] = {}
         self._pending_staging: dict[str, list[tuple[bytes, int]]] = {}
         self._cross_node_xfer_enabled = os.environ.get("GMS_KVR_CROSS_NODE") == "1"
+        self._content_directory = ContentDirectory(
+            os.environ.get("GMS_TRTLLM_DAEMON_SOCKET"),
+            engine="trtllm",
+            block_size=self.block_size,
+            engine_id=self.engine_id,
+        )
+        start_directory_sync = getattr(
+            self._content_directory, "start_async_read", None
+        )
+        if start_directory_sync is not None:
+            start_directory_sync()
 
     def _staging_scan(self, _hashes: list[bytes]) -> dict[bytes, dict]:
         return {}
@@ -194,11 +206,44 @@ class GMSTrtllmKvCacheScheduler:
         local = self._prefix_index.lookup(
             tokens, self.block_size, salt, self.source_engine_id
         )
+        hashes = prefix_block_hashes(tokens, self.block_size, salt)
+        if self._content_directory.enabled:
+            directory_entries: list[tuple[int, int]] = []
+            try:
+                for entry in self._content_directory.lookup(hashes):
+                    if entry is None or entry.get("state") != "ready":
+                        break
+                    if str(entry.get("engine_id")) != str(self.source_engine_id):
+                        break
+                    slots = entry.get("slot_ids") or []
+                    generations = entry.get("generations") or []
+                    if len(slots) != 1 or len(generations) != 1:
+                        break
+                    directory_entries.append((int(slots[0]), int(generations[0])))
+                if self._content_directory.mode == "shadow":
+                    if directory_entries != local:
+                        logger.warning(
+                            "TRT-LLM GMS directory shadow mismatch request=%s "
+                            "legacy_blocks=%d directory_blocks=%d",
+                            req_id,
+                            len(local),
+                            len(directory_entries),
+                        )
+                else:
+                    local = directory_entries
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "TRT-LLM GMS directory lookup failed request=%s mode=%s",
+                    req_id,
+                    self._content_directory.mode,
+                    exc_info=True,
+                )
+                if self._content_directory.authoritative:
+                    local = []
         if local:
             self._pending_restore[req_id] = local
             return len(local) * self.block_size, False
         if self._cross_node_xfer_enabled:
-            hashes = prefix_block_hashes(tokens, self.block_size, salt)
             hits = self._staging_scan(hashes)
             staging: list[tuple[bytes, int]] = []
             for h in hashes:
@@ -240,13 +285,17 @@ class GMSTrtllmKvCacheScheduler:
             tokens, bids, self.block_size, salt, self.engine_id
         )
         hashes = []
-        if self._cross_node_xfer_enabled:
+        if self._cross_node_xfer_enabled or self._content_directory.enabled:
             hashes = prefix_block_hashes(tokens, self.block_size, salt)[: len(bids)]
         self._sched_evict_queue.append((req_id, bids, generations, hashes))
         return True
 
     def shutdown(self) -> None:
         self._prefix_index.snapshot()
+        self._content_directory.close()
+
+    def wait_for_initialization(self) -> None:
+        return None
 
     def build_connector_meta(self, _scheduler_output: Any) -> GMSTrtllmConnectorMeta:
         meta = GMSTrtllmConnectorMeta(
@@ -276,6 +325,12 @@ class GMSTrtllmKvCacheWorker:
         self.daemon_socket = os.environ.get("GMS_TRTLLM_DAEMON_SOCKET", "")
         self._cross_node_xfer_enabled = os.environ.get("GMS_KVR_CROSS_NODE") == "1"
         self._host_tier_fallback = os.environ.get("GMS_KVR_HOST_TIER_FALLBACK") == "1"
+        self._content_directory = ContentDirectory(
+            self.daemon_socket,
+            engine="trtllm",
+            block_size=self.block_size,
+            engine_id=self.engine_id,
+        )
         self._meta = GMSTrtllmConnectorMeta()
         self._gds_conn: Optional[BlockGdsConnector] = None
         self._handle = None
@@ -316,6 +371,17 @@ class GMSTrtllmKvCacheWorker:
     def clear_connector_metadata(self) -> None:
         self._meta = GMSTrtllmConnectorMeta()
 
+    def register_forward_pass_callable(self):
+        return None
+
+    def wait_for_layer_load(self, _layer_idx: int, _stream: Any) -> None:
+        # GMS restores whole logical blocks before the forward pass.
+        return None
+
+    def save_kv_layer(self, _layer_idx: int, _stream: Any) -> None:
+        # GMS spills whole logical blocks from wait_for_save().
+        return None
+
     def _register_cross_node(self, block_ids: list[int], hashes: list[bytes]) -> None:
         if not self._cross_node_xfer_enabled or self._handle is None or not hashes:
             return
@@ -323,7 +389,13 @@ class GMSTrtllmKvCacheWorker:
             return
         items = []
         for bid, h in zip(block_ids, hashes):
-            items.append({"content_hash": h, "ranges": self._block_layout(int(bid))})
+            items.append(
+                {
+                    "content_hash": h,
+                    "engine_id": self.engine_id,
+                    "ranges": self._block_layout(int(bid)),
+                }
+            )
         try:
             _total, skipped = self._handle._client.register_content_addresses_batch(
                 items
@@ -335,18 +407,76 @@ class GMSTrtllmKvCacheWorker:
         if skipped:
             self._cross_node_xfer_enabled = False
 
+    def _publish_directory(
+        self,
+        block_ids: list[int],
+        generations: list[int],
+        hashes: list[bytes],
+        failed_ids: set[int],
+        tier: str,
+    ) -> None:
+        if not self._content_directory.enabled or self._block_layout is None:
+            return
+        items = [
+            {
+                "content_hash": content_hash,
+                "engine_id": self.engine_id,
+                "slot_id": int(block_id),
+                "generation": int(generation),
+                "ranges": self._block_layout(int(block_id)),
+                "tier": tier,
+            }
+            for block_id, generation, content_hash in zip(
+                block_ids, generations, hashes
+            )
+            if content_hash and int(block_id) not in failed_ids
+        ]
+        try:
+            publish = getattr(
+                self._content_directory,
+                "publish_deferred",
+                self._content_directory.publish,
+            )
+            publish(items)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "TRT-LLM GMS directory publication failed size=%d mode=%s",
+                len(items),
+                self._content_directory.mode,
+                exc_info=True,
+            )
+            if self._content_directory.authoritative:
+                raise
+
     def wait_for_save(self, _stream: Any) -> None:
         for req_id, block_ids, generations, hashes in self._meta.evict_queue:
             gens = {int(b): int(g) for b, g in zip(block_ids, generations)}
             if self._gds_conn is None:
                 self._finished_saves.add(str(req_id))
                 continue
+            failed_ids: set[int] = set(block_ids)
+            tier = ""
             if self._gds_conn.is_available():
-                self._gds_conn.evict_blocks_to_storage(block_ids, generations=gens)
+                result = self._gds_conn.evict_blocks_to_storage(
+                    block_ids, generations=gens
+                )
+                failed_ids = {int(block_id) for block_id in result.failed_ids}
+                tier = "storage"
                 self._register_cross_node(block_ids, hashes)
             elif self._host_tier_fallback:
-                self._gds_conn.evict_blocks_to_host(block_ids, generations=gens)
+                result = self._gds_conn.evict_blocks_to_host(
+                    block_ids, generations=gens
+                )
+                failed_ids = {int(block_id) for block_id in result.failed_ids}
+                tier = "host"
+            if tier:
+                self._publish_directory(
+                    block_ids, generations, hashes, failed_ids, tier
+                )
             self._finished_saves.add(str(req_id))
+
+    def shutdown(self) -> None:
+        self._content_directory.close()
 
     def start_load_kv(self, _stream: Any) -> None:
         for req_id, triples in self._meta.restore_queue:
