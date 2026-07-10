@@ -17,6 +17,8 @@ def test_trtllm_entrypoint_bootstraps_snapshot_before_main_import():
         "from dynamo.trtllm.snapshot import _configure_trtllm_snapshot_capture_env"
     )
     snapshot_env_call = "_configure_trtllm_snapshot_capture_env()"
+    startup_import = "from dynamo.trtllm.startup import configure_gms_openmpi_defaults"
+    startup_call = "configure_gms_openmpi_defaults()"
     main_import = "from dynamo.trtllm.main import main"
 
     assert standby_import in source
@@ -24,7 +26,12 @@ def test_trtllm_entrypoint_bootstraps_snapshot_before_main_import():
     assert snapshot_env_import in source
     assert snapshot_env_call in source
     assert main_import in source
+    assert startup_import in source
+    assert startup_call in source
     assert source.index(standby_import) < source.index(main_import)
     assert source.index(standby_call) < source.index(main_import)
     assert source.index(snapshot_env_import) < source.index(main_import)
     assert source.index(snapshot_env_call) < source.index(main_import)
+    assert source.index(standby_call) < source.index(startup_import)
+    assert source.index(startup_import) < source.index(startup_call)
+    assert source.index(startup_call) < source.index(main_import)
