@@ -104,6 +104,7 @@ class GMSMemorySaverImpl:
         self._kv_shared = allocation_shared()
         self.imported_weights_bytes = 0
         self.preloaded_weights_bytes = 0
+        self._pending_write_model: Optional[torch.nn.Module] = None
         self.ro_connect_timeout_ms = ro_connect_timeout_ms
         self._active_region_depth = 0
         self._pending_write_model: Optional[torch.nn.Module] = None
@@ -288,3 +289,19 @@ class GMSMemorySaverImpl:
         stats = finalize_gms_write(self.allocators["weights"], model)
         self.imported_weights_bytes = stats.committed_bytes
         self.preloaded_weights_bytes = 0
+
+    def defer_finalize_write_mode(self, model: torch.nn.Module) -> None:
+        """Defer publication until SGLang exits its GMS mem-pool region."""
+        if self.allocators["weights"].granted_lock_type != GrantedLockType.RW:
+            return
+        if self._pending_write_model is not None:
+            raise RuntimeError("a SGLang GMS weight publication is already pending")
+        self._pending_write_model = model
+
+    def finalize_pending_write_mode(self) -> None:
+        """Publish the deferred model after the outer allocator region exits."""
+        model = self._pending_write_model
+        if model is None:
+            return
+        self._pending_write_model = None
+        self.finalize_write_mode(model)

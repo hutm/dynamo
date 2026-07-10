@@ -165,6 +165,7 @@ def patch_model_runner() -> None:
         return
 
     original_alloc_memory_pool = ModelRunner.alloc_memory_pool
+    original_load_model = getattr(ModelRunner, "load_model", None)
 
     def patched_alloc_memory_pool(self, *args, **kwargs):
         impl = get_gms_memory_saver_impl()
@@ -188,9 +189,21 @@ def patch_model_runner() -> None:
         return original_alloc_memory_pool(self, *args, **kwargs)
 
     ModelRunner.alloc_memory_pool = patched_alloc_memory_pool
+
+    if original_load_model is not None:
+
+        def patched_load_model(self, *args, **kwargs):
+            result = original_load_model(self, *args, **kwargs)
+            impl = get_gms_memory_saver_impl()
+            if impl is not None:
+                impl.finalize_pending_write_mode()
+            return result
+
+        ModelRunner.load_model = patched_load_model
+
     ModelRunner._gms_patched = True
     _model_runner_patched = True
-    logger.info("[GMS] Patched ModelRunner.alloc_memory_pool")
+    logger.info("[GMS] Patched ModelRunner load finalization and KV sizing")
 
 
 def patch_shared_kv_pool_geometry() -> None:
