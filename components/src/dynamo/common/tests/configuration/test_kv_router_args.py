@@ -357,6 +357,78 @@ def test_load_aware_frontend_implies_kv_router_mode() -> None:
     assert config.router_assume_kv_reuse is False
 
 
+def test_bulwark_gateway_endpoint_requires_private_namespace() -> None:
+    parser = argparse.ArgumentParser()
+    FrontendArgGroup().add_arguments(parser)
+
+    args = parser.parse_args(
+        ["--bulwark-gateway-endpoint", "dyn://public.backend.generate"]
+    )
+    config = FrontendConfig.from_cli_args(args)
+
+    with pytest.raises(ValueError, match="requires --namespace"):
+        config.validate()
+
+
+def test_bulwark_gateway_endpoint_rejects_non_endpoint_path() -> None:
+    parser = argparse.ArgumentParser()
+    FrontendArgGroup().add_arguments(parser)
+
+    args = parser.parse_args(
+        [
+            "--bulwark-gateway-endpoint",
+            "public.backend.generate",
+            "--namespace",
+            "private-workers",
+        ]
+    )
+    config = FrontendConfig.from_cli_args(args)
+
+    with pytest.raises(ValueError, match="dyn://"):
+        config.validate()
+
+
+def test_bulwark_gateway_endpoint_validates() -> None:
+    parser = argparse.ArgumentParser()
+    FrontendArgGroup().add_arguments(parser)
+
+    args = parser.parse_args(
+        [
+            "--bulwark-gateway-endpoint",
+            "dyn://public.backend.generate",
+            "--namespace-prefix",
+            "private-workers",
+        ]
+    )
+    config = FrontendConfig.from_cli_args(args)
+    config.validate()
+
+    assert config.bulwark_gateway_endpoint == "dyn://public.backend.generate"
+    assert config.namespace_prefix == "private-workers"
+
+
+def test_bulwark_gateway_exact_namespace_uses_worker_suffix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DYN_NAMESPACE_WORKER_SUFFIX", "replica-a")
+    parser = argparse.ArgumentParser()
+    FrontendArgGroup().add_arguments(parser)
+
+    args = parser.parse_args(
+        [
+            "--bulwark-gateway-endpoint",
+            "dyn://public.backend.generate",
+            "--namespace",
+            "private-workers",
+        ]
+    )
+    config = FrontendConfig.from_cli_args(args)
+    config.validate()
+
+    assert config.namespace == "private-workers-replica-a"
+    assert config.namespace_prefix is None
+
+
 def test_frontend_rejection_thresholds_default_to_none(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
