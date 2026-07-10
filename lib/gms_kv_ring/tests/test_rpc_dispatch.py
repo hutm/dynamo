@@ -3,16 +3,26 @@
 
 """RPC composition and wire-error boundary tests."""
 
+from gms_kv_ring.daemon.rpc_content import HANDLERS as CONTENT_HANDLERS
 from gms_kv_ring.daemon.rpc_dispatch import HANDLERS, dispatch
+from gms_kv_ring.daemon.rpc_lifecycle import HANDLERS as LIFECYCLE_HANDLERS
+from gms_kv_ring.daemon.rpc_transfer import HANDLERS as TRANSFER_HANDLERS
 from gms_kv_ring.daemon.rpc_types import required_digest, required_int, required_str
 
 
 def test_handler_domains_compose_without_gaps_or_duplicates():
-    assert len(HANDLERS) == 31
+    domains = (LIFECYCLE_HANDLERS, CONTENT_HANDLERS, TRANSFER_HANDLERS)
+    assert sum(map(len, domains)) == len(HANDLERS)
+    assert HANDLERS == {
+        key: handler for domain in domains for key, handler in domain.items()
+    }
     assert "ping" in HANDLERS
     assert "attach_engine_pool" in HANDLERS
     assert "staging_scan" in HANDLERS
     assert "fetch_remote" in HANDLERS
+    assert "directory_lookup" in HANDLERS
+    assert "directory_promote" in HANDLERS
+    assert "directory_publish_batch" in HANDLERS
 
 
 def test_dispatch_handles_ping_and_unknown_operations():
