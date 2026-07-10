@@ -14,8 +14,8 @@ use super::{
     Discovery, DiscoveryEvent, DiscoveryInstance, DiscoveryInstanceId, DiscoveryQuery,
     DiscoverySpec, DiscoveryStream, EndpointInstanceId, EventChannelInstanceId, EventScope,
     EventSourceInstanceId, ModelCardInstanceId, classify_discovery_change, encode_event_segment,
-    model_with_updated_taints, reconcile_discovery_snapshot, validate_event_source_reregistration,
-    validate_model_reregistration,
+    model_with_updated_taints, reconcile_discovery_snapshot, resolve_logical_instance_id,
+    validate_event_source_reregistration, validate_model_reregistration,
 };
 use crate::storage::kv;
 
@@ -66,14 +66,17 @@ async fn update_model_taints_in_bucket(
 pub struct KVStoreDiscovery {
     store: Arc<kv::Manager>,
     cancel_token: CancellationToken,
+    instance_id: u64,
 }
 
 impl KVStoreDiscovery {
-    pub fn new(store: kv::Manager, cancel_token: CancellationToken) -> Self {
-        Self {
+    pub fn new(store: kv::Manager, cancel_token: CancellationToken) -> Result<Self> {
+        let instance_id = resolve_logical_instance_id(store.connection_id())?;
+        Ok(Self {
             store: Arc::new(store),
             cancel_token,
-        }
+            instance_id,
+        })
     }
 
     /// Build the key path for an endpoint (relative to bucket, not absolute)
@@ -382,7 +385,7 @@ impl KVStoreDiscovery {
 #[async_trait]
 impl Discovery for KVStoreDiscovery {
     fn instance_id(&self) -> u64 {
-        self.store.connection_id()
+        self.instance_id
     }
 
     async fn register_internal(&self, spec: DiscoverySpec) -> Result<DiscoveryInstance> {
@@ -941,7 +944,7 @@ mod tests {
     #[tokio::test]
     async fn event_channel_keys_and_queries_preserve_exact_endpoint_scope() {
         let store = kv::Manager::memory();
-        let client = KVStoreDiscovery::new(store, CancellationToken::new());
+        let client = KVStoreDiscovery::new(store, CancellationToken::new()).unwrap();
         let endpoint_a = EndpointId {
             namespace: "ns/one".to_string(),
             component: "worker.component".to_string(),
@@ -950,6 +953,15 @@ mod tests {
         let endpoint_b = EndpointId {
             name: "b/>".to_string(),
             ..endpoint_a.clone()
+        let cancel_token = CancellationToken::new();
+        let client = KVStoreDiscovery::new(store, cancel_token).unwrap();
+
+        let spec = DiscoverySpec::Endpoint {
+            namespace: "test".to_string(),
+            component: "comp1".to_string(),
+            endpoint: "ep1".to_string(),
+            transport: TransportType::Nats("nats://localhost:4222".to_string()),
+            device_type: None,
         };
 
         for (publisher_id, endpoint) in [(1, endpoint_a.clone()), (2, endpoint_b.clone())] {
@@ -997,7 +1009,7 @@ mod tests {
     }
 
     async fn assert_event_source_lifecycle(store: kv::Manager) {
-        let client = KVStoreDiscovery::new(store, CancellationToken::new());
+        let client = KVStoreDiscovery::new(store, CancellationToken::new()).unwrap();
         let endpoint = EndpointId {
             namespace: "ns/one".to_string(),
             component: "worker.component".to_string(),
@@ -1047,7 +1059,7 @@ mod tests {
 
     #[tokio::test]
     async fn event_source_watch_removes_exact_publisher_incarnation() {
-        let client = KVStoreDiscovery::new(kv::Manager::memory(), CancellationToken::new());
+        let client = KVStoreDiscovery::new(kv::Manager::memory(), CancellationToken::new()).unwrap();
         let endpoint = EndpointId {
             namespace: "ns".to_string(),
             component: "worker".to_string(),
@@ -1112,7 +1124,7 @@ mod tests {
     async fn test_kv_store_discovery_list() {
         let store = kv::Manager::memory();
         let cancel_token = CancellationToken::new();
-        let client = KVStoreDiscovery::new(store, cancel_token);
+        let client = KVStoreDiscovery::new(store, cancel_token).unwrap();
 
         // Register multiple endpoints
         let spec1 = DiscoverySpec::Endpoint {
@@ -1173,7 +1185,7 @@ mod tests {
     async fn test_kv_store_discovery_watch() {
         let store = kv::Manager::memory();
         let cancel_token = CancellationToken::new();
-        let client = Arc::new(KVStoreDiscovery::new(store, cancel_token.clone()));
+        let client = Arc::new(KVStoreDiscovery::new(store, cancel_token.clone()).unwrap());
 
         // Start watching before registering
         let mut stream = client
@@ -1310,7 +1322,7 @@ mod tests {
 
     #[tokio::test]
     async fn model_taint_updates_replace_existing_value_and_emit_scoped_event() {
-        let client = KVStoreDiscovery::new(kv::Manager::memory(), CancellationToken::new());
+        let client = KVStoreDiscovery::new(kv::Manager::memory(), CancellationToken::new()).unwrap();
         let query = DiscoveryQuery::EndpointModels {
             namespace: "ns".to_string(),
             component: "worker".to_string(),

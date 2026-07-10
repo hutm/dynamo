@@ -18,7 +18,7 @@ use crate::CancellationToken;
 use crate::discovery::{
     Discovery, DiscoveryEvent, DiscoveryInstance, DiscoveryInstanceId, DiscoveryMetadata,
     DiscoveryQuery, DiscoverySpec, DiscoveryStream, MAX_JSON_SAFE_PUBLISHER_ID,
-    ModelCardInstanceId, reconcile_discovery_snapshot,
+    ModelCardInstanceId, reconcile_discovery_snapshot, resolve_logical_instance_id,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -90,15 +90,17 @@ impl KubeDiscoveryClient {
         cancel_token: CancellationToken,
     ) -> Result<Self> {
         let pod_info = PodInfo::from_env()?;
-        let instance_id = pod_info.target.instance_id();
+        let physical_instance_id = pod_info.target.instance_id();
+        let instance_id = resolve_logical_instance_id(physical_instance_id)?;
         let cr_name = pod_info.target.cr_name();
 
         tracing::info!(
-            "Initializing KubeDiscoveryClient: mode={:?}, target={:?}, cr_name={}, instance_id={:x}, namespace={}, pod_uid={}",
+            "Initializing KubeDiscoveryClient: mode={:?}, target={:?}, cr_name={}, instance_id={:x}, physical_instance_id={:x}, namespace={}, pod_uid={}",
             pod_info.mode,
             pod_info.target,
             cr_name,
             instance_id,
+            physical_instance_id,
             pod_info.pod_namespace,
             pod_info.pod_uid
         );
