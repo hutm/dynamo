@@ -25,6 +25,7 @@ python -m dynamo.frontend --router-mode kv --http-port 8000
 | `--router-queue-threshold` | `16.0` | Backpressure queue threshold; priority hints only reorder requests while this queue is non-empty |
 | `--router-queue-policy` | `fcfs` | Queue scheduling policy: `fcfs` (tail TTFT), `wspt` (avg TTFT), or `lcfs` (comparison-only reverse ordering) |
 | `--no-router-track-prefill-tokens` | disabled | Ignore prompt-side prefill tokens in router load accounting; useful for decode-only routing paths |
+| `--router-gms-decode-transfer` | disabled | Experimental GMS decode-to-decode transfer orchestration for GMS-capable aggregated decode workers |
 
 > [!IMPORTANT]
 > `--router-mode kv` (or `DYN_ROUTER_MODE=kv`) enables KV routing on the
