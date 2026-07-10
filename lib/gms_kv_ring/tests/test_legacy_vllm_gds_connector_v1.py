@@ -137,6 +137,41 @@ def test_scheduler_get_num_new_matched_tokens_is_zero(tmp_path):
     assert async_load is False
 
 
+def test_scheduler_authoritative_directory_supplies_prefix(tmp_path):
+    cfg = _fake_vllm_config(str(tmp_path / "ignored.sock"))
+    conn = GMSKVCacheConnectorV1(cfg, KVConnectorRole.SCHEDULER)
+
+    class Directory:
+        enabled = True
+        authoritative = True
+        mode = "authoritative"
+
+        def lookup(self, hashes):
+            return [
+                {
+                    "engine_id": "test-eid",
+                    "slot_ids": [40 + i],
+                    "generations": [7 + i],
+                    "state": "ready",
+                }
+                for i, _content_hash in enumerate(hashes)
+            ]
+
+        def close(self):
+            pass
+
+    conn._content_directory = Directory()
+    req = _fake_request("directory-hit", list(range(1, 9)))
+    matched, is_async = conn.get_num_new_matched_tokens(req, 0)
+
+    assert matched == 8
+    assert is_async is False
+    assert conn._pending_hit["directory-hit"] == [
+        ("local", 40, 7),
+        ("local", 41, 8),
+    ]
+
+
 def test_worker_register_kv_caches_builds_gds_connector(tmp_path):
     fake = _FakeGpuDirectBackend()
     sock = str(tmp_path / "d.sock")
@@ -630,9 +665,9 @@ def test_block_gds_restore_remap_directly(tmp_path):
                     got = bytes(
                         dev[start : start + block_bytes].cpu().numpy().tobytes()
                     )
-                    assert (
-                        got == patterns[(src, L)]
-                    ), f"remap src={src} dst={dst} layer={L} mismatch"
+                    assert got == patterns[(src, L)], (
+                        f"remap src={src} dst={dst} layer={L} mismatch"
+                    )
         finally:
             h.close()
     finally:
@@ -873,7 +908,7 @@ def test_connector_evict_raises_does_not_block_get_finished(tmp_path):
             # Failure counter increments by the number of failed
             # blocks (2).
             assert after - before >= 2, (
-                f"expected evict_failures to increment by ≥2, got " f"{after - before}"
+                f"expected evict_failures to increment by ≥2, got {after - before}"
             )
             # The crucial invariant: get_finished still returns
             # the req_id so vLLM unpins blocks.
@@ -2036,9 +2071,9 @@ def test_prefix_index_snapshot_load_logs_count(tmp_path, caplog):
         _PrefixIndex(max_entries=64, snapshot_path=snap)
 
     msgs = [r.message for r in caplog.records]
-    assert any(
-        "loaded 2 entries" in m for m in msgs
-    ), f"expected load INFO log; got: {msgs}"
+    assert any("loaded 2 entries" in m for m in msgs), (
+        f"expected load INFO log; got: {msgs}"
+    )
 
 
 def test_prefix_index_drop_slots_removes_pointers_only(tmp_path):
@@ -2115,7 +2150,7 @@ def test_daemon_scrub_drops_corrupted_host_tier_slot(tmp_path):
         scanned2, corruptions2 = d.scrub_once()
         assert scanned2 == 1
         assert corruptions2 == 1, (
-            f"scrub did not detect poisoned slot; " f"corruptions={corruptions2}"
+            f"scrub did not detect poisoned slot; corruptions={corruptions2}"
         )
         # Slot was dropped → host_tier empty.
         assert d.host_tier.n_slots() == 0
@@ -2146,7 +2181,7 @@ def test_daemon_scrub_ignores_zero_crc_and_unready_slots(tmp_path):
 
         scanned, corruptions = d.scrub_once()
         assert scanned == 0, (
-            f"scrubber scanned slots it shouldn't have " f"(scanned={scanned})"
+            f"scrubber scanned slots it shouldn't have (scanned={scanned})"
         )
         assert corruptions == 0
         # Both slots still present.
@@ -2232,8 +2267,7 @@ def test_backend_scrub_detects_corrupt_storage_file(tmp_path):
         scanned2, corruptions2 = d.scrub_backend_once()
         assert scanned2 == 1
         assert corruptions2 == 1, (
-            f"backend scrub did not detect poisoned file; "
-            f"corruptions={corruptions2}"
+            f"backend scrub did not detect poisoned file; corruptions={corruptions2}"
         )
         # Slot dropped from the backend index.
         assert d.storage_tier.n_slots() == 0
