@@ -13,6 +13,7 @@ No hot-path methods here. The rings are the hot path.
 
 from __future__ import annotations
 
+import base64
 import json
 import socket
 import struct
@@ -119,6 +120,116 @@ class DaemonClient:
         return resp
 
     # ---- API ----
+
+    def persistent_kv_lookup(
+        self,
+        namespace: str,
+        keys: list[bytes],
+    ) -> list[bool]:
+        resp = self._ok(
+            {
+                "op": "persistent_kv_lookup",
+                "namespace": str(namespace),
+                "keys": [key.hex() for key in keys],
+            }
+        )
+        return [bool(value) for value in resp.get("hits", [])]
+
+    def persistent_kv_attach_pool(
+        self,
+        path: str,
+        num_rows: int,
+        row_size: int,
+    ) -> str:
+        resp = self._ok(
+            {
+                "op": "persistent_kv_attach_pool",
+                "path": str(path),
+                "num_rows": int(num_rows),
+                "row_size": int(row_size),
+            }
+        )
+        return str(resp["pool_id"])
+
+    def persistent_kv_detach_pool(self, pool_id: str) -> bool:
+        resp = self._ok(
+            {
+                "op": "persistent_kv_detach_pool",
+                "pool_id": str(pool_id),
+            }
+        )
+        return bool(resp.get("detached", False))
+
+    def persistent_kv_store(
+        self,
+        namespace: str,
+        items: list[tuple[bytes, bytes]],
+    ) -> list[bool]:
+        resp = self._ok(
+            {
+                "op": "persistent_kv_store",
+                "namespace": str(namespace),
+                "items": [
+                    {
+                        "key": key.hex(),
+                        "data": base64.b64encode(data).decode("ascii"),
+                    }
+                    for key, data in items
+                ],
+            }
+        )
+        return [bool(value) for value in resp.get("stored", [])]
+
+    def persistent_kv_load(
+        self,
+        namespace: str,
+        keys: list[bytes],
+    ) -> list[bytes | None]:
+        resp = self._ok(
+            {
+                "op": "persistent_kv_load",
+                "namespace": str(namespace),
+                "keys": [key.hex() for key in keys],
+            }
+        )
+        return [
+            None if value is None else base64.b64decode(value, validate=True)
+            for value in resp.get("values", [])
+        ]
+
+    def persistent_kv_store_pool(
+        self,
+        namespace: str,
+        pool_id: str,
+        items: list[tuple[bytes, int]],
+    ) -> list[bool]:
+        resp = self._ok(
+            {
+                "op": "persistent_kv_store_pool",
+                "namespace": str(namespace),
+                "pool_id": str(pool_id),
+                "items": [{"key": key.hex(), "slot": int(slot)} for key, slot in items],
+            }
+        )
+        return [bool(value) for value in resp.get("stored", [])]
+
+    def persistent_kv_load_pool(
+        self,
+        namespace: str,
+        pool_id: str,
+        keys: list[bytes],
+        slots: list[int],
+    ) -> bool:
+        resp = self._ok(
+            {
+                "op": "persistent_kv_load_pool",
+                "namespace": str(namespace),
+                "pool_id": str(pool_id),
+                "keys": [key.hex() for key in keys],
+                "slots": [int(slot) for slot in slots],
+            }
+        )
+        return bool(resp.get("loaded", False))
 
     def attach_engine_pool(
         self,
@@ -774,6 +885,7 @@ class DaemonClient:
             for engine_id, slot_ids in (resp.get("protected") or {}).items()
         }
         return protected, bool(resp.get("rejected_stale_writer", False))
+
     def staging_fail(self, reservation_id: str, reason: str = "") -> None:
         """Cleanup on transfer failure. Called by the router if the
         sender reports an error before bytes arrive."""
