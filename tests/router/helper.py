@@ -196,6 +196,12 @@ def verify_response_timing(
                 "✓ Verified kv_transfer_estimated_latency_ms=%.2f",
                 kv_transfer_estimated_latency_ms,
             )
+        else:
+            prefill_wait_time_ms = timing_info.get("prefill_wait_time_ms")
+            if prefill_wait_time_ms is not None:
+                assert prefill_wait_time_ms >= 0, (
+                    f"Expected prefill_wait_time_ms >= 0, got: {prefill_wait_time_ms}"
+                )
 
 
 ########################################################
@@ -602,9 +608,15 @@ async def send_request_with_retry(url: str, payload: dict, max_retries: int = 8)
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, json=payload) as response:
                     if response.status == 200:
-                        # Read the response to ensure it's valid
-                        async for _ in response.content:
-                            pass
+                        # Read and validate the response to ensure the stream
+                        # completed rather than failing inside an HTTP 200 body.
+                        chunks = []
+                        async for chunk in response.content:
+                            if chunk:
+                                chunks.append(chunk)
+                        _validate_stream_response_chunks(
+                            chunks, f"Initial request to {url}"
+                        )
                         logger.debug(
                             f"First request succeeded on attempt {attempt + 1}"
                         )
@@ -659,6 +671,54 @@ def managed_runtime(
         runtime.shutdown()
 
 
+def _validate_stream_response_chunks(chunks: list[bytes], context: str) -> None:
+    """Validate an OpenAI-compatible SSE stream completed cleanly.
+
+    Some backends surface generation errors as HTTP 200 streams that terminate
+    early. Treat those as failed requests instead of counting the transport as
+    success.
+    """
+    body = b"".join(chunks).decode("utf-8", errors="replace")
+    saw_sse_payload = False
+    saw_done = False
+
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(":"):
+            continue
+        if not line.startswith("data:"):
+            continue
+
+        saw_sse_payload = True
+        data_str = line[5:].strip()
+        if data_str == "[DONE]":
+            saw_done = True
+            continue
+
+        try:
+            data = json.loads(data_str)
+        except json.JSONDecodeError:
+            continue
+
+        error = data.get("error")
+        if error:
+            raise AssertionError(f"{context} returned stream error payload: {error}")
+
+    if saw_sse_payload and not saw_done:
+        raise AssertionError(f"{context} stream ended without data: [DONE]")
+
+    if not saw_sse_payload:
+        if not body.strip():
+            raise AssertionError(f"{context} stream returned no SSE payload")
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            return
+        error = data.get("error") if isinstance(data, dict) else None
+        if error:
+            raise AssertionError(f"{context} returned error payload: {error}")
+
+
 async def send_inflight_requests(urls: list, payload: dict, num_requests: int):
     """Send multiple requests concurrently, alternating between URLs if multiple provided"""
 
@@ -681,11 +741,14 @@ async def send_inflight_requests(urls: list, payload: dict, num_requests: int):
                     )
                     return False
 
-                # For streaming responses, read the entire stream
+                # For streaming responses, read and validate the entire stream.
                 chunks = []
                 async for line in response.content:
                     if line:
                         chunks.append(line)
+                _validate_stream_response_chunks(
+                    chunks, f"Request {request_id} to URL {url_index}"
+                )
 
                 logger.debug(
                     f"Request {request_id} to URL {url_index} completed with {len(chunks)} chunks"
