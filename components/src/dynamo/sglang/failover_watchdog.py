@@ -172,10 +172,15 @@ class SGLangGmsFailoverChildWatchdog:
         self._stop = threading.Event()
         self._released = threading.Event()
         self._thread: threading.Thread | None = None
+        self._previous_sigquit_handler: Any = None
+        self._previous_sigquit_callback: tuple[Any, tuple[Any, ...]] | None = None
+        self._sigquit_uses_asyncio = False
+        self._sigquit_handler: Any = None
 
     def start(self) -> None:
         if self._thread is not None:
             return
+        self._install_sigquit_hook()
         self._install_subprocess_watchdog_hook()
         self._thread = threading.Thread(
             target=self._run,
@@ -189,6 +194,7 @@ class SGLangGmsFailoverChildWatchdog:
         if self._thread is not None:
             self._thread.join(timeout=0.2)
             self._thread = None
+        self._restore_sigquit_hook()
 
     def _run(self) -> None:
         interval = _poll_interval_s()
@@ -205,6 +211,80 @@ class SGLangGmsFailoverChildWatchdog:
             name = failed[0] if failed is not None else "pid"
             self._trigger_failure(f"detected SGLang child failure name={name}")
             return
+
+    def _install_sigquit_hook(self) -> None:
+        """Route SGLang child-failure SIGQUIT through the fenced handoff.
+
+        A remote TP-rank loss can make a local scheduler send SIGQUIT before
+        either watchdog thread observes the dead child. SGLang's default
+        handler sleeps for crash diagnostics, delaying lock release and router
+        replay. In GMS failover mode the diagnostics belong to the failed
+        process, while this owner must fence and hand off immediately.
+        """
+
+        def sigquit_callback() -> None:
+            self._trigger_failure("SGLang SIGQUIT reported child failure")
+
+        # SGLang installs the running-phase handler with add_signal_handler.
+        # Replacing only signal.signal would leave that event-loop callback
+        # active, so both handlers would run and diagnostics would still sleep.
+        previous = getattr(self._loop, "_signal_handlers", {}).get(signal.SIGQUIT)
+        if previous is not None:
+            self._previous_sigquit_callback = (
+                previous._callback,
+                previous._args,
+            )
+        try:
+            self._loop.add_signal_handler(signal.SIGQUIT, sigquit_callback)
+            self._sigquit_handler = sigquit_callback
+            self._sigquit_uses_asyncio = True
+            logger.info("[GMS failover] hooked SGLang SIGQUIT child-failure path")
+            return
+        except (NotImplementedError, RuntimeError, ValueError):
+            logger.debug(
+                "[GMS failover] could not hook SGLang asyncio SIGQUIT; "
+                "falling back to signal.signal"
+            )
+
+        def raw_sigquit_handler(_signum, _frame) -> None:
+            sigquit_callback()
+
+        try:
+            self._previous_sigquit_handler = signal.getsignal(signal.SIGQUIT)
+            signal.signal(signal.SIGQUIT, raw_sigquit_handler)
+            self._sigquit_handler = raw_sigquit_handler
+            logger.info("[GMS failover] hooked SGLang SIGQUIT child-failure path")
+        except ValueError:
+            logger.debug(
+                "[GMS failover] could not hook SGLang SIGQUIT outside main thread"
+            )
+
+    def _restore_sigquit_hook(self) -> None:
+        if self._sigquit_handler is None:
+            return
+        if self._sigquit_uses_asyncio:
+            current = getattr(self._loop, "_signal_handlers", {}).get(signal.SIGQUIT)
+            try:
+                if current is not None and current._callback is self._sigquit_handler:
+                    if self._previous_sigquit_callback is None:
+                        self._loop.remove_signal_handler(signal.SIGQUIT)
+                    else:
+                        callback, args = self._previous_sigquit_callback
+                        self._loop.add_signal_handler(signal.SIGQUIT, callback, *args)
+            except (NotImplementedError, RuntimeError, ValueError):
+                logger.debug("[GMS failover] could not restore SGLang asyncio SIGQUIT")
+        else:
+            try:
+                if signal.getsignal(signal.SIGQUIT) is self._sigquit_handler:
+                    signal.signal(signal.SIGQUIT, self._previous_sigquit_handler)
+            except ValueError:
+                logger.debug(
+                    "[GMS failover] could not restore SGLang SIGQUIT outside main thread"
+                )
+        self._sigquit_handler = None
+        self._previous_sigquit_handler = None
+        self._previous_sigquit_callback = None
+        self._sigquit_uses_asyncio = False
 
     def _install_subprocess_watchdog_hook(self) -> None:
         tokenizer_manager = getattr(self._engine, "tokenizer_manager", None)

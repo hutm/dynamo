@@ -176,7 +176,6 @@ def engine(gms_daemon):
             )
         ),
         disable_cuda_graph=True,
-        disable_piecewise_cuda_graph=True,
         random_seed=0,
     )
     yield obj

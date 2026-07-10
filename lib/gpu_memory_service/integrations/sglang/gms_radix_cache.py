@@ -71,6 +71,8 @@ import zlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
+from gms_kv_ring.common.content_directory import ContentDirectory
+
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -297,6 +299,18 @@ def make_gms_radix_cache_class():
                 "",
             )
             self._cross_node_staging_enabled = self._cross_node_register
+            self._content_directory = ContentDirectory(
+                self._daemon_socket or os.environ.get("GMS_KV_DIRECTORY_SOCKET"),
+                engine="sglang",
+                block_size=int(getattr(self, "page_size", 0)),
+                engine_id=self._engine_id,
+            )
+            start_directory_sync = getattr(
+                self._content_directory, "start_async_read", None
+            )
+            if start_directory_sync is not None:
+                start_directory_sync()
+            self.token_to_kv_pool_allocator._gms_kv_directory = self._content_directory
 
             # ---------- Warm-restart persistence (SGL-PERSIST) ----------
             # Background snapshot of the spilled-node table so a
@@ -414,9 +428,26 @@ def make_gms_radix_cache_class():
                 return int(key_match(node_key, lookup_key))
             return int(node_key.match(lookup_key, page_size=self.page_size))
 
+        def _gms_prefix_hashes(self, token_ids, extra_key=None):
+            """Hash the same cache scope that SGLang's radix tree matches."""
+            from gms_kv_ring.common.prefix_hashes import prefix_block_hashes
+
+            salt = self._cross_node_salt
+            if extra_key is not None:
+                import json
+
+                salt = "gms-sglang-extra-v1:" + json.dumps(
+                    [salt, extra_key], ensure_ascii=False, separators=(",", ":")
+                )
+            return prefix_block_hashes(token_ids, int(self.page_size), salt)
+
         def _is_active(self) -> bool:
             """True iff spill/restore should engage. False
             collapses to vanilla RadixCache behavior."""
+            if self._content_directory.authoritative and hasattr(
+                self.token_to_kv_pool_allocator, "_gms_kv_leases_by_page"
+            ):
+                return True
             if self._gds is None or self._block_layout_fn is None:
                 return False
             if self._gds.is_available():
@@ -490,7 +521,11 @@ def make_gms_radix_cache_class():
             self,
             node,
             slot_indices: "list[int]",
+            generations: "list[int]",
+            tier: str,
             prefix_tokens: "Optional[list[int]]" = None,
+            active_hbm: bool = False,
+            extra_key: "Optional[str]" = None,
         ) -> None:
             """After a successful spill, batch-register per-page
             content hashes with the daemon so a peer router can
@@ -505,7 +540,7 @@ def make_gms_radix_cache_class():
             No-op when the daemon has no transport (`skipped=True`
             from the RPC); we self-disable to avoid the per-spill
             RPC cost in single-node deployments."""
-            if not self._cross_node_register:
+            if not (self._cross_node_register or self._content_directory.enabled):
                 return
             page_size = int(getattr(self, "page_size", 0))
             if page_size <= 0 or len(slot_indices) % page_size != 0:
@@ -529,13 +564,9 @@ def make_gms_radix_cache_class():
             if not prefix_tokens:
                 return
             try:
-                from gms_kv_ring.common.prefix_hashes import prefix_block_hashes
-
-                all_hashes = prefix_block_hashes(
-                    prefix_tokens,
-                    page_size,
-                    self._cross_node_salt,
-                )
+                if extra_key is None:
+                    extra_key = getattr(getattr(node, "key", None), "extra_key", None)
+                all_hashes = self._gms_prefix_hashes(prefix_tokens, extra_key=extra_key)
             except Exception:  # noqa: BLE001
                 logger.warning(
                     "[GMSRadixCache eng=%s] prefix-hash compute "
@@ -552,17 +583,55 @@ def make_gms_radix_cache_class():
             items: list[dict] = []
             for i, h in enumerate(local_hashes):
                 chunk_slots = slot_indices[i * page_size : (i + 1) * page_size]
+                chunk_generations = generations[i * page_size : (i + 1) * page_size]
                 ranges = []
-                for sl in chunk_slots:
-                    ranges.extend(self._block_layout_fn(sl))
+                if self._block_layout_fn is not None:
+                    for sl in chunk_slots:
+                        ranges.extend(self._block_layout_fn(sl))
+                if tier == "hbm":
+                    page = int(chunk_slots[0]) // page_size
+                    lease = self.token_to_kv_pool_allocator._gms_kv_leases_by_page.get(
+                        page
+                    )
+                    if lease is None:
+                        continue
+                    slot_ids = [page]
+                    chunk_generations = [int(lease.generation)]
+                else:
+                    slot_ids = chunk_slots
                 items.append(
                     {
                         "content_hash": h,
                         "engine_id": self._engine_id,
                         "ranges": ranges,
+                        "slot_ids": slot_ids,
+                        "generations": chunk_generations,
+                        "tier": tier,
+                        "active": bool(active_hbm and tier == "hbm"),
                     }
                 )
             if not items:
+                return
+            if self._content_directory.enabled:
+                try:
+                    publish = getattr(
+                        self._content_directory,
+                        "publish_deferred",
+                        self._content_directory.publish,
+                    )
+                    publish(items)
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "[GMSRadixCache eng=%s] directory publication "
+                        "failed size=%d mode=%s",
+                        self._engine_id,
+                        len(items),
+                        self._content_directory.mode,
+                        exc_info=True,
+                    )
+                    if self._content_directory.authoritative:
+                        raise
+            if not self._cross_node_register:
                 return
             client = getattr(getattr(self._gds, "handle", None), "_client", None)
             if client is None:
@@ -615,6 +684,238 @@ def make_gms_radix_cache_class():
                 )
                 return {}
 
+        def _install_directory_value(self, key, value) -> bool:
+            """Fill exact existing radix edges, then insert any new suffix.
+
+            SGLang's native ``_insert_helper`` treats an existing key as a
+            duplicate and does not replace its value. GMS intentionally keeps
+            spilled placeholders with ``value=None``, so authoritative restore
+            must refill those exact edges before native insertion can handle a
+            previously unknown suffix.
+            """
+            node = self.root_node
+            remaining = key
+            cursor = 0
+            existing = []
+            while len(remaining) > 0:
+                child_key = self._gms_child_key(remaining)
+                child = node.children.get(child_key)
+                if child is None:
+                    break
+                prefix_len = self._gms_key_match(child.key, remaining)
+                # Avoid partially splitting a value-less edge. A later lookup
+                # can retry once a complete directory edge is available.
+                if prefix_len != len(child.key):
+                    return False
+                existing.append((child, cursor, cursor + prefix_len))
+                cursor += prefix_len
+                remaining = remaining[prefix_len:]
+                node = child
+            for child, begin, end in existing:
+                if child.value is None:
+                    child.value = value[begin:end].clone()
+                    with self._spill_lock:
+                        self._spilled.pop(id(child), None)
+                        self._persist_dirty = True
+            if len(remaining) > 0:
+                self._insert_helper(node, remaining, value[cursor:], 0, False)
+            return True
+
+        def _restore_directory_suffix(
+            self,
+            key,
+            matched_value,
+            block_hashes: "list[bytes]",
+            start_block: int,
+        ) -> bool:
+            """Restore or adopt a contiguous manifest-compatible suffix."""
+            if not self._content_directory.enabled:
+                return False
+            page_size = int(getattr(self, "page_size", 0))
+            hashes = block_hashes[start_block:]
+            claim_token = None
+            try:
+                if self._content_directory.authoritative and hasattr(
+                    self.token_to_kv_pool_allocator,
+                    "_gms_kv_leases_by_page",
+                ):
+                    raw_entries, claim_token = self._content_directory.lookup_and_claim(
+                        hashes
+                    )
+                else:
+                    raw_entries = self._content_directory.lookup(hashes)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "[GMSRadixCache eng=%s] directory lookup failed mode=%s",
+                    self._engine_id,
+                    self._content_directory.mode,
+                    exc_info=True,
+                )
+                return False
+
+            pages: list[tuple[list[int], list[int]]] = []
+            tier = None
+            for entry in raw_entries:
+                if entry is None or entry.get("state") != "ready":
+                    break
+                if str(entry.get("engine_id")) != str(self._source_engine_id):
+                    break
+                entry_tier = str(entry.get("tier", ""))
+                if tier is None:
+                    tier = entry_tier
+                if entry_tier != tier:
+                    break
+                slots = [int(slot) for slot in (entry.get("slot_ids") or [])]
+                generations = [
+                    int(generation) for generation in (entry.get("generations") or [])
+                ]
+                expected = 1 if tier == "hbm" else page_size
+                if len(slots) != expected or len(generations) != expected:
+                    break
+                pages.append((slots, generations))
+            if self._content_directory.mode == "shadow":
+                legacy_blocks = int(len(matched_value)) // page_size
+                if start_block + len(pages) != legacy_blocks:
+                    logger.warning(
+                        "[GMSRadixCache eng=%s] directory shadow mismatch "
+                        "legacy_blocks=%d directory_blocks=%d",
+                        self._engine_id,
+                        legacy_blocks,
+                        start_block + len(pages),
+                    )
+                return False
+            if not pages:
+                return False
+
+            n_slots = len(pages) * page_size
+            acquired = []
+            fresh = None
+            try:
+                if tier == "hbm":
+                    from gpu_memory_service.integrations.sglang.install_kv_leases import (
+                        adopt_hbm_pages,
+                    )
+
+                    page_ids = [slots[0] for slots, _generations in pages]
+                    lease_generations = [
+                        generations[0] for _slots, generations in pages
+                    ]
+                    fresh, acquired = adopt_hbm_pages(
+                        self.token_to_kv_pool_allocator,
+                        page_ids,
+                        lease_generations,
+                    )
+                    if fresh is None or len(fresh) != n_slots:
+                        return False
+                    adopted = self._content_directory.adopt_claim(
+                        claim_token,
+                        [
+                            {
+                                "content_hash": content_hash,
+                                "generations": [int(lease.generation)],
+                            }
+                            for content_hash, lease in zip(hashes, acquired)
+                        ],
+                    )
+                    claim_token = None
+                    if adopted != len(acquired):
+                        raise RuntimeError("incomplete SGLang HBM adoption")
+                else:
+                    fresh = self.token_to_kv_pool_allocator.alloc(n_slots)
+                    if fresh is None or len(fresh) < n_slots:
+                        if fresh is not None:
+                            self.token_to_kv_pool_allocator.free(fresh)
+                        return False
+                    fresh_list = self._value_to_int_list(fresh)
+                    source = []
+                    generations = []
+                    for slots, page_generations in pages:
+                        source.extend(slots)
+                        generations.extend(page_generations)
+                    triples = [
+                        (src, dst, generation)
+                        for src, dst, generation in zip(source, fresh_list, generations)
+                    ]
+                    foreign = str(self._source_engine_id) != str(self._engine_id)
+                    if foreign or not self._gds.is_available():
+                        results = self._gds.restore_blocks_remap_from_host(
+                            self._source_engine_id, triples
+                        )
+                    else:
+                        results = self._gds.restore_blocks_remap(triples)
+                    if len(results) != len(triples) or not all(results.values()):
+                        self.token_to_kv_pool_allocator.free(fresh)
+                        return False
+
+                import torch
+
+                matched_len = (
+                    int(len(matched_value)) if matched_value is not None else 0
+                )
+                prefix_len = (start_block + len(pages)) * page_size
+                restore_key = key[:prefix_len]
+                if matched_len > 0:
+                    prefix_value = matched_value[:matched_len]
+                    if getattr(prefix_value, "device", None) != getattr(
+                        fresh, "device", None
+                    ):
+                        prefix_value = prefix_value.to(fresh.device)
+                    value = torch.cat([prefix_value, fresh])
+                else:
+                    value = fresh
+                if not self._install_directory_value(restore_key, value):
+                    raise RuntimeError("failed to install SGLang directory value")
+                if tier == "hbm":
+                    log_adoption = (
+                        logger.warning
+                        if os.environ.get("GMS_KV_DIRECTORY_DIAGNOSTICS")
+                        else logger.info
+                    )
+                    log_adoption(
+                        "[GMS-KVDirectory] SGLang adopted_hbm_pages=%d", len(pages)
+                    )
+                return True
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "[GMSRadixCache eng=%s] directory restore failed",
+                    self._engine_id,
+                    exc_info=True,
+                )
+                if acquired:
+                    try:
+                        self._content_directory.publish(
+                            [
+                                {
+                                    "content_hash": content_hash,
+                                    "engine_id": self._engine_id,
+                                    "slot_id": int(lease.block_id),
+                                    "generation": int(lease.generation),
+                                    "tier": "hbm",
+                                    "sealed": False,
+                                }
+                                for content_hash, lease in zip(hashes, acquired)
+                            ]
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "[GMSRadixCache eng=%s] failed to invalidate "
+                            "an incomplete HBM adoption",
+                            self._engine_id,
+                        )
+                    from gpu_memory_service.integrations.sglang.install_kv_leases import (
+                        rollback_adopted_hbm_pages,
+                    )
+
+                    rollback_adopted_hbm_pages(
+                        self.token_to_kv_pool_allocator, acquired
+                    )
+                elif fresh is not None:
+                    self.token_to_kv_pool_allocator.free(fresh)
+                return False
+            finally:
+                if claim_token is not None:
+                    self._content_directory.release_claim(claim_token)
+
         def _restore_staged_suffix_for_key(self, key, matched_value) -> bool:
             """Restore a contiguous staged suffix and insert it in the tree.
 
@@ -625,7 +926,9 @@ def make_gms_radix_cache_class():
             explicit slot ranges, then inserts the resulting prefix into the
             radix tree so vanilla matching can consume it.
             """
-            if not self._cross_node_staging_enabled:
+            if not (
+                self._cross_node_staging_enabled or self._content_directory.enabled
+            ):
                 return False
             page_size = int(getattr(self, "page_size", 0))
             if page_size <= 0:
@@ -639,27 +942,33 @@ def make_gms_radix_cache_class():
             if not tokens:
                 return False
             matched_len = int(len(matched_value)) if matched_value is not None else 0
-            if matched_len >= len(tokens) or matched_len % page_size != 0:
+            if matched_len % page_size != 0:
                 return False
             try:
-                from gms_kv_ring.common.prefix_hashes import prefix_block_hashes
-
-                block_hashes = prefix_block_hashes(
-                    tokens,
-                    page_size,
-                    self._cross_node_salt,
+                block_hashes = self._gms_prefix_hashes(
+                    tokens, extra_key=getattr(key, "extra_key", None)
                 )
             except Exception:  # noqa: BLE001
                 logger.debug(
-                    "[GMSRadixCache eng=%s] staged prefix hash " "compute failed",
+                    "[GMSRadixCache eng=%s] staged prefix hash compute failed",
                     self._engine_id,
                     exc_info=True,
                 )
                 return False
+            if matched_len >= len(tokens):
+                if self._content_directory.mode == "shadow":
+                    self._restore_directory_suffix(key, matched_value, block_hashes, 0)
+                return False
             start_block = matched_len // page_size
             if start_block >= len(block_hashes):
                 return False
+            if self._restore_directory_suffix(
+                key, matched_value, block_hashes, start_block
+            ):
+                return True
             candidate_hashes = block_hashes[start_block:]
+            if not self._cross_node_staging_enabled:
+                return False
             hits = self._staging_scan(candidate_hashes)
             staged: list[tuple[bytes, int]] = []
             for h in candidate_hashes:
@@ -679,7 +988,7 @@ def make_gms_radix_cache_class():
                 fresh = self.token_to_kv_pool_allocator.alloc(n_slots)
             except Exception:  # noqa: BLE001
                 logger.warning(
-                    "[GMSRadixCache eng=%s] alloc failed during " "staged restore",
+                    "[GMSRadixCache eng=%s] alloc failed during staged restore",
                     self._engine_id,
                     exc_info=True,
                 )
@@ -749,6 +1058,80 @@ def make_gms_radix_cache_class():
         # Spill / restore
         # --------------------------------------------------------
 
+        def _publish_inserted_hbm(self, key, value, prefix_len: int) -> None:
+            if (
+                not self._content_directory.authoritative
+                or value is None
+                or not hasattr(
+                    self.token_to_kv_pool_allocator, "_gms_kv_leases_by_page"
+                )
+            ):
+                return
+            page_size = int(self.page_size)
+            try:
+                key, value = key.maybe_to_bigram_view(self.is_eagle, value)
+                key = key.page_aligned(page_size)
+                value = value[: len(key)]
+                prefix_len = max(0, int(prefix_len))
+                suffix = value[prefix_len:]
+                if len(suffix) == 0 or len(suffix) % page_size != 0:
+                    return
+                self._maybe_register_cross_node(
+                    self.root_node,
+                    self._value_to_int_list(suffix),
+                    [0] * len(suffix),
+                    "hbm",
+                    prefix_tokens=self._key_to_int_list(key),
+                    active_hbm=True,
+                    extra_key=getattr(key, "extra_key", None),
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "[GMSRadixCache eng=%s] active HBM publication failed",
+                    self._engine_id,
+                    exc_info=True,
+                )
+                raise
+
+        def _retain_hbm_node(self, node) -> bool:
+            """Publish an evictable native leaf and keep its GMS pages alive."""
+            value = node.value
+            if value is None:
+                return False
+            slot_indices = self._value_to_int_list(value)
+            page_size = int(self.page_size)
+            if not slot_indices or len(slot_indices) % page_size != 0:
+                return False
+            try:
+                prefix_tokens = self._collect_prefix_tokens(node)
+                self._maybe_register_cross_node(
+                    node,
+                    slot_indices,
+                    [0] * len(slot_indices),
+                    "hbm",
+                    prefix_tokens=prefix_tokens,
+                )
+                from gpu_memory_service.integrations.sglang.install_kv_leases import (
+                    retain_hbm_indices,
+                )
+
+                leases = retain_hbm_indices(self.token_to_kv_pool_allocator, value)
+                if len(leases) != len(slot_indices) // page_size:
+                    return False
+                flush = getattr(self._content_directory, "flush_deferred", None)
+                if flush is not None and not flush(timeout=2.0):
+                    raise TimeoutError("GMS SGLang HBM directory commit timed out")
+                return True
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "[GMSRadixCache eng=%s] HBM retention failed",
+                    self._engine_id,
+                    exc_info=True,
+                )
+                if self._content_directory.authoritative:
+                    raise
+                return False
+
         def _spill_node(self, node, *, force_host_tier: bool = False) -> bool:
             """Read node.value bytes from HBM into daemon
             storage keyed by the slot indices. Returns True on
@@ -817,7 +1200,11 @@ def make_gms_radix_cache_class():
             # the work is bounded by tree depth and runs on the
             # already-slow evict path.
             prefix_tokens: Optional[list] = None
-            if self._persist_enabled or self._cross_node_register:
+            if (
+                self._persist_enabled
+                or self._cross_node_register
+                or self._content_directory.enabled
+            ):
                 try:
                     prefix_tokens = self._collect_prefix_tokens(node)
                 except Exception:  # noqa: BLE001
@@ -839,6 +1226,8 @@ def make_gms_radix_cache_class():
             self._maybe_register_cross_node(
                 node,
                 slot_indices,
+                new_gens,
+                "host" if host_spill else "storage",
                 prefix_tokens=prefix_tokens,
             )
             return True
@@ -902,7 +1291,7 @@ def make_gms_radix_cache_class():
             )
             if zlib.crc32(pkl) & 0xFFFFFFFF != stored_crc:
                 logger.warning(
-                    "[GMSRadixCache eng=%s] snapshot CRC mismatch; " "ignoring",
+                    "[GMSRadixCache eng=%s] snapshot CRC mismatch; ignoring",
                     self._engine_id,
                 )
                 return None
@@ -954,7 +1343,7 @@ def make_gms_radix_cache_class():
                 self._atomic_write(self._persist_path, blob)
             except OSError:
                 logger.warning(
-                    "[GMSRadixCache eng=%s] snapshot write to %s " "failed",
+                    "[GMSRadixCache eng=%s] snapshot write to %s failed",
                     self._engine_id,
                     self._persist_path,
                     exc_info=True,
@@ -971,7 +1360,7 @@ def make_gms_radix_cache_class():
                     n = self._take_snapshot()
                     if n:
                         logger.debug(
-                            "[GMSRadixCache eng=%s] snapshot %d " "entries",
+                            "[GMSRadixCache eng=%s] snapshot %d entries",
                             self._engine_id,
                             n,
                         )
@@ -1120,7 +1509,7 @@ def make_gms_radix_cache_class():
                 )
             except Exception:  # noqa: BLE001
                 logger.warning(
-                    "[GMSRadixCache eng=%s] alloc failed during " "restore",
+                    "[GMSRadixCache eng=%s] alloc failed during restore",
                     self._engine_id,
                     exc_info=True,
                 )
@@ -1323,6 +1712,12 @@ def make_gms_radix_cache_class():
                     self._epoch_client = None
             except Exception:  # noqa: BLE001
                 pass
+            try:
+                directory = getattr(self, "_content_directory", None)
+                if directory is not None:
+                    directory.close()
+            except Exception:  # noqa: BLE001
+                pass
 
         def __del__(self):
             try:
@@ -1390,10 +1785,20 @@ def make_gms_radix_cache_class():
                 _prio, x = heapq.heappop(eviction_heap)
                 # 1. Spill BEFORE freeing HBM (daemon needs to
                 #    read the live bytes).
-                spilled = self._spill_node(
-                    x,
-                    force_host_tier=force_host_tier,
-                )
+                if (
+                    self._content_directory.authoritative
+                    and not force_host_tier
+                    and hasattr(
+                        self.token_to_kv_pool_allocator,
+                        "_gms_kv_leases_by_page",
+                    )
+                ):
+                    spilled = self._retain_hbm_node(x)
+                else:
+                    spilled = self._spill_node(
+                        x,
+                        force_host_tier=force_host_tier,
+                    )
                 # 2. Free HBM back to allocator either way.
                 value_len = len(x.value) if x.value is not None else 0
                 if x.value is not None:
@@ -1446,6 +1851,8 @@ def make_gms_radix_cache_class():
                 # CRITICAL: restore spilled children before
                 # reading their value tensor.
                 if child.value is None and id(child) in self._spilled:
+                    if self._content_directory.authoritative:
+                        break
                     if not self._restore_node(child):
                         break
                 if child.value is None:
@@ -1481,6 +1888,20 @@ def make_gms_radix_cache_class():
         # children have been restored by the time we touch
         # `child.value`. So we ONLY need to override evict() at
         # the public level — match_prefix() works via the helper.
+
+        def insert(self, *args, **kwargs):  # type: ignore[override]
+            result = super().insert(*args, **kwargs)
+            if self._content_directory.authoritative:
+                if _new_api is not None:
+                    params = args[0] if args else kwargs["params"]
+                    prefix_len = int(result.prefix_len)
+                    self._publish_inserted_hbm(params.key, params.value, prefix_len)
+                else:
+                    key = args[0] if args else kwargs["key"]
+                    value = args[1] if len(args) > 1 else kwargs.get("value")
+                    prefix_len = int(getattr(result, "prefix_len", result or 0))
+                    self._publish_inserted_hbm(key, value, prefix_len)
+            return result
 
         if _new_api is not None:
             # Latest upstream main: structured params + results.

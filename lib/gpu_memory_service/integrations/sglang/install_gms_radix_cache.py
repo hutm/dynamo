@@ -39,9 +39,13 @@ def install() -> bool:
     global _INSTALLED
     if _INSTALLED:
         return False
-    if os.environ.get("GMS_SGLANG_ENABLE_KV_RING") != "1":
+    directory_mode = os.environ.get("GMS_KV_DIRECTORY_MODE", "off").lower()
+    if (
+        os.environ.get("GMS_SGLANG_ENABLE_KV_RING") != "1"
+        and directory_mode not in ("shadow", "authoritative")
+    ):
         logger.debug(
-            "GMS_SGLANG_ENABLE_KV_RING not set; skipping install",
+            "SGLang GMS radix cache disabled; skipping install",
         )
         return False
     try:
@@ -98,14 +102,15 @@ def _swap_tree_cache(scheduler) -> None:
     # GMSRadixCache constructed below uses `gds=None` and
     # behaves identically to vanilla — safe degradation.
     gds = None
-    daemon_socket = os.environ.get("GMS_SGLANG_DAEMON_SOCKET")
+    gds_socket = os.environ.get("GMS_SGLANG_DAEMON_SOCKET")
+    directory_socket = gds_socket or os.environ.get("GMS_KV_DIRECTORY_SOCKET")
     engine_id = os.environ.get("GMS_SGLANG_ENGINE_ID", "0")
     block_layout_fn = None
-    if daemon_socket and os.path.exists(daemon_socket):
+    if gds_socket and os.path.exists(gds_socket):
         try:
             gds, block_layout_fn = _build_gds_connector(
                 allocator=old.token_to_kv_pool_allocator,
-                daemon_socket=daemon_socket,
+                daemon_socket=gds_socket,
                 engine_id=engine_id,
             )
         except Exception:  # noqa: BLE001
@@ -127,9 +132,48 @@ def _swap_tree_cache(scheduler) -> None:
         gds=gds,
         block_layout_fn=block_layout_fn,
         engine_id=engine_id,
-        daemon_socket=daemon_socket if gds is not None else None,
+        daemon_socket=directory_socket,
     )
     scheduler.tree_cache = new
+    from dataclasses import fields, is_dataclass
+
+    def cache_attrs(owner):
+        names = set(vars(owner)) if hasattr(owner, "__dict__") else set()
+        if is_dataclass(owner):
+            names.update(field.name for field in fields(owner))
+        return [
+            (name, getattr(owner, name))
+            for name in names
+            if hasattr(owner, name)
+        ]
+
+    rebound = []
+    owners = [
+        (owner_name, owner)
+        for owner_name, owner in vars(scheduler).items()
+        if owner is not old
+    ]
+    for owner_name, owner in owners:
+        for attr_name, value in cache_attrs(owner):
+            if value is old:
+                object.__setattr__(owner, attr_name, new)
+                rebound.append(f"{owner_name}.{attr_name}")
+    canary = getattr(getattr(scheduler, "tp_worker", None), "model_runner", None)
+    canary = getattr(canary, "canary_manager", None)
+    if canary is not None:
+        canary.attach_radix_cache(new)
+    stale = [
+        f"{owner_name}.{attr_name}"
+        for owner_name, owner in owners
+        for attr_name, value in cache_attrs(owner)
+        if value is old
+    ]
+    if stale:
+        raise RuntimeError(f"stale SGLang tree-cache references: {stale}")
+    logger.info(
+        "[GMSRadixCache install] rebound cache references: %s",
+        ", ".join(rebound) or "none",
+    )
     try:
         from gpu_memory_service.integrations.common.transition_reclaim import (
             start_kv_transition_reclaim_watcher,
