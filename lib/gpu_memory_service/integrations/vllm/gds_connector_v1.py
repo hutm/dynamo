@@ -492,7 +492,7 @@ def _power_of_2_env(
         # Not power-of-2; find largest power-of-2 <= n.
         rounded = 1 << (n.bit_length() - 1)
         logger.warning(
-            "[GMS GDS Connector] %s=%d is not a power-of-2; " "rounding down to %d",
+            "[GMS GDS Connector] %s=%d is not a power-of-2; rounding down to %d",
             var,
             n,
             rounded,
@@ -745,6 +745,9 @@ def _build_layers_and_layout(
 from gms_kv_ring.common.prefix_hashes import (  # noqa: E402
     prefix_block_hashes as _prefix_block_hashes,
 )
+from gms_kv_ring.common.content_directory import (  # noqa: E402
+    ContentDirectory as _ContentDirectory,
+)
 
 # Snapshot file format for `_PrefixIndex.snapshot/_load_snapshot`.
 # Layout:
@@ -973,6 +976,18 @@ class GMSKVCacheConnectorV1(_KVConnectorBase_V1):
             # cache_config not always present in test stubs.
             self._block_size_tokens = 0
 
+        self._content_directory = _ContentDirectory(
+            self._epoch_socket,
+            engine="vllm",
+            block_size=self._block_size_tokens,
+            engine_id=self.engine_id,
+            mode=self._extra_config.get("gms_kv_directory_mode"),
+        )
+        start_directory_sync = getattr(
+            self._content_directory, "start_async_read", None
+        )
+        if start_directory_sync is not None:
+            start_directory_sync()
         # Worker state — populated lazily on register_kv_caches.
         self._handle = None
         self._gds_conn = None
@@ -1126,6 +1141,13 @@ class GMSKVCacheConnectorV1(_KVConnectorBase_V1):
         except Exception:  # noqa: BLE001
             pass
 
+        try:
+            directory = getattr(self, "_content_directory", None)
+            if directory is not None:
+                directory.close()
+        except Exception:  # noqa: BLE001
+            pass
+
     def __del__(self) -> None:
         try:
             self.shutdown()
@@ -1199,6 +1221,43 @@ class GMSKVCacheConnectorV1(_KVConnectorBase_V1):
             salt,
             self._source_engine_id,
         )
+        if self._content_directory.enabled:
+            directory_entries: list[tuple[int, int]] = []
+            try:
+                raw_entries = self._content_directory.lookup(block_hashes)
+                for entry in raw_entries:
+                    if entry is None or entry.get("state") != "ready":
+                        break
+                    # The existing metadata path restores one source engine
+                    # per connector. Mixed-source assembly remains a future
+                    # protocol extension; stop safely at the first mismatch.
+                    if str(entry.get("engine_id")) != str(self._source_engine_id):
+                        break
+                    slots = entry.get("slot_ids") or []
+                    generations = entry.get("generations") or []
+                    if len(slots) != 1 or len(generations) != 1:
+                        break
+                    directory_entries.append((int(slots[0]), int(generations[0])))
+                if self._content_directory.mode == "shadow":
+                    if directory_entries != src_entries:
+                        logger.warning(
+                            "GMS KV directory shadow mismatch request=%s "
+                            "legacy_blocks=%d directory_blocks=%d",
+                            request.request_id,
+                            len(src_entries),
+                            len(directory_entries),
+                        )
+                else:
+                    src_entries = directory_entries
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "GMS KV directory lookup failed request=%s mode=%s",
+                    request.request_id,
+                    self._content_directory.mode,
+                    exc_info=True,
+                )
+                if self._content_directory.authoritative:
+                    src_entries = []
         local_match_blocks = len(src_entries)
         staging_hits: dict[bytes, dict] = {}
         staging_extra = 0
@@ -1391,7 +1450,7 @@ class GMSKVCacheConnectorV1(_KVConnectorBase_V1):
             # get empty bytes (no content_hash → not registerable).
             hashes: list[bytes] = []
             if (
-                self._cross_node_register
+                (self._cross_node_register or self._content_directory.enabled)
                 and self._block_size_tokens > 0
                 and getattr(request, "prompt_token_ids", None)
             ):
@@ -1785,6 +1844,7 @@ class GMSKVCacheConnectorV1(_KVConnectorBase_V1):
         # entries in this step into a single batched RPC at the end
         # (one RPC per bind instead of one per request).
         cross_node_batch: list[dict] = []
+        directory_batch: list[dict] = []
         for entry in evict_queue:
             # Tolerate v4 (no hashes) and v5 (hashes) shapes.
             if len(entry) == 4:
@@ -1793,12 +1853,15 @@ class GMSKVCacheConnectorV1(_KVConnectorBase_V1):
                 req_id, block_ids, gens = entry
                 block_hashes = []
             failed_ids: set[int] = set()
-            if available or self._should_evict_to_host(available):
+            did_spill = False
+            spill_to_host = self._should_evict_to_host(available)
+            spill_tier = "host" if spill_to_host else "storage"
+            if available or spill_to_host:
                 gens_map = {
                     int(b): int(g) for b, g in zip(block_ids, gens) if int(g) != 0
                 }
                 try:
-                    if self._should_evict_to_host(available):
+                    if spill_to_host:
                         res = self._gds_conn.evict_blocks_to_host(
                             block_ids,
                             generations=gens_map if gens_map else None,
@@ -1808,6 +1871,7 @@ class GMSKVCacheConnectorV1(_KVConnectorBase_V1):
                             block_ids,
                             generations=gens_map if gens_map else None,
                         )
+                    did_spill = True
                     if res.failed:
                         metrics.connector_evict_failures.inc(
                             engine_id=eid,
@@ -1857,6 +1921,25 @@ class GMSKVCacheConnectorV1(_KVConnectorBase_V1):
                             "ranges": self._block_layout(int(bid)),
                         }
                     )
+            if (
+                self._content_directory.enabled
+                and did_spill
+                and block_hashes
+                and self._block_layout is not None
+            ):
+                for bid, generation, content_hash in zip(block_ids, gens, block_hashes):
+                    if not content_hash or int(bid) in failed_ids:
+                        continue
+                    directory_batch.append(
+                        {
+                            "content_hash": content_hash,
+                            "engine_id": eid,
+                            "slot_id": int(bid),
+                            "generation": int(generation),
+                            "ranges": self._block_layout(int(bid)),
+                            "tier": spill_tier,
+                        }
+                    )
             self._worker_finished_saves.add(req_id)
 
         if cross_node_batch and self._handle is not None:
@@ -1881,6 +1964,25 @@ class GMSKVCacheConnectorV1(_KVConnectorBase_V1):
                     exc_info=True,
                 )
                 self._cross_node_xfer_enabled = False
+
+        if directory_batch:
+            try:
+                publish = getattr(
+                    self._content_directory,
+                    "publish_deferred",
+                    self._content_directory.publish,
+                )
+                publish(directory_batch)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "[GMS GDS Connector] directory publication failed "
+                    "(size=%d mode=%s)",
+                    len(directory_batch),
+                    self._content_directory.mode,
+                    exc_info=True,
+                )
+                if self._content_directory.authoritative:
+                    raise
 
     def clear_connector_metadata(self) -> None:
         """vLLM calls this AFTER the forward pass for the step. We
