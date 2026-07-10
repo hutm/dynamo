@@ -66,6 +66,10 @@ from dynamo.common.utils.engine_response import normalize_finish_reason
 from dynamo.common.utils.input_params import InputParamManager
 from dynamo.common.utils.structural_tag import serialize_structural_tag
 from dynamo.common.utils.time_section import time_and_log_code_section
+from dynamo.gms_router_policy import (
+    maybe_fetch_gms_placement,
+    resolve_vllm_gms_daemon_socket,
+)
 from dynamo.llm import (
     KvEventPublisher,
     ModelInput,
@@ -3073,6 +3077,13 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             multi_modal_data = prepared_input.multi_modal_data
             mm_processor_kwargs = prepared_input.mm_processor_kwargs
             pre_rendered = prepared_input.pre_rendered_prompt
+
+        await maybe_fetch_gms_placement(
+            request,
+            resolve_vllm_gms_daemon_socket(self.engine_client.vllm_config),
+            logger=logger,
+            request_id=request_id,
+        )
 
         # Build prompt from request. `prompt` is either a pre-rendered
         # MultiModalInput dict (fast path) or a TokensPrompt/EmbedsPrompt from
