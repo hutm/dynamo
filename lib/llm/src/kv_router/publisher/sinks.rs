@@ -155,6 +155,26 @@ pub(super) async fn admit_local_event(
     local_indexer.apply_event_with_buffer(event.clone()).await
 }
 
+pub(super) async fn emit_router_event(
+    local_indexer: &Option<Arc<LocalKvIndexer>>,
+    router_event: RouterEvent,
+    output: &mut Vec<RouterEvent>,
+) -> bool {
+    let applied = match admit_local_event(local_indexer.as_deref(), &router_event).await {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                worker_id = router_event.worker_id,
+                %error,
+                "Failed to apply event to local indexer"
+            );
+            false
+        }
+    };
+    output.push(router_event);
+    applied
+}
+
 pub(super) async fn emit(
     local_indexer: &Option<Arc<LocalKvIndexer>>,
     worker_id: u64,
@@ -163,15 +183,10 @@ pub(super) async fn emit(
     event: KvCacheEvent,
     output: &mut Vec<RouterEvent>,
 ) -> bool {
-    let router_event =
-        RouterEvent::with_residency_domain(worker_id, event, storage_tier, residency_domain);
-    let applied = match admit_local_event(local_indexer.as_deref(), &router_event).await {
-        Ok(()) => true,
-        Err(error) => {
-            tracing::warn!(worker_id, %error, "Failed to apply event to local indexer");
-            false
-        }
-    };
-    output.push(router_event);
-    applied
+    emit_router_event(
+        local_indexer,
+        RouterEvent::with_residency_domain(worker_id, event, storage_tier, residency_domain),
+        output,
+    )
+    .await
 }

@@ -15,7 +15,7 @@ use crate::kv_router::metrics::kv_publisher_metrics;
 use super::DEFAULT_MAX_BATCH_BLOCKS;
 use super::batching::BatchingState;
 use super::dedup::{EventDedupFilter, EventDedupPolicy};
-use super::sinks::{RouterEventBatchSink, emit};
+use super::sinks::{RouterEventBatchSink, emit, emit_router_event};
 
 pub(super) async fn run_event_processor_loop<P: RouterEventBatchSink + 'static>(
     publisher: P,
@@ -83,6 +83,30 @@ pub(super) async fn run_event_processor_loop<P: RouterEventBatchSink + 'static>(
                         worker_id,
                         placement_event.event.data
                     );
+
+                    // GMS metadata is already one atomic placement mutation. Do not
+                    // merge it with ordinary KV mutations, whose data payload is only
+                    // a compatibility envelope for the existing router event stream.
+                    if let Some(gms_placement) = placement_event.gms_placement {
+                        batching_state
+                            .flush(&local_indexer, worker_id, &mut dedup, &mut output)
+                            .await;
+                        let mut event = placement_event.event;
+                        event.event_id = batching_state.next_publish_id;
+                        let mut router_event = RouterEvent::with_residency_domain(
+                            worker_id,
+                            event,
+                            storage_tier,
+                            residency_domain,
+                        );
+                        router_event.gms_placement = Some(gms_placement);
+                        let _ = emit_router_event(&local_indexer, router_event, &mut output).await;
+                        batching_state.next_publish_id = batching_state
+                            .next_publish_id
+                            .checked_add(1)
+                            .expect("KV event publisher outbound cursor exhausted");
+                        continue;
+                    }
 
                     match &placement_event.event.data {
                         KvCacheEventData::Removed(_) | KvCacheEventData::Stored(_) => {
