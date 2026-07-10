@@ -26,6 +26,31 @@ from tests.utils.port_utils import allocate_ports, deallocate_ports
 logger = logging.getLogger(__name__)
 
 
+def _tp_size() -> int:
+    """Tensor-parallel size for the failover scenario (GMS_TEST_TP_SIZE, default 1).
+
+    TP=N runs each engine across devices 0..N-1; the GMS weights + kv_cache
+    daemons are started on each of those devices. The engine's own collective
+    (vLLM mp executor / sglang tp schedulers) applies
+    pause/resume across all ranks, so failover stays group-atomic without the
+    harness coordinating per-rank.
+    """
+    return max(1, int(os.environ.get("GMS_TEST_TP_SIZE", "1")))
+
+
+def _tp_visible_devices() -> str:
+    tp = _tp_size()
+    inherited = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if inherited:
+        devices = [device.strip() for device in inherited.split(",") if device.strip()]
+        if len(devices) < tp:
+            raise ValueError(
+                f"GMS_TEST_TP_SIZE={tp} exceeds CUDA_VISIBLE_DEVICES={inherited!r}"
+            )
+        return ",".join(devices[:tp])
+    return ",".join(str(i) for i in range(tp))
+
+
 class GMSProcessManager:
     """Start the shared GMS daemons and frontend for one test scenario."""
 
@@ -56,6 +81,7 @@ class GMSProcessManager:
     def __enter__(self):
         stack = ExitStack()
         try:
+            tp = _tp_size()
             if self._kv_directory:
                 shared_dir = stack.enter_context(
                     tempfile.TemporaryDirectory(prefix="gms-local-failover-")
@@ -83,6 +109,8 @@ class GMSProcessManager:
                 self.weights_gms = stack.enter_context(
                     GMSServer(device=0, tag="weights")
                 )
+                for d in range(1, tp):
+                    stack.enter_context(GMSServer(device=d, tag="weights"))
             if "kv_cache" in self._tags:
                 self.kv_cache_gms = stack.enter_context(
                     GMSServer(
@@ -91,6 +119,8 @@ class GMSProcessManager:
                         directory_socket_path=self.kv_directory_socket,
                     )
                 )
+                for d in range(1, tp):
+                    stack.enter_context(GMSServer(device=d, tag="kv_cache"))
             frontend = stack.enter_context(
                 DynamoFrontendProcess(
                     self._request,
@@ -211,7 +241,7 @@ class GMSEngineProcess(EngineProcess, ABC):
                 (f"http://localhost:{frontend_port}/v1/models", check_models_api),
                 (f"http://localhost:{frontend_port}/health", check_health_generate),
             ],
-            timeout=300,
+            timeout=1200,
             display_output=True,
             terminate_all_matching_process_names=False,
             stragglers=[],
@@ -313,7 +343,10 @@ class VLLMWithGMSProcess(GMSEngineProcess):
             raise
 
     def env_updates(self) -> dict[str, str]:
-        return {"VLLM_NIXL_SIDE_CHANNEL_PORT": str(self.nixl_port)}
+        return {
+            "VLLM_NIXL_SIDE_CHANNEL_PORT": str(self.nixl_port),
+            "CUDA_VISIBLE_DEVICES": _tp_visible_devices(),
+        }
 
     def command(self) -> list[str]:
         kv_events_cfg = json.dumps(
@@ -337,9 +370,17 @@ class VLLMWithGMSProcess(GMSEngineProcess):
             "--max-num-seqs",
             "1",
             "--gpu-memory-utilization",
+            # Env-configurable: shadow engines start while a prior engine's
+            # GMS-persistent KV pool is still resident, so vLLM's startup
+            # free-memory preflight (free >= util*total) needs headroom for a
+            # second/third coexisting allocation. Default 0.8 matches upstream;
+            # the failover repro lowers it so the preflight passes and the
+            # geometry patch reattaches the shared pool.
             os.environ.get("VLLM_GMS_GPU_MEM_UTIL", "0.8"),
             "--kv-events-config",
             kv_events_cfg,
+            "--tensor-parallel-size",
+            str(_tp_size()),
         ]
         command.extend(
             build_gpu_mem_args("build_vllm_gpu_mem_args")
@@ -492,6 +533,8 @@ class SGLangWithGMSProcess(GMSEngineProcess):
             "0.8",
             "--port",
             str(self.serve_port),
+            "--tp-size",
+            str(_tp_size()),
         ]
         extra_config = self.model_loader_extra_config()
         if extra_config is not None:
@@ -504,7 +547,10 @@ class SGLangWithGMSProcess(GMSEngineProcess):
         return command
 
     def env_updates(self) -> dict[str, str]:
-        return {"NVCC_PREPEND_FLAGS": "-ccbin /usr/bin/g++"}
+        return {
+            "NVCC_PREPEND_FLAGS": "-ccbin /usr/bin/g++",
+            "CUDA_VISIBLE_DEVICES": _tp_visible_devices(),
+        }
 
     def pause_payload(self) -> dict:
         return {}
