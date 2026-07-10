@@ -43,6 +43,24 @@ pytestmark = [pytest.mark.nightly, pytest.mark.fault_tolerance]
 
 logger = logging.getLogger(__name__)
 
+def _directory_diagnostics(*processes: ManagedProcess) -> str:
+    lines = []
+    for process in processes:
+        for line in process.read_logs().splitlines():
+            lowered = line.lower()
+            if (
+                "gms-kvdiag" in lowered
+                or "gms-kvdirectory" in lowered
+                or "hbm directory adoption" in lowered
+                or "bulk hbm hydration" in lowered
+                or "traceback" in lowered
+                or "runtimeerror" in lowered
+                or "gmsradix" in lowered
+            ):
+                lines.append(line)
+    return "\n".join(lines[-80:])
+
+
 _HBM_RECOVERY_PROMPT = (
     "GMS persistent HBM recovery probe. The promoted shadow must reuse this exact "
     "deterministic prefix without recomputing its key value cache. "
@@ -74,14 +92,21 @@ def _start_primary(
     kv_cache_gms,
     *,
     weights_hash: str,
+    cleared_layouts: int = 2,
 ):
     primary = manager.start_engine("primary", read_only_weights=True)
-    assert_completion_ok(
-        frontend_port,
-        "Primary test",
-        failure_message="Primary inference failed",
-        success_message="Primary inference OK",
-    )
+    try:
+        assert_completion_ok(
+            frontend_port,
+            "Primary test",
+            failure_message="Primary inference failed",
+            success_message="Primary inference OK",
+        )
+    except Exception as exc:
+        logs = primary.read_logs()
+        raise AssertionError(
+            f"Primary inference failed: {exc}\n{logs[-30000:]}"
+        ) from exc
 
     weights_with_primary, _ = wait_for_active_layout(
         weights_gms,
@@ -91,7 +116,7 @@ def _start_primary(
     )
     assert_kv_history(
         kv_cache_gms.get_event_history().events,
-        cleared_layouts=2,
+        cleared_layouts=cleared_layouts,
         suffix=["rw_connected"],
     )
     return primary, weights_with_primary
@@ -129,6 +154,7 @@ def _resume_shadow_after_primary_failover(
     shadow: ManagedProcess,
     kv_cache_gms,
     primary: ManagedProcess,
+    after_primary_kill=None,
 ):
     # Pre-activation failover model: the shadow begins taking over as soon as a
     # crash is detected, and may go live BEFORE the primary fully dies. Primary
@@ -148,6 +174,8 @@ def _resume_shadow_after_primary_failover(
         assert kv_with_primary.allocation_count > 0
 
         _kill_process_group(primary)
+        if after_primary_kill is not None:
+            after_primary_kill()
 
         # After the primary is gone the shadow must fully reacquire the KV pool.
         deadline = time.monotonic() + 30.0
@@ -165,9 +193,9 @@ def _resume_shadow_after_primary_failover(
         result = resume_future.result(timeout=resume_timeout_s)
         kv_with_shadow = kv_cache_gms.get_runtime_state()
         assert kv_with_shadow.state == ServerState.RW
-        assert (
-            kv_with_shadow.allocation_count == kv_with_primary.allocation_count
-        ), "failover changed the committed shared KV allocation count"
+        assert kv_with_shadow.allocation_count == kv_with_primary.allocation_count, (
+            "failover changed the committed shared KV allocation count"
+        )
         return result
 
 
@@ -258,16 +286,21 @@ def _run_shadow_failover_test(
 def test_gms_minimal_cold_hbm_failover_vllm(
     request, runtime_services_dynamic_ports, predownload_models, monkeypatch
 ):
-    """Prove the smallest local persistent-KV failover loop.
+    """Smallest complete GMS KV-failover loop.
 
-    The replacement starts only after the primary is killed. There is no
-    prewarm, async metadata view, request replay, cooperative handoff or
-    latency target in this baseline.
+    There is no prewarmed shadow, async metadata view, cooperative handoff or
+    latency target.  The primary is killed, a replacement vLLM process starts
+    from scratch, reattaches the GMS-owned HBM allocation, hydrates its native
+    block index on demand and proves reuse of the exact warmed prefix.
     """
     monkeypatch.setenv("VLLM_GMS_GPU_MEM_UTIL", "0.22")
+    monkeypatch.setenv("GMS_KV_DIRECTORY_ASYNC_READ", "0")
+    monkeypatch.setenv("GMS_KV_DIRECTORY_ASYNC_PUBLISH", "0")
+    monkeypatch.setenv("GMS_KV_DIRECTORY_DIAGNOSTICS", "1")
 
     with GMSProcessManager(request, VLLMWithGMSProcess, kv_directory=True) as manager:
         assert manager.frontend_port is not None
+        assert manager.kv_cache_gms is not None
         assert manager.kv_directory_socket is not None
         assert manager.kv_directory_manifest is not None
 
@@ -319,7 +352,197 @@ def test_gms_minimal_cold_hbm_failover_vllm(
             body_overrides={"temperature": 0},
         )
         assert shadow_output == primary_output
-        assert "adopted_hbm_blocks=" in shadow.read_logs()
+        logs = shadow.read_logs()
+        assert "adopted_hbm_blocks=" in logs, _directory_diagnostics(primary, shadow)
+
+
+@pytest.mark.e2e
+@pytest.mark.gpu_1
+@pytest.mark.model(FAULT_TOLERANCE_MODEL_NAME)
+@pytest.mark.timeout(600)
+@pytest.mark.vllm
+def test_gms_authoritative_hbm_failover_vllm(
+    request, runtime_services_dynamic_ports, predownload_models, monkeypatch
+):
+    monkeypatch.setenv("VLLM_GMS_GPU_MEM_UTIL", "0.22")
+    monkeypatch.setenv("GMS_KV_DIRECTORY_DIAGNOSTICS", "1")
+    monkeypatch.setenv("GMS_KV_DIRECTORY_ASYNC_READ", "1")
+    monkeypatch.setenv("GMS_KV_DIRECTORY_ASYNC_PUBLISH", "1")
+    with GMSProcessManager(request, VLLMWithGMSProcess, kv_directory=True) as manager:
+        assert manager.frontend_port is not None
+        assert manager.weights_gms is not None
+        assert manager.kv_cache_gms is not None
+        assert manager.kv_directory_socket is not None
+        assert manager.kv_directory_manifest is not None
+
+        shadow = manager.start_engine("shadow", directory_standby=True)
+        weights_state = pause_engine(
+            manager.weights_gms,
+            manager.kv_cache_gms,
+            shadow,
+            pause_label="Directory shadow pause",
+        )
+        primary, weights_with_primary = _start_primary(
+            manager,
+            manager.frontend_port,
+            manager.weights_gms,
+            manager.kv_cache_gms,
+            weights_hash=weights_state.memory_layout_hash,
+            cleared_layouts=1,
+        )
+        assert_completion_ok(
+            manager.frontend_port,
+            _HBM_RECOVERY_PROMPT,
+            failure_message="Primary HBM recovery warmup failed",
+            success_message="Primary HBM recovery warmup OK",
+        )
+        for index in range(3):
+            sibling = (
+                f"GMS native-index hydration sibling {index}. "
+                + ("This prefix is deliberately distinct and deterministic. " * 64)
+            )
+            assert_completion_ok(
+                manager.frontend_port,
+                sibling,
+                failure_message="Primary HBM hydration sibling warmup failed",
+                success_message="Primary HBM hydration sibling warmup OK",
+            )
+
+        with DaemonClient(manager.kv_directory_socket) as directory:
+            _entries, epoch, writer = directory.directory_lookup(
+                manager.kv_directory_manifest, []
+            )
+            assert writer == "engine-primary"
+            protected, rejected = directory.directory_hbm_inventory(
+                writer, epoch, scope="vllm"
+            )
+            assert not rejected
+            assert sum(map(len, protected.values())) > 0
+
+            def promote_shadow():
+                promoted, _new_epoch, active = directory.directory_promote(
+                    epoch, "engine-shadow"
+                )
+                assert promoted and active == "engine-shadow"
+
+            result = _resume_shadow_after_primary_failover(
+                shadow,
+                manager.kv_cache_gms,
+                primary,
+                after_primary_kill=promote_shadow,
+            )
+        assert result["status"] == "ok"
+        wait_for_resumed_layout(
+            manager.weights_gms,
+            manager.kv_cache_gms,
+            weights_with_primary,
+            min_weight_ro_sessions=1,
+        )
+        assert_completion_ok(
+            manager.frontend_port,
+            _HBM_RECOVERY_PROMPT,
+            failure_message="Shadow HBM recovery probe failed",
+            success_message="Shadow HBM recovery probe OK",
+            retry_timeout=30.0,
+        )
+        deadline = time.monotonic() + 10.0
+        while "adopted_hbm_blocks=" not in shadow.read_logs():
+            if time.monotonic() >= deadline:
+                diagnostics = _directory_diagnostics(primary, shadow)
+                raise AssertionError(
+                    "shadow served without adopting GMS HBM blocks\n" + diagnostics
+                )
+            time.sleep(0.1)
+        logs = shadow.read_logs()
+        if "bulk_hydrated_hbm_blocks=" not in logs:
+            diagnostics = _directory_diagnostics(primary, shadow)
+            raise AssertionError(
+                "shadow used lazy adoption but did not hydrate its native HBM index\n"
+                + diagnostics
+            )
+
+
+@pytest.mark.e2e
+@pytest.mark.gpu_1
+@pytest.mark.model(FAULT_TOLERANCE_MODEL_NAME)
+@pytest.mark.timeout(600)
+@pytest.mark.sglang
+def test_gms_authoritative_hbm_failover_sglang(
+    request, runtime_services_dynamic_ports, predownload_models, monkeypatch
+):
+    monkeypatch.setenv("GMS_KV_DIRECTORY_ASYNC_READ", "1")
+    monkeypatch.setenv("GMS_KV_DIRECTORY_ASYNC_PUBLISH", "1")
+    monkeypatch.setenv("GMS_KV_DIRECTORY_DIAGNOSTICS", "1")
+    with GMSProcessManager(request, SGLangWithGMSProcess, kv_directory=True) as manager:
+        shadow = manager.start_engine("shadow", directory_standby=True)
+        weights_state = pause_engine(
+            manager.weights_gms,
+            manager.kv_cache_gms,
+            shadow,
+            pause_label="Directory shadow pause",
+        )
+        primary, weights_with_primary = _start_primary(
+            manager,
+            manager.frontend_port,
+            manager.weights_gms,
+            manager.kv_cache_gms,
+            weights_hash=weights_state.memory_layout_hash,
+            cleared_layouts=1,
+        )
+        assert_completion_ok(
+            manager.frontend_port,
+            _HBM_RECOVERY_PROMPT,
+            failure_message="Primary SGLang HBM recovery warmup failed",
+            success_message="Primary SGLang HBM recovery warmup OK",
+        )
+
+        with DaemonClient(manager.kv_directory_socket) as directory:
+            _entries, epoch, writer = directory.directory_lookup(
+                manager.kv_directory_manifest, []
+            )
+            assert writer == "engine-primary", _directory_diagnostics(
+                primary, shadow
+            )
+            protected, rejected = directory.directory_hbm_inventory(
+                writer, epoch, scope="sglang"
+            )
+            assert not rejected
+            assert sum(map(len, protected.values())) > 0
+
+            def promote_shadow():
+                promoted, _new_epoch, active = directory.directory_promote(
+                    epoch, "engine-shadow"
+                )
+                assert promoted and active == "engine-shadow"
+
+            result = _resume_shadow_after_primary_failover(
+                shadow,
+                manager.kv_cache_gms,
+                primary,
+                after_primary_kill=promote_shadow,
+            )
+        assert result["status"] == "ok"
+        wait_for_resumed_layout(
+            manager.weights_gms,
+            manager.kv_cache_gms,
+            weights_with_primary,
+            min_weight_ro_sessions=1,
+        )
+        assert_completion_ok(
+            manager.frontend_port,
+            _HBM_RECOVERY_PROMPT,
+            failure_message="Shadow SGLang HBM recovery probe failed",
+            success_message="Shadow SGLang HBM recovery probe OK",
+            retry_timeout=30.0,
+        )
+        deadline = time.monotonic() + 10.0
+        while "adopted_hbm_pages=" not in shadow.read_logs():
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    "SGLang shadow served without adopting GMS HBM pages\n"
+                    + _directory_diagnostics(primary, shadow)
+                )
+            time.sleep(0.1)
 
 
 @pytest.mark.e2e
