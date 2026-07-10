@@ -29,12 +29,28 @@ This command:
 
 Backend workers register themselves using the `register_model` API. For accurate prefix-cache state, workers must also publish KV cache events with the backend-specific event flags; otherwise the router can run in approximate mode with `--no-router-kv-events`.
 
-The [Frontend Configuration Reference](../frontend/configuration.md#router) is the
-canonical list of embedded-router CLI arguments, environment variables, defaults,
-and boolean forms. Use [Configuration and Tuning](router-configuration.md) for
-workload-specific guidance, [Router Filtering](router-filtering.md) for candidate
-eligibility, and [Routing Concepts](router-concepts.md#active-load-modeling) for the
-prefill and decode cost model.
+#### CLI Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--router-mode kv` | `round-robin` | Enable KV cache-aware routing |
+| `--router-temperature <float>` | `0.0` | Controls routing randomness (0.0 = deterministic, higher = more random) |
+| `--kv-cache-block-size <size>` | Backend-specific | KV cache block size (should match backend config) |
+| `--router-kv-events` / `--no-router-kv-events` | `--router-kv-events` | Enable/disable real-time KV event tracking |
+| `--load-aware` / `--no-load-aware` | `--no-load-aware` | Route by active load without cache-reuse signals; implies `--router-mode kv` on the frontend |
+| `--router-kv-overlap-score-credit <float>` | `1.0` | Credit multiplier for device-local prefix overlap, from 0.0 to 1.0 |
+| `--router-prefill-load-scale <float>` | `1.0` | Scale adjusted prompt-side prefill load before adding decode blocks |
+| `--router-track-prefill-tokens` / `--no-router-track-prefill-tokens` | `--router-track-prefill-tokens` | Include prompt-side load in active worker load accounting |
+| `--router-gms-decode-transfer` / `--no-router-gms-decode-transfer` | `--no-router-gms-decode-transfer` | Experimental GMS decode-to-decode transfer orchestration for GMS-capable aggregated decode workers |
+| `--router-prefill-load-model <none\|aic>` | `none` | Prompt-side load model; see [Routing Concepts](router-concepts.md#active-load-modeling) and [Configuration and Tuning](router-configuration.md#aic-prefill-load-model) |
+| `--router-queue-threshold <float>` | `16.0` | Queue threshold fraction; priority hints only reorder requests while this queue is non-empty |
+| `--router-queue-policy <str>` | `fcfs` | Scheduling policy for the queue: `fcfs` (tail TTFT), `wspt` (avg TTFT), or `lcfs` (comparison-only reverse ordering) |
+| `--serve-indexer` | `false` | Serve the Dynamo-native remote indexer from this frontend/router on the worker component |
+| `--use-remote-indexer` | `false` | Query the worker component's served remote indexer instead of maintaining a local overlap indexer |
+
+For all available options: `python -m dynamo.frontend --help`
+
+For detailed configuration options and tuning parameters, see [Configuration and Tuning](router-configuration.md). For candidate eligibility rules, see [Router Filtering](router-filtering.md). For how the router models prefill and decode load in the cost function, see [Routing Concepts](router-concepts.md#active-load-modeling).
 
 ### Kubernetes Deployment
 
