@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Type
 
 if TYPE_CHECKING:
@@ -31,6 +32,25 @@ _gms_initialized = False
 def is_gms_active() -> bool:
     """Return True if setup_gms() has been called successfully."""
     return _gms_initialized
+
+
+def _truthy_env(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def configure_shared_failover_env() -> None:
+    from gpu_memory_service.integrations.sglang.kv_identity import (
+        shared_kv_enabled,
+    )
+    if not (
+        shared_kv_enabled()
+        and _truthy_env("DYN_GMS_FAILOVER_SHADOW_MODE")
+    ):
+        return
+    os.environ.setdefault("SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK", "0")
+    logger.info(
+        "[GMS] Disabled SGLang TP memory imbalance check for shared-GMS failover"
+    )
 
 
 def setup_gms(server_args) -> Type["GMSModelLoader"]:
@@ -58,13 +78,21 @@ def setup_gms(server_args) -> Type["GMSModelLoader"]:
             "Cannot use --enable-draft-weights-cpu-backup with --load-format gms."
         )
 
+    # GMS uses SGLang's torch_memory_saver regions as the allocation hook for
+    # weights and KV. Use the current override API when available; the fallback
+    # supports the separately pinned SGLang 0.5.11 XPU image.
     override = getattr(server_args, "override", None)
     if callable(override):
         override("dynamo.gms", enable_memory_saver=True)
     else:
-        # The separately pinned XPU image still uses SGLang 0.5.11, which
-        # predates ServerArgs.override. Remove after that pin reaches 0.5.16+.
         server_args.enable_memory_saver = True
+
+    configure_shared_failover_env()
+
+    # Collective timeouts are tightened only after Scheduler.__init__ has
+    # completed model loading and CUDA-graph capture. The model-loader import
+    # below installs that event-loop patch in every scheduler rank.
+
     # Resolve lock mode and RO reconnect timeout from model_loader_extra_config
     # before patches fire.
     global _gms_lock_mode
@@ -83,6 +111,14 @@ def setup_gms(server_args) -> Type["GMSModelLoader"]:
 
     _gms_lock_mode = get_gms_lock_mode(extra)
     _gms_ro_connect_timeout_ms = get_gms_ro_connect_timeout_ms(extra)
+
+    from gpu_memory_service.integrations.sglang import (
+        install_kv_leases,
+        install_vmm_ipc_kv,
+    )
+
+    install_vmm_ipc_kv.install_lazy()
+    install_kv_leases.install()
 
     # Import triggers patches at module level
     from gpu_memory_service.integrations.sglang.model_loader import GMSModelLoader
