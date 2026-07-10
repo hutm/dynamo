@@ -287,3 +287,39 @@ async def test_sglang_failover_watchdog_hooks_subprocess_watchdog(monkeypatch):
     finally:
         assert watchdog is not None
         watchdog.stop()
+
+
+def test_sglang_failover_watchdog_routes_sigquit_to_controlled_handoff(monkeypatch):
+    class FakeLoop:
+        def __init__(self):
+            self.previous = lambda: None
+            self._signal_handlers = {
+                failover_watchdog.signal.SIGQUIT: SimpleNamespace(
+                    _callback=self.previous, _args=()
+                )
+            }
+
+        def add_signal_handler(self, signum, callback, *args):
+            self._signal_handlers[signum] = SimpleNamespace(
+                _callback=callback, _args=args
+            )
+
+        def remove_signal_handler(self, signum):
+            self._signal_handlers.pop(signum, None)
+            return True
+
+    loop = FakeLoop()
+    watchdog = failover_watchdog.SGLangGmsFailoverChildWatchdog(
+        SimpleNamespace(), SimpleNamespace(), loop
+    )
+    reasons = []
+    monkeypatch.setattr(watchdog, "_trigger_failure", reasons.append)
+
+    watchdog._install_sigquit_hook()
+    installed = loop._signal_handlers[failover_watchdog.signal.SIGQUIT]._callback
+    installed()
+    assert reasons == ["SGLang SIGQUIT reported child failure"]
+
+    watchdog._restore_sigquit_hook()
+    restored = loop._signal_handlers[failover_watchdog.signal.SIGQUIT]._callback
+    assert restored is loop.previous

@@ -24,6 +24,87 @@ _factory: Callable[[object, int], KVLeaseClient] | None = None
 _STATE: dict[int, dict[str, object]] = {}
 
 
+def retain_hbm_indices(allocator, indices) -> list[KVLease]:
+    """Keep allocator pages leased after SGLang returns them locally."""
+    import torch
+
+    st = _STATE.get(id(allocator))
+    if st is None or indices is None or int(indices.numel()) == 0:
+        return []
+    page_size = int(allocator.page_size)
+    pages = torch.unique(indices // page_size)
+    page_ids = [int(value) for value in pages.detach().cpu().tolist()]
+    lease_map = st["leases_by_page"]
+    retained = st["retained_pages"]
+    client = st["client"]
+    assert isinstance(lease_map, dict) and isinstance(retained, set)
+    leases = [lease_map[page] for page in page_ids if page in lease_map]
+    if len(leases) != len(page_ids):
+        return []
+    client.seal(leases)
+    retained.update(page_ids)
+    return leases
+
+
+def adopt_hbm_pages(allocator, pages: list[int], generations: list[int]):
+    """Atomically transfer exact preserved pages into SGLang native state."""
+    import torch
+
+    st = _STATE.get(id(allocator))
+    if st is None or len(pages) != len(generations) or len(set(pages)) != len(pages):
+        return None, []
+    page_size = int(allocator.page_size)
+    if allocator.need_sort:
+        allocator.merge_and_sort_free()
+    available = {int(value) for value in allocator.free_pages.detach().cpu().tolist()}
+    if any(page not in available for page in pages):
+        return None, []
+    client = st["client"]
+    old = [KVLease(page, generation) for page, generation in zip(pages, generations)]
+    acquired = client.adopt(old)
+    if [int(lease.block_id) for lease in acquired] != pages:
+        client.release(acquired)
+        return None, []
+    page_tensor = torch.tensor(
+        pages, dtype=allocator.free_pages.dtype, device=allocator.free_pages.device
+    )
+    allocator.free_pages = allocator.free_pages[
+        ~torch.isin(allocator.free_pages, page_tensor)
+    ]
+    lease_map = st["leases_by_page"]
+    retained = st["retained_pages"]
+    assert isinstance(lease_map, dict) and isinstance(retained, set)
+    for lease in acquired:
+        lease_map[int(lease.block_id)] = lease
+        retained.discard(int(lease.block_id))
+    offsets = torch.arange(page_size, device=allocator.free_pages.device)
+    indices = (page_tensor[:, None] * page_size + offsets).reshape(-1)
+    return indices, acquired
+
+
+def rollback_adopted_hbm_pages(allocator, leases: list[KVLease]) -> None:
+    if not leases:
+        return
+    import torch
+
+    st = _STATE.get(id(allocator))
+    if st is None:
+        return
+    client = st["client"]
+    lease_map = st["leases_by_page"]
+    retained = st["retained_pages"]
+    assert isinstance(lease_map, dict) and isinstance(retained, set)
+    pages = [int(lease.block_id) for lease in leases]
+    for page in pages:
+        lease_map.pop(page, None)
+        retained.discard(page)
+    client.release(leases)
+    page_tensor = torch.tensor(
+        pages, dtype=allocator.free_pages.dtype, device=allocator.free_pages.device
+    )
+    allocator.free_pages = torch.cat((page_tensor, allocator.free_pages))
+
+
 def install(factory: Callable[[object, int], KVLeaseClient] | None = None) -> bool:
     global _patched, _factory
     if factory is not None:
@@ -82,6 +163,45 @@ def install(factory: Callable[[object, int], KVLeaseClient] | None = None) -> bo
             logger.debug("[GMS-KVLease] SGLang free-count read failed", exc_info=True)
             return -1
 
+    def _ensure_directory_capacity(self, required_pages: int) -> int:
+        st = _state(self)
+        directory = getattr(self, "_gms_kv_directory", None)
+        if st is None or directory is None or not directory.authoritative:
+            return 0
+        client = st["client"]
+        shortage = max(0, int(required_pages) - max(0, _safe_free_count(client)))
+        if shortage == 0:
+            return 0
+        victims = directory.ensure_hbm_capacity(shortage)
+        lease_map = st["leases_by_page"]
+        retained = st["retained_pages"]
+        assert isinstance(lease_map, dict) and isinstance(retained, set)
+        releases = []
+        restore_active = []
+        for victim in victims:
+            for page, generation in zip(victim["slot_ids"], victim["generations"]):
+                page = int(page)
+                current = lease_map.get(page)
+                if current is not None and page not in retained:
+                    restore_active.append(
+                        {
+                            "content_hash": victim["content_hash"],
+                            "engine_id": victim["engine_id"],
+                            "slot_id": page,
+                            "generation": int(current.generation),
+                            "tier": "hbm",
+                            "active": True,
+                        }
+                    )
+                    continue
+                lease_map.pop(page, None)
+                retained.discard(page)
+                releases.append(current or KVLease(page, int(generation)))
+        if restore_active:
+            directory.publish(restore_active)
+        client.release(releases)
+        return len(releases)
+
     def _pages_to_list(pages) -> list[int]:
         if pages is None:
             return []
@@ -136,6 +256,7 @@ def install(factory: Callable[[object, int], KVLeaseClient] | None = None) -> bo
         assert isinstance(client, GMSKVLeaseClient) or hasattr(client, "acquire")
         if not pages:
             return True
+        _ensure_directory_capacity(self, len(pages))
         try:
             leases = client.acquire(
                 len(pages),
@@ -188,8 +309,11 @@ def install(factory: Callable[[object, int], KVLeaseClient] | None = None) -> bo
         lease_map = st["leases_by_page"]
         client = st["client"]
         assert isinstance(lease_map, dict)
-        missing_pages = [page for page in pages if page not in lease_map]
-        leases = [lease_map.pop(page) for page in pages if page in lease_map]
+        retained = st["retained_pages"]
+        assert isinstance(retained, set)
+        released_pages = [page for page in pages if page not in retained]
+        missing_pages = [page for page in released_pages if page not in lease_map]
+        leases = [lease_map.pop(page) for page in released_pages if page in lease_map]
         if missing_pages:
             log_lease_pressure(
                 logger,
@@ -207,7 +331,16 @@ def install(factory: Callable[[object, int], KVLeaseClient] | None = None) -> bo
         orig_base_init(self, *args, **kwargs)
         total_pages = int(self.size // self.page_size)
         client = _make_client(self, total_pages)
-        _STATE[id(self)] = {"client": client, "leases_by_page": {}}
+        lease_map: dict[int, KVLease] = {}
+        retained_pages: set[int] = set()
+        _STATE[id(self)] = {
+            "client": client,
+            "leases_by_page": lease_map,
+            "retained_pages": retained_pages,
+        }
+        self._gms_kv_lease_client = client
+        self._gms_kv_leases_by_page = lease_map
+        self._gms_retained_pages = retained_pages
         logger.info(
             "[GMS-KVLease] SGLang allocator leases enabled namespace=%s owner=%s pages=%d",
             getattr(client, "namespace", "?"),
