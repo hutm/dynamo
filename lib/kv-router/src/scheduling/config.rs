@@ -669,6 +669,7 @@ struct KvRouterConfigSerde {
     router_tracking_hash: TrackingHashAlgorithm,
     router_tracking_key_file: Option<PathBuf>,
     router_tracking_key_id: Option<String>,
+    router_gms_decode_transfer: bool,
     router_prefill_load_model: RouterPrefillLoadModel,
     #[serde(rename = "router_snapshot_threshold")]
     _legacy_router_snapshot_threshold: Option<u32>,
@@ -718,6 +719,7 @@ impl Default for KvRouterConfigSerde {
             router_tracking_hash: config.router_tracking_hash,
             router_tracking_key_file: config.router_tracking_key_file,
             router_tracking_key_id: config.router_tracking_key_id,
+            router_gms_decode_transfer: config.router_gms_decode_transfer,
             router_prefill_load_model: config.router_prefill_load_model,
             _legacy_router_snapshot_threshold: None,
             _legacy_router_reset_states: false,
@@ -811,6 +813,11 @@ pub struct KvRouterConfig {
     /// Provider-managed epoch identifier mixed into keyed tracking scope derivation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router_tracking_key_id: Option<String>,
+    /// Whether the router may orchestrate GMS decode-to-decode KV transfer.
+    /// Default is false so GMS transfer policy remains an explicit opt-in and
+    /// vanilla Dynamo routing behavior is unchanged.
+    #[serde(default)]
+    pub router_gms_decode_transfer: bool,
 
     /// Optional model for estimating effective prompt-side prefill load over time.
     pub router_prefill_load_model: RouterPrefillLoadModel,
@@ -967,6 +974,7 @@ impl Default for KvRouterConfig {
             router_tracking_hash: TrackingHashAlgorithm::default(),
             router_tracking_key_file: None,
             router_tracking_key_id: None,
+            router_gms_decode_transfer: false,
             router_prefill_load_model: RouterPrefillLoadModel::default(),
             router_ttl_secs: 120.0,
             router_approximate_cache_policy: ApproximateCachePolicyKind::default(),
@@ -1031,6 +1039,7 @@ impl TryFrom<KvRouterConfigSerde> for KvRouterConfig {
             router_tracking_hash: compat.router_tracking_hash,
             router_tracking_key_file: compat.router_tracking_key_file,
             router_tracking_key_id: compat.router_tracking_key_id,
+            router_gms_decode_transfer: compat.router_gms_decode_transfer,
             router_prefill_load_model: compat.router_prefill_load_model,
             router_ttl_secs: compat.router_ttl_secs,
             router_approximate_cache_policy: ApproximateCachePolicyKind::default(),
@@ -1755,6 +1764,13 @@ mod tests {
         assert!(error.contains("expected 'none' or 'aic'"));
 
         assert!(serde_json::to_string(&config_from_values(&[])).is_ok());
+    }
+
+    #[test]
+    fn router_gms_decode_transfer_is_disabled_by_default() {
+        let cfg = KvRouterConfig::default();
+
+        assert!(!cfg.router_gms_decode_transfer);
     }
 
     #[test]

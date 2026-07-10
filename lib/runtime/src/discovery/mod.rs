@@ -7,8 +7,8 @@ use futures::Stream;
 use serde::{Deserialize, Serialize};
 
 use crate::protocols::EndpointId;
-use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use tokio_util::sync::CancellationToken;

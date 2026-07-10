@@ -682,6 +682,7 @@ impl<S: AsyncShardHandle> BranchShardedIndexer<S> {
                 state_source: event.state_source,
                 storage_tier: event.storage_tier,
                 residency_domain: event.residency_domain.clone(),
+                gms_placement: None,
                 event: KvCacheEvent {
                     event_id: event.event.event_id,
                     dp_rank: event.event.dp_rank,
@@ -703,6 +704,7 @@ impl<S: AsyncShardHandle> BranchShardedIndexer<S> {
                     state_source: event.state_source,
                     storage_tier: event.storage_tier,
                     residency_domain: event.residency_domain.clone(),
+                    gms_placement: None,
                     event: KvCacheEvent {
                         event_id: event.event.event_id,
                         dp_rank: event.event.dp_rank,

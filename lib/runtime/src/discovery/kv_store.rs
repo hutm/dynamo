@@ -953,15 +953,6 @@ mod tests {
         let endpoint_b = EndpointId {
             name: "b/>".to_string(),
             ..endpoint_a.clone()
-        let cancel_token = CancellationToken::new();
-        let client = KVStoreDiscovery::new(store, cancel_token).unwrap();
-
-        let spec = DiscoverySpec::Endpoint {
-            namespace: "test".to_string(),
-            component: "comp1".to_string(),
-            endpoint: "ep1".to_string(),
-            transport: TransportType::Nats("nats://localhost:4222".to_string()),
-            device_type: None,
         };
 
         for (publisher_id, endpoint) in [(1, endpoint_a.clone()), (2, endpoint_b.clone())] {
@@ -1059,7 +1050,8 @@ mod tests {
 
     #[tokio::test]
     async fn event_source_watch_removes_exact_publisher_incarnation() {
-        let client = KVStoreDiscovery::new(kv::Manager::memory(), CancellationToken::new()).unwrap();
+        let client =
+            KVStoreDiscovery::new(kv::Manager::memory(), CancellationToken::new()).unwrap();
         let endpoint = EndpointId {
             namespace: "ns".to_string(),
             component: "worker".to_string(),
@@ -1322,7 +1314,8 @@ mod tests {
 
     #[tokio::test]
     async fn model_taint_updates_replace_existing_value_and_emit_scoped_event() {
-        let client = KVStoreDiscovery::new(kv::Manager::memory(), CancellationToken::new()).unwrap();
+        let client =
+            KVStoreDiscovery::new(kv::Manager::memory(), CancellationToken::new()).unwrap();
         let query = DiscoveryQuery::EndpointModels {
             namespace: "ns".to_string(),
             component: "worker".to_string(),

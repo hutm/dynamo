@@ -1666,6 +1666,7 @@ mod tests {
                     data: KvCacheEventData::Cleared,
                     dp_rank: 0,
                 },
+                gms_placement: None,
             })
             .unwrap();
         assert_eq!(

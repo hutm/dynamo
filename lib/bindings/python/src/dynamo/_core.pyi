@@ -1813,6 +1813,7 @@ class KvRouterConfig:
         router_tracking_hash: Literal["public-xxh3-v1", "keyed-xxh3-v1"] = "public-xxh3-v1",
         router_tracking_key_file: Optional[str | os.PathLike[str]] = None,
         router_tracking_key_id: Optional[str] = None,
+        router_gms_decode_transfer: bool = False,
     ) -> None:
         """
         Create a KV router configuration.
@@ -1842,6 +1843,7 @@ class KvRouterConfig:
                 Required only for keyed tracking mode.
             router_tracking_key_id: Provider-managed key epoch mixed into keyed scope
                 derivation. Required only for keyed tracking mode.
+            router_gms_decode_transfer: Enable experimental GMS decode-to-decode transfer orchestration (default: False).
             router_prefill_load_model: Prompt-side prefill load model (default: "none").
                 "none" keeps static prompt load accounting.
                 "aic" decays the oldest active prefill request using AIC-predicted duration.

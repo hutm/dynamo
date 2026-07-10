@@ -2502,6 +2502,7 @@ mod local_indexer_tests {
                 data: KvCacheEventData::Cleared,
                 dp_rank: 0,
             },
+            gms_placement: None,
         }
     }
 
