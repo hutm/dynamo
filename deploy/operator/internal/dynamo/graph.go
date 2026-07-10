@@ -1738,6 +1738,7 @@ func GenerateBasePodSpec(
 	AddStandardEnvVars(&container, operatorConfig)
 	AddTransportTLSEnvVars(&container, operatorConfig)
 	frontendSidecarMounts := append([]corev1.VolumeMount(nil), container.VolumeMounts...)
+	frontendSidecarEnv := append([]corev1.EnvVar(nil), container.Env...)
 
 	// Apply backend-specific container modifications
 	multinodeDeployer := deployerOverride
@@ -1799,7 +1800,7 @@ func GenerateBasePodSpec(
 	podSpec.Containers = append([]corev1.Container{container}, sidecars...)
 
 	if component.FrontendSidecar != nil {
-		if err := mergeFrontendSidecarDefaults(&podSpec, *component.FrontendSidecar, componentContext, operatorConfig, frontendSidecarMounts); err != nil {
+		if err := mergeFrontendSidecarDefaults(&podSpec, *component.FrontendSidecar, componentContext, operatorConfig, frontendSidecarMounts, frontendSidecarEnv); err != nil {
 			return nil, err
 		}
 	}
@@ -1838,10 +1839,20 @@ func GenerateBasePodSpec(
 		if err := dra.ApplyClaim(&podSpec, claimTemplateName); err != nil {
 			return nil, fmt.Errorf("failed to apply DRA claim for GMS: %w", err)
 		}
-		// Snapshot + intra-pod GMS uses V1 for every backend. GMS or
-		// failover without checkpoint stays on the V0 sidecar.
-		useV1 := GetCheckpoint(component) != nil
-		gms.EnsureServerSidecar(&podSpec, &podSpec.Containers[0], useV1)
+		intraPodFailover := IsIntraPodFailoverEnabled(component)
+		// Snapshot + ordinary intra-pod GMS uses V1. The five-container
+		// failover topology still uses the tag-isolated V0 servers.
+		useV1 := GetCheckpoint(component) != nil && !intraPodFailover
+		if intraPodFailover {
+			gpuCount, err := containerGPUs()
+			if err != nil {
+				return nil, fmt.Errorf("failed to determine GPU count for GMS: %w", err)
+			}
+			gms.EnsureClient(&podSpec, &podSpec.Containers[0])
+			appendIntraPodGMSServerContainers(&podSpec, podSpec.Containers[0], int(gpuCount))
+		} else {
+			gms.EnsureServerSidecar(&podSpec, &podSpec.Containers[0], useV1)
+		}
 		for _, name := range gmsSpec.ExtraClientContainers {
 			var container *corev1.Container
 			for i := range podSpec.Containers {
@@ -2034,7 +2045,7 @@ func appendMissingPVCVolumesForMounts(volumes []corev1.Volume, mounts []corev1.V
 	return ordered
 }
 
-func mergeFrontendSidecarDefaults(podSpec *corev1.PodSpec, sidecarName string, parentContext ComponentContext, operatorConfig *configv1alpha1.OperatorConfiguration, parentMounts []corev1.VolumeMount) error {
+func mergeFrontendSidecarDefaults(podSpec *corev1.PodSpec, sidecarName string, parentContext ComponentContext, operatorConfig *configv1alpha1.OperatorConfiguration, parentMounts []corev1.VolumeMount, parentEnv []corev1.EnvVar) error {
 	for i := range podSpec.Containers {
 		if podSpec.Containers[i].Name != sidecarName {
 			continue
@@ -2058,7 +2069,7 @@ func mergeFrontendSidecarDefaults(podSpec *corev1.PodSpec, sidecarName string, p
 		if err := mergo.Merge(&base, *user, mergo.WithOverride); err != nil {
 			return fmt.Errorf("failed to merge frontend sidecar %q: %w", sidecarName, err)
 		}
-		base.Env = MergeEnvs(baseEnv, user.Env)
+		base.Env = MergeEnvs(MergeEnvs(parentEnv, baseEnv), user.Env)
 		AddStandardEnvVars(&base, operatorConfig)
 		AddTransportTLSEnvVars(&base, operatorConfig)
 		base.VolumeMounts = appendMissingVolumeMounts(base.VolumeMounts, parentMounts)
@@ -2888,7 +2899,7 @@ func generatePodSpecForRole(
 	}
 
 	if isInterPodGMS {
-		augmentEngineForGMS(podSpec, r.Rank, component.IsInterPodFailoverEnabled())
+		augmentEngineForGMS(podSpec, r.Rank, component.IsInterPodFailoverEnabled(), r.Name)
 	}
 
 	return podSpec, nil

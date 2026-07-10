@@ -300,7 +300,8 @@ func (v *dynamoGraphDeploymentValidation) validateDynamoGraphDeploymentSpec(
 			if !opts.grovePathway {
 				allErrs = append(allErrs, field.Forbidden(modePath, opts.grovePathwayRequirement))
 			}
-			if spec.BackendFramework != string(dynamo.BackendFrameworkVLLM) {
+			backend := dynamo.BackendFramework(spec.BackendFramework)
+			if backend != dynamo.BackendFrameworkVLLM && backend != dynamo.BackendFrameworkSGLang && backend != dynamo.BackendFrameworkTRTLLM {
 				detected := spec.BackendFramework
 				if detected == "" {
 					detected = unsetValue
@@ -308,7 +309,7 @@ func (v *dynamoGraphDeploymentValidation) validateDynamoGraphDeploymentSpec(
 				allErrs = append(allErrs, field.Invalid(
 					modePath,
 					gms.Mode,
-					fmt.Sprintf("the inter-pod GMS layout is currently supported only for vLLM (detected backend: %s)", detected),
+					fmt.Sprintf("the inter-pod GMS layout is supported only for vLLM, SGLang, and TensorRT-LLM (detected backend: %s)", detected),
 				))
 			}
 		}
