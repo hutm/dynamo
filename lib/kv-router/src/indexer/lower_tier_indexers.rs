@@ -22,7 +22,8 @@ use crate::indexer::{
     ThreadPoolIndexer, WireTieredMatchDetails, record_unsupported_residency_event,
 };
 use crate::protocols::{
-    LocalBlockHash, ResidencyProjection, ResidencyRoutingSnapshot, RouterEvent, StorageTier,
+    GmsPlacementMatch, LocalBlockHash, ResidencyProjection, ResidencyRoutingSnapshot, RouterEvent,
+    StorageTier, WorkerWithDpRank,
 };
 use crate::router_hint::{RouterHintCandidateSource, RouterHintRootCandidates};
 use arc_swap::ArcSwap;
@@ -145,6 +146,7 @@ impl LowerTierIndexers {
 pub struct TieredMatchDetails {
     pub device: MatchDetails,
     pub lower_tier: HashMap<StorageTier, LowerTierMatchDetails>,
+    pub gms_placements: HashMap<WorkerWithDpRank, GmsPlacementMatch>,
 }
 
 impl TieredMatchDetails {
@@ -164,6 +166,11 @@ impl From<&TieredMatchDetails> for WireTieredMatchDetails {
                 .lower_tier
                 .iter()
                 .map(|(tier, details)| (*tier, details.into()))
+                .collect(),
+            gms_placements: d
+                .gms_placements
+                .iter()
+                .map(|(worker, placement)| (*worker, placement.clone()))
                 .collect(),
         }
     }
@@ -188,6 +195,7 @@ impl From<WireTieredMatchDetails> for TieredMatchDetails {
                 ..Default::default()
             },
             lower_tier,
+            gms_placements: w.gms_placements.into_iter().collect(),
         }
     }
 }

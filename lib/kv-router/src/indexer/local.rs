@@ -12,8 +12,8 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    GetWorkersRequest, KvEventSender, KvIndexer, KvIndexerInterface, KvIndexerMetrics,
-    KvRouterError, LowerTierIndexer, ThreadPoolIndexer, WorkerKvQueryResponse,
+    GetWorkersRequest, GmsPlacementIndex, KvEventSender, KvIndexer, KvIndexerInterface,
+    KvIndexerMetrics, KvRouterError, LowerTierIndexer, ThreadPoolIndexer, WorkerKvQueryResponse,
     record_unsupported_residency_event,
 };
 use crate::protocols::*;
@@ -212,6 +212,8 @@ pub struct LocalKvIndexer {
     indexer: KvIndexer,
     /// Lazily-created exact lower-tier indexes partitioned by storage tier.
     lower_tier_indexers: LowerTierRegistry,
+    /// GMS placement metadata learned from the same KV event stream.
+    gms_placement_index: Arc<GmsPlacementIndex>,
     /// Circular buffer of recent events.
     ///
     /// NOTE: One `LocalKvIndexer` belongs to one rank publisher, so its sequence and any latest
@@ -244,6 +246,7 @@ impl LocalKvIndexer {
             indexer: KvIndexer::new(token, kv_block_size, metrics.clone()),
             metrics,
             lower_tier_indexers: Arc::new(Mutex::new(HashMap::new())),
+            gms_placement_index: Arc::new(GmsPlacementIndex::new()),
             event_buffer: Arc::new(Mutex::new(VecDeque::with_capacity(max_buffer_size))),
             recovery_cache: Arc::new(RecoverySnapshotCache::new()),
             max_buffer_size,
@@ -581,6 +584,7 @@ impl LocalKvIndexer {
     ) -> tokio::task::JoinHandle<BuildTaskResult> {
         let indexer = self.indexer.clone();
         let lower_tier_indexers = self.lower_tier_indexers.clone();
+        let gms_placement_index = self.gms_placement_index.clone();
         let event_buffer = self.event_buffer.clone();
         let recovery_cache = self.recovery_cache.clone();
         #[cfg(test)]
@@ -594,9 +598,14 @@ impl LocalKvIndexer {
                 tokio::time::sleep(delay).await;
             }
 
-            let build_output =
-                Self::build_fresh_dump(indexer, lower_tier_indexers, event_buffer, last_event_id)
-                    .await;
+            let build_output = Self::build_fresh_dump(
+                indexer,
+                lower_tier_indexers,
+                gms_placement_index,
+                event_buffer,
+                last_event_id,
+            )
+            .await;
             let notify = build.notify.clone();
             let result = recovery_cache.finish_build(&build, build_output).await;
 
@@ -608,6 +617,7 @@ impl LocalKvIndexer {
     async fn build_fresh_dump(
         indexer: KvIndexer,
         lower_tier_indexers: LowerTierRegistry,
+        gms_placement_index: Arc<GmsPlacementIndex>,
         event_buffer: Arc<Mutex<VecDeque<RouterEvent>>>,
         fallback_last_event_id: u64,
     ) -> FreshDumpOutput {
@@ -617,7 +627,8 @@ impl LocalKvIndexer {
             .back()
             .map_or(fallback_last_event_id, |event| event.event.event_id);
         match Self::dump_all_tiers(&indexer, &lower_tier_indexers).await {
-            Ok(events) => {
+            Ok(mut events) => {
+                events.extend(gms_placement_index.dump_events());
                 let represented_blocks = events
                     .iter()
                     .map(|event| match &event.event.data {
@@ -740,6 +751,7 @@ impl LocalKvIndexer {
     }
 
     async fn apply_event_by_tier(&self, event: &RouterEvent) -> Result<(), KvRouterError> {
+        self.gms_placement_index.apply_event(event);
         let targets_primary = match event.targets_primary() {
             Ok(targets_primary) => targets_primary,
             Err(_) => {
@@ -815,6 +827,7 @@ impl KvIndexerInterface for LocalKvIndexer {
     }
 
     async fn remove_worker(&self, worker: WorkerId) {
+        self.gms_placement_index.remove_worker(worker);
         for indexer in self.all_lower_tier_indexers() {
             indexer.remove_worker(worker).await;
         }
@@ -822,6 +835,8 @@ impl KvIndexerInterface for LocalKvIndexer {
     }
 
     async fn remove_worker_dp_rank(&self, worker: WorkerId, dp_rank: DpRank) {
+        self.gms_placement_index
+            .remove_worker_dp_rank(WorkerWithDpRank::new(worker, dp_rank));
         for indexer in self.all_lower_tier_indexers() {
             KvIndexerInterface::remove_worker_dp_rank(&*indexer, worker, dp_rank).await;
         }
@@ -833,7 +848,9 @@ impl KvIndexerInterface for LocalKvIndexer {
     }
 
     async fn dump_events(&self) -> Result<Vec<RouterEvent>, KvRouterError> {
-        Self::dump_all_tiers(&self.indexer, &self.lower_tier_indexers).await
+        let mut events = Self::dump_all_tiers(&self.indexer, &self.lower_tier_indexers).await?;
+        events.extend(self.gms_placement_index.dump_events());
+        Ok(events)
     }
 
     async fn process_routing_decision_for_request(

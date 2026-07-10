@@ -263,6 +263,7 @@ mod tests {
                     ..Default::default()
                 },
                 lower_tier: HashMap::new(),
+                gms_placements: HashMap::new(),
             })
         }
     }

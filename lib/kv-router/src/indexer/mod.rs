@@ -59,6 +59,7 @@ fn warn_on_unit_block_size(indexer_type: &'static str, kv_block_size: u32) {
         );
     }
 }
+mod gms_placement;
 mod kv_indexer;
 mod local;
 mod lower_tier;
@@ -83,6 +84,7 @@ mod tests;
 // Re-export everything that was public in the old single-file module.
 pub use approximate_lru::*;
 pub use branch_sharded::*;
+pub use gms_placement::*;
 pub use kv_indexer::*;
 pub use local::*;
 pub use lower_tier::*;
