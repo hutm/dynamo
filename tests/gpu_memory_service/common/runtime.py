@@ -90,19 +90,28 @@ class GMSProcessManager:
                 lease_dir = os.path.join(shared_dir, "leases")
                 os.makedirs(lease_dir)
                 self._directory_env = {
-                    "GMS_KV_DIRECTORY_MODE": "authoritative",
+                    "GMS_KV_DIRECTORY_MODE": os.environ.get(
+                        "GMS_KV_DIRECTORY_MODE", "authoritative"
+                    ),
                     "GMS_KV_DIRECTORY_SOCKET": self.kv_directory_socket,
                     "GMS_KV_DIRECTORY_MANIFEST": self.kv_directory_manifest,
-                    "GMS_KV_DIRECTORY_DIAGNOSTICS": "1",
+                    "GMS_KV_DIRECTORY_DIAGNOSTICS": os.environ.get(
+                        "GMS_KV_DIRECTORY_DIAGNOSTICS", "1"
+                    ),
                     "GMS_KV_DIRECTORY_ASYNC_READ": os.environ.get(
                         "GMS_KV_DIRECTORY_ASYNC_READ", "1"
                     ),
                     "GMS_KV_DIRECTORY_ASYNC_PUBLISH": os.environ.get(
                         "GMS_KV_DIRECTORY_ASYNC_PUBLISH", "1"
                     ),
+                    "GMS_KV_DIRECTORY_POLL_MS": os.environ.get(
+                        "GMS_KV_DIRECTORY_POLL_MS", "250"
+                    ),
                     "GMS_KV_LEASES": "1",
+                    "GMS_SGLANG_KV_LEASES": "1",
                     "GMS_KV_LEASE_SHM_DIR": lease_dir,
                     "GMS_VLLM_SHARED_KV": "1",
+                    "GMS_SGLANG_SHARED_KV": "1",
                 }
             if "weights" in self._tags:
                 self.weights_gms = stack.enter_context(
@@ -178,6 +187,8 @@ class GMSProcessManager:
         engine.env["ENGINE_ID"] = engine_id
         if directory_standby:
             engine.env["GMS_KV_DIRECTORY_STANDBY"] = "1"
+            # Hydration is a replacement-owner role, not an inference-engine
+            # default. Make it explicit across nested engine subprocesses.
             engine.env["GMS_VLLM_HYDRATE_HBM"] = os.environ.get(
                 "GMS_VLLM_HYDRATE_HBM", "1"
             )
@@ -195,13 +206,18 @@ class GMSProcessManager:
             raise RuntimeError(
                 "GMSProcessManager must be entered before starting engines"
             )
-        engine = self._stack.enter_context(
-            self.create_engine(
-                engine_id,
-                read_only_weights=read_only_weights,
-                directory_standby=directory_standby,
-            )
+        engine = self.create_engine(
+            engine_id,
+            read_only_weights=read_only_weights,
+            directory_standby=directory_standby,
         )
+        try:
+            engine = self._stack.enter_context(engine)
+        except Exception as exc:
+            logs = engine.read_logs()
+            raise RuntimeError(
+                f"engine {engine_id!r} failed to start: {exc}\n{logs[-30000:]}"
+            ) from exc
         self.engines[engine_id] = engine
         return engine
 
@@ -405,8 +421,11 @@ class TRTLLMWithGMSProcess(GMSEngineProcess):
     TRTLLM_GMS_MODEL_NAME = os.environ.get(
         "TRTLLM_GMS_MODEL_NAME", FAULT_TOLERANCE_MODEL_NAME
     )
+    # The local failover harness co-locates two paused shadows and one
+    # primary on one GPU. Keep enough headroom for all three TRT executors;
+    # production and dedicated-GPU tests can override this environment knob.
     TRTLLM_GMS_FREE_GPU_MEMORY_FRACTION = os.environ.get(
-        "TRTLLM_GMS_FREE_GPU_MEMORY_FRACTION", "0.9"
+        "TRTLLM_GMS_FREE_GPU_MEMORY_FRACTION", "0.25"
     )
     TRTLLM_GMS_MAX_SEQ_LEN = os.environ.get("TRTLLM_GMS_MAX_SEQ_LEN", "256")
     TRTLLM_GMS_MAX_NUM_TOKENS = os.environ.get("TRTLLM_GMS_MAX_NUM_TOKENS", "256")
