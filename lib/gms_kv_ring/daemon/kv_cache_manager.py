@@ -38,6 +38,7 @@ import logging
 import os
 import threading
 import time
+from collections import deque
 from typing import Optional
 
 from gms_kv_ring.daemon.consumers import (
@@ -202,7 +203,35 @@ class GmsKvCacheManager:
         # `staging_send_buffer`, and pushes via NixlTransport.send.
         # Stores: hash → {"engine_id": str, "ranges": [(layer, offset, size), ...]}
         self._content_hash_index: dict[bytes, dict] = {}
-        self._content_hash_lock = threading.Lock()
+        # Engine-independent KV residency directory. Unlike the legacy
+        # cross-node index above, this index exists even when NIXL transport
+        # is disabled: it is the local source of truth used by a restarted
+        # inference engine to rediscover daemon-owned KV bytes. Entries are
+        # namespaced by a layout manifest and reverse-indexed by physical
+        # slot so slot reuse atomically retires the previous content hash.
+        self._content_directory: dict[tuple[str, bytes], dict] = {}
+        self._content_directory_by_slot: dict[tuple[str, str, int], bytes] = {}
+        # Short-lived lookup claims close the query/fetch TOCTOU window. The
+        # public directory remains a flat content -> residency map; claims are
+        # opaque tokens owned and validated entirely by the daemon.
+        self._content_directory_claims: dict[str, dict] = {}
+        self._content_directory_access_seq = 0
+        self._content_directory_epoch = 1
+        # Public directory mutations have a monotonic revision independent
+        # of writer epochs. Readers take one revisioned snapshot and then
+        # consume this bounded delta log without blocking engine hot paths.
+        self._content_directory_revision = 0
+        self._content_directory_changes = deque(maxlen=131_072)
+        self._content_directory_writer_id: Optional[str] = None
+
+        # Engine-visible CPU pools attached by native secondary-tier adapters.
+        # Storage remains in host_tier; these mmaps are transfer endpoints only.
+        self._persistent_kv_pools: dict[str, dict] = {}
+        self._persistent_kv_pools_lock = threading.Lock()
+
+        # A condition preserves the established lock semantics and lets
+        # revision readers sleep until a committed mutation is available.
+        self._content_hash_lock = threading.Condition()
         # Destination restore path: small integer handle ->
         # (content_hash, staging_generation). The worker-side
         # connector registers handles just before pushing a
@@ -1630,7 +1659,16 @@ class GmsKvCacheManager:
         self._stop_scrub()
         self._stop_backend_scrub()
         self.close_connections()
+        self._close_persistent_kv_pools()
         self._shutdown_all_pools()
+
+    def _close_persistent_kv_pools(self) -> None:
+        with self._persistent_kv_pools_lock:
+            pools = list(self._persistent_kv_pools.values())
+            self._persistent_kv_pools.clear()
+        for pool in pools:
+            pool["view"].release()
+            pool["mmap"].close()
 
     def _shutdown_all_pools(self) -> None:
         with self._lock:
