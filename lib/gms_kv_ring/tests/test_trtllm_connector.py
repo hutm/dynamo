@@ -193,10 +193,40 @@ def _make_scheduler(monkeypatch, **env):
 
 def test_scheduler_returns_zero_on_cold_index(monkeypatch):
     sched = _make_scheduler(monkeypatch)
+    assert sched.wait_for_initialization() is None
     req = _FakeRequest("r1", [1, 2, 3, 4, 5, 6, 7, 8])
     extra, async_ = sched.get_num_new_matched_tokens(req, 0)
     assert extra == 0
     assert async_ is False
+
+
+def test_scheduler_authoritative_directory_supplies_prefix(monkeypatch):
+    sched = _make_scheduler(monkeypatch)
+
+    class Directory:
+        enabled = True
+        authoritative = True
+        mode = "authoritative"
+
+        def lookup(self, hashes):
+            return [
+                {
+                    "engine_id": sched.source_engine_id,
+                    "slot_ids": [30 + i],
+                    "generations": [4 + i],
+                    "state": "ready",
+                }
+                for i, _content_hash in enumerate(hashes)
+            ]
+
+    sched._content_directory = Directory()
+    req = _FakeRequest("directory", [1, 2, 3, 4, 5, 6, 7, 8])
+    extra, async_ = sched.get_num_new_matched_tokens(req, 0)
+
+    assert (extra, async_) == (8, False)
+    sched.update_state_after_alloc(req, [100, 101])
+    meta = sched.build_connector_meta(SimpleNamespace())
+    assert meta.restore_queue == [("directory", [(30, 100, 4), (31, 101, 5)])]
 
 
 def test_scheduler_uses_staging_hits_when_no_local_match(monkeypatch):
@@ -413,6 +443,15 @@ def _install_worker_mock(
     return worker
 
 
+def test_worker_implements_current_trtllm_layer_hooks(monkeypatch):
+    monkeypatch.setenv("GMS_TRTLLM_DAEMON_SOCKET", "")
+    worker = GMSTrtllmKvCacheWorker(_make_llm_args(block_size=4))
+
+    assert worker.register_forward_pass_callable() is None
+    assert worker.wait_for_layer_load(0, _FakeStream()) is None
+    assert worker.save_kv_layer(0, _FakeStream()) is None
+
+
 def test_worker_wait_for_save_drains_evict_queue(monkeypatch):
     monkeypatch.setenv("GMS_TRTLLM_DAEMON_SOCKET", "")
     worker = GMSTrtllmKvCacheWorker(_make_llm_args(block_size=4))
@@ -432,6 +471,38 @@ def test_worker_wait_for_save_drains_evict_queue(monkeypatch):
     # `r1` reported as save-complete.
     saves, _loads = worker.get_finished(["r1"], [])
     assert saves == ["r1"]
+
+
+def test_worker_publishes_successful_spills_to_directory(monkeypatch):
+    monkeypatch.setenv("GMS_TRTLLM_DAEMON_SOCKET", "")
+    worker = GMSTrtllmKvCacheWorker(_make_llm_args(block_size=4))
+    _install_worker_mock(worker)
+
+    class Directory:
+        enabled = True
+        authoritative = False
+        mode = "shadow"
+
+        def __init__(self):
+            self.items = []
+
+        def publish(self, items):
+            self.items.extend(items)
+            return len(items)
+
+    directory = Directory()
+    worker._content_directory = directory
+    hashes = prefix_block_hashes([1, 2, 3, 4, 5, 6, 7, 8], 4, None)
+    worker.bind_connector_meta(
+        GMSTrtllmConnectorMeta(
+            evict_queue=[("directory-save", [10, 11], [3, 4], hashes)]
+        )
+    )
+    worker.wait_for_save(_FakeStream())
+
+    assert [item["slot_id"] for item in directory.items] == [10, 11]
+    assert [item["generation"] for item in directory.items] == [3, 4]
+    assert all(item["tier"] == "storage" for item in directory.items)
 
 
 def test_worker_wait_for_save_cross_node_emits_batch(monkeypatch):
