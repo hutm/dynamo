@@ -9,13 +9,13 @@ use dynamo_kv_router::{
     approx::PruneConfig,
     config::{ApproximateCachePolicyKind, KvRouterConfig},
     indexer::{
-        ApproximateLruIncarnation, ApproximateLruStats, ApproximateRetentionConfig, KvIndexer,
-        KvIndexerInterface, KvIndexerMetrics, KvRouterError, LowerTierIndexers, ThreadPoolIndexer,
-        record_unsupported_residency_event,
+        ApproximateLruIncarnation, ApproximateLruStats, ApproximateRetentionConfig,
+        GmsPlacementIndex, KvIndexer, KvIndexerInterface, KvIndexerMetrics, KvRouterError,
+        LowerTierIndexers, ThreadPoolIndexer, record_unsupported_residency_event,
     },
     protocols::{
         DpRank, KvCacheEventData, ResidencyProjection, ResidencyRoutingSnapshot, RouterEvent,
-        WorkerId,
+        WorkerId, WorkerWithDpRank,
     },
 };
 
@@ -67,12 +67,14 @@ pub enum Indexer {
     KvIndexer {
         primary: KvIndexer,
         lower_tier: LowerTierIndexers,
+        gms_placement: Arc<GmsPlacementIndex>,
         approx: Option<SideIndexer>,
         primary_records_routing_decisions: bool,
     },
     Concurrent {
         primary: Arc<ThreadPoolIndexer<ConcurrentRadixTreeCompressed>>,
         lower_tier: LowerTierIndexers,
+        gms_placement: Arc<GmsPlacementIndex>,
         approx: Option<SideIndexer>,
         primary_records_routing_decisions: bool,
     },
@@ -255,6 +257,7 @@ impl Indexer {
                         block_size,
                         Some(kv_indexer_metrics),
                     ),
+                    gms_placement: Arc::new(GmsPlacementIndex::new()),
                     approx: None,
                     primary_records_routing_decisions: true,
                 });
@@ -272,6 +275,7 @@ impl Indexer {
                     block_size,
                     Some(kv_indexer_metrics),
                 ),
+                gms_placement: Arc::new(GmsPlacementIndex::new()),
                 approx: None,
                 primary_records_routing_decisions: true,
             });
@@ -298,6 +302,7 @@ impl Indexer {
                     block_size,
                     Some(kv_indexer_metrics),
                 ),
+                gms_placement: Arc::new(GmsPlacementIndex::new()),
                 approx,
                 primary_records_routing_decisions: false,
             });
@@ -316,6 +321,7 @@ impl Indexer {
                 block_size,
                 Some(kv_indexer_metrics),
             ),
+            gms_placement: Arc::new(GmsPlacementIndex::new()),
             approx,
             primary_records_routing_decisions: false,
         })
@@ -326,13 +332,25 @@ impl Indexer {
             Self::KvIndexer {
                 primary,
                 lower_tier,
+                gms_placement,
                 ..
-            } => dump_local_events(primary.dump_events().await?, lower_tier).await,
+            } => {
+                let mut events =
+                    dump_local_events(primary.dump_events().await?, lower_tier).await?;
+                events.extend(gms_placement.dump_events());
+                Ok(events)
+            }
             Self::Concurrent {
                 primary,
                 lower_tier,
+                gms_placement,
                 ..
-            } => dump_local_events(primary.dump_events().await?, lower_tier).await,
+            } => {
+                let mut events =
+                    dump_local_events(primary.dump_events().await?, lower_tier).await?;
+                events.extend(gms_placement.dump_events());
+                Ok(events)
+            }
             Self::Remote { .. } => Ok(Vec::new()),
             Self::None => Err(KvRouterError::Unsupported(
                 "event dumping requires a KV indexer".to_string(),
@@ -341,6 +359,13 @@ impl Indexer {
     }
 
     pub(crate) async fn try_apply_event(&self, event: RouterEvent) -> Result<(), KvRouterError> {
+        match self {
+            Self::KvIndexer { gms_placement, .. } | Self::Concurrent { gms_placement, .. } => {
+                gms_placement.apply_event(&event)
+            }
+            Self::Remote { .. } | Self::None => {}
+        }
+
         let targets_primary = match event.targets_primary() {
             Ok(targets_primary) => targets_primary,
             Err(_) => {
@@ -430,9 +455,11 @@ impl Indexer {
             Self::KvIndexer {
                 primary,
                 lower_tier,
+                gms_placement,
                 approx,
                 ..
             } => {
+                gms_placement.remove_worker_dp_rank(WorkerWithDpRank::new(worker_id, dp_rank));
                 primary
                     .reset_worker_dp_rank_and_wait(worker_id, dp_rank)
                     .await?;
@@ -450,9 +477,11 @@ impl Indexer {
             Self::Concurrent {
                 primary,
                 lower_tier,
+                gms_placement,
                 approx,
                 ..
             } => {
+                gms_placement.remove_worker_dp_rank(WorkerWithDpRank::new(worker_id, dp_rank));
                 primary
                     .reset_worker_dp_rank_and_wait(worker_id, dp_rank)
                     .await?;
@@ -582,7 +611,10 @@ mod tests {
     use dynamo_kv_router::{
         ConcurrentRadixTreeCompressed, ThreadPoolIndexer,
         approx::PruneConfig,
-        indexer::{KvIndexer, KvIndexerInterface, KvIndexerMetrics, RoutingDecisionHashes},
+        indexer::{
+            GmsPlacementIndex, KvIndexer, KvIndexerInterface, KvIndexerMetrics,
+            RoutingDecisionHashes,
+        },
         protocols::{
             BlockHashOptions, LocalBlockHash, StorageTier, TokensWithHashes, WorkerWithDpRank,
             compute_block_hash_for_seq, compute_seq_hash_for_block,
@@ -597,6 +629,7 @@ mod tests {
                 Arc::new(KvIndexerMetrics::new_unregistered()),
             ),
             lower_tier: LowerTierIndexers::new(1, 4),
+            gms_placement: Arc::new(GmsPlacementIndex::new()),
             approx: None,
             primary_records_routing_decisions: false,
         }
@@ -610,6 +643,7 @@ mod tests {
                 4,
             )),
             lower_tier: LowerTierIndexers::new(2, 4),
+            gms_placement: Arc::new(GmsPlacementIndex::new()),
             approx: None,
             primary_records_routing_decisions: false,
         }
@@ -626,6 +660,7 @@ mod tests {
                 },
             )),
             lower_tier: LowerTierIndexers::new(2, 4),
+            gms_placement: Arc::new(GmsPlacementIndex::new()),
             approx: None,
             primary_records_routing_decisions: true,
         }
@@ -1034,6 +1069,7 @@ mod tests {
         let indexer = Indexer::Concurrent {
             primary,
             lower_tier: LowerTierIndexers::new(2, 4),
+            gms_placement: Arc::new(GmsPlacementIndex::new()),
             approx: Some(super::SideIndexer::Concurrent(side)),
             primary_records_routing_decisions: false,
         };
@@ -1165,6 +1201,7 @@ mod tests {
         let indexer = Indexer::Concurrent {
             primary,
             lower_tier: LowerTierIndexers::new(2, 4),
+            gms_placement: Arc::new(GmsPlacementIndex::new()),
             approx: Some(super::SideIndexer::Concurrent(side)),
             primary_records_routing_decisions: false,
         };

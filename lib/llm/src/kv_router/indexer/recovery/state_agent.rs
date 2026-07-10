@@ -1813,9 +1813,9 @@ mod tests {
         StableDpSlotId,
     };
     use dynamo_kv_router::indexer::{
-        KvIndexer, KvIndexerInterface, KvIndexerMetrics, KvStateAttachmentStatus,
-        KvStateRecoveryReceipt, LowerTierIndexers, LowerTierQueryOptions, MatchDetails,
-        query_lower_tiers_with_options,
+        GmsPlacementIndex, KvIndexer, KvIndexerInterface, KvIndexerMetrics,
+        KvStateAttachmentStatus, KvStateRecoveryReceipt, LowerTierIndexers, LowerTierQueryOptions,
+        MatchDetails, query_lower_tiers_with_options,
     };
     use dynamo_kv_router::protocols::{
         ExternalSequenceBlockHash, KvCacheRemoveData, KvCacheStoreData, KvCacheStoredBlockData,
@@ -1858,6 +1858,7 @@ mod tests {
             Indexer::KvIndexer {
                 primary,
                 lower_tier: LowerTierIndexers::new(1, 4),
+                gms_placement: Arc::new(GmsPlacementIndex::new()),
                 approx: None,
                 primary_records_routing_decisions: false,
             },
@@ -2094,6 +2095,7 @@ mod tests {
         let indexer = Indexer::KvIndexer {
             primary,
             lower_tier: lower_tiers.clone(),
+            gms_placement: Arc::new(GmsPlacementIndex::new()),
             approx: None,
             primary_records_routing_decisions: false,
         };

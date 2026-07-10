@@ -1102,7 +1102,7 @@ mod tests {
             CacheOwnerId, CacheSemanticsId, DcId, IdentitySource, IndexerDomainId, PoolId,
             RoutingScopeId, StableDpSlotId,
         },
-        indexer::{KvIndexer, KvIndexerInterface, KvIndexerMetrics},
+        indexer::{GmsPlacementIndex, KvIndexer, KvIndexerInterface, KvIndexerMetrics},
         protocols::{
             DpRank, ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData, KvCacheStoreData,
             KvCacheStoredBlockData, LocalBlockHash, ResidencyDomain, StorageTier, WorkerId,
@@ -1373,6 +1373,7 @@ mod tests {
             Indexer::KvIndexer {
                 primary: indexer,
                 lower_tier: LowerTierIndexers::new(1, 4),
+                gms_placement: Arc::new(GmsPlacementIndex::new()),
                 approx: None,
                 primary_records_routing_decisions: false,
             },
