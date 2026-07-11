@@ -606,6 +606,55 @@ is never used. When `--load-format gms` is set, the worker:
 > For TensorRT-LLM, GMS KV management means KVCacheManager V2 plus slot leases;
 > the V1 connector is unsupported.
 
+##### Persistent-KV support boundary
+
+The current TensorRT-LLM integration proves that GMS-owned weights survive an
+engine crash, KVCacheManager V2 slots remain protected by crash-recoverable
+leases, and a promoted shadow can resume serving. The host connector can also
+save and restore complete logical KV blocks through GMS host or storage tiers.
+
+It does **not** yet prove that a promoted shadow adopts the primary's completed
+HBM prefix without recomputing it. In particular, the integration does not yet
+publish an authoritative `ACTIVE -> READY` transition for completed HBM blocks
+or reconstruct KVCacheManager V2's content-hash-to-slot index from the surviving
+GMS directory. The TensorRT-LLM shadow-failover test therefore establishes
+service recovery and lease coordination, not persistent-HBM cache-hit parity
+with the vLLM and SGLang integrations.
+
+This is an inference-engine integration gap, not a CUDA or GMS memory-lifetime
+limitation. GMS already preserves the allocation, bytes, lease generations, and
+directory metadata. Closing the gap requires stable KVCacheManager V2 lifecycle
+hooks for finalizing a reusable block and adopting an exact persisted slot into
+the engine's native cache index. Until those hooks are available, patching V2
+internals is possible but version-sensitive.
+
+Follow-up work:
+
+- [ ] Detect the persistent `allocate_kv_caches` capability from the installed
+  TensorRT-LLM build and fail closed instead of assuming the engine patch exists.
+- [ ] Publish allocated HBM slots as `ACTIVE`, then atomically seal their lease
+  generation and publish them as `READY` only after TensorRT-LLM declares the KV
+  block complete and reusable.
+- [ ] On promotion, validate the model/layout manifest and lease generation,
+  claim sealed slots, and adopt them into KVCacheManager V2 without placing the
+  physical slots on its free list.
+- [ ] Hydrate TensorRT-LLM's native content-hash-to-slot index from the claimed
+  directory entries so normal scheduler lookups become local cache hits.
+- [ ] Resolve the source owner from each authoritative directory entry rather
+  than relying on a configured primary engine ID after ownership changes.
+- [ ] Implement cross-node staging discovery; the current staging scan is a
+  placeholder and cannot discover remote TensorRT-LLM KV sources.
+- [ ] Overlap block movement with execution where KVCacheManager V2 exposes a
+  stable layer or block readiness hook. The current connector restores complete
+  logical blocks before the forward pass and saves them at a later barrier.
+- [ ] Extend real-GPU validation to assert output equality, matched-token reuse,
+  no prefill recomputation for a sealed prefix, near-full-HBM behavior, TP=1 and
+  TP=2, CUDA graphs, and crashes during both incomplete and completed blocks.
+
+All adoption and lookup paths must fail closed on partial blocks, incompatible
+manifests, stale generations, mixed owners, or an unavailable engine hook. In
+those cases, recomputation is correct; reporting a cache hit is not.
+
 ### Shadow Engine Failover (Pause / Resume)
 
 All integrations support releasing and reclaiming GPU memory for shadow engine patterns. The API names differ by framework:
