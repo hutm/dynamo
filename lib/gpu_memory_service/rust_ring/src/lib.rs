@@ -33,6 +33,10 @@
 //!     src_engine_id  : char[48]   (NUL-padded)
 //!     block_pairs[54]: each (u32 src_blk, u32 dest_blk)
 
+// PyO3 0.22's generated wrappers trigger this lint under Rust 1.96 even though
+// the conversion is emitted by the macro rather than by these functions.
+#![allow(clippy::useless_conversion)]
+
 use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -58,6 +62,8 @@ const R_BLOCK_PAIRS: usize = 80;
 const BLOCK_PAIR_STRIDE: usize = 8;
 
 const OP_RESTORE_CHUNK: u8 = 1;
+
+type PopRecord = (u8, u8, u32, u32, Py<PyBytes>, Vec<(u32, u32)>);
 
 const LEASE_MAGIC: u32 = 0x4c53_4d47; // "GMSL" as little-endian u32.
 const LEASE_VERSION: u32 = 1;
@@ -413,6 +419,7 @@ unsafe fn load_lease_reservation(ptr: *const u8) -> (u32, u64, u64) {
     buf, capacity, src_engine_id_bytes, src_blocks, dest_blocks,
     counter_slot, counter_target, flags,
 ))]
+#[allow(clippy::too_many_arguments)] // Stable positional Python ABI.
 fn push_record(
     py: Python<'_>,
     buf: PyBuffer<u8>,
@@ -425,8 +432,10 @@ fn push_record(
     flags: u8,
 ) -> PyResult<bool> {
     let _ = py;
-    if !buf.readonly() || true {
-        // PyBuffer doesn't expose mut directly; we'll use the raw pointer.
+    if buf.readonly() {
+        return Err(pyo3::exceptions::PyBufferError::new_err(
+            "restore ring buffer must be writable",
+        ));
     }
     if src_blocks.len() != dest_blocks.len() {
         return Err(pyo3::exceptions::PyValueError::new_err(
@@ -521,11 +530,7 @@ fn push_record(
 /// engine_id_bytes, [(src_blk, dest_blk), ...]).
 #[pyfunction]
 #[pyo3(signature = (buf, capacity))]
-fn try_pop_record(
-    py: Python<'_>,
-    buf: PyBuffer<u8>,
-    capacity: u32,
-) -> PyResult<Option<(u8, u8, u32, u32, Py<PyBytes>, Vec<(u32, u32)>)>> {
+fn try_pop_record(py: Python<'_>, buf: PyBuffer<u8>, capacity: u32) -> PyResult<Option<PopRecord>> {
     let mask = (capacity - 1) as u64;
     let ptr = buf.buf_ptr() as *mut u8;
     let buf_len = buf.len_bytes();
@@ -756,10 +761,7 @@ unsafe fn acquire_lease_blocks(
             if acquired.len() >= count as usize {
                 break;
             }
-            if preferred_blocks
-                .iter()
-                .any(|preferred| *preferred == block_id)
-            {
+            if preferred_blocks.contains(&block_id) {
                 continue;
             }
             if let Some(lease) = try_acquire_lease_block(ptr, total_blocks, block_id, owner_hash) {
@@ -910,7 +912,7 @@ fn kv_lease_seal(
     unsafe {
         let total_blocks = validate_lease_buffer(ptr, buf_len)?;
         let _mutation = enter_lease_mutation(ptr)?;
-        for (block_id, generation) in block_ids.into_iter().zip(generations.into_iter()) {
+        for (block_id, generation) in block_ids.into_iter().zip(generations) {
             if block_id >= total_blocks {
                 continue;
             }
@@ -927,21 +929,21 @@ fn kv_lease_seal(
             // generation) and the stale seal would otherwise mark unwritten
             // bytes complete. Mirrors release_acquired_lease_blocks' post-CAS
             // generation recheck under the TRANSITION lock.
-            match (*state_ptr).compare_exchange(
-                LEASE_STATE_LEASED,
-                LEASE_STATE_TRANSITION,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    if (*generation_ptr).load(Ordering::Acquire) != generation {
-                        (*state_ptr).store(LEASE_STATE_LEASED, Ordering::Release);
-                    } else {
-                        (*state_ptr).store(LEASE_STATE_SEALED, Ordering::Release);
-                        sealed = sealed.wrapping_add(1);
-                    }
+            if (*state_ptr)
+                .compare_exchange(
+                    LEASE_STATE_LEASED,
+                    LEASE_STATE_TRANSITION,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                if (*generation_ptr).load(Ordering::Acquire) != generation {
+                    (*state_ptr).store(LEASE_STATE_LEASED, Ordering::Release);
+                } else {
+                    (*state_ptr).store(LEASE_STATE_SEALED, Ordering::Release);
+                    sealed = sealed.wrapping_add(1);
                 }
-                Err(_) => {}
             }
         }
     }
@@ -1075,7 +1077,7 @@ fn kv_lease_release(
         let total_blocks = validate_lease_buffer(ptr, buf_len)?;
         let _mutation = enter_lease_mutation(ptr)?;
         let free_count_ptr = ptr.add(L_FREE_COUNT) as *const AtomicU64;
-        for (block_id, generation) in block_ids.into_iter().zip(generations.into_iter()) {
+        for (block_id, generation) in block_ids.into_iter().zip(generations) {
             if block_id >= total_blocks {
                 continue;
             }

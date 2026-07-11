@@ -32,6 +32,13 @@ def test_rust_path_active_in_restore_ring():
     assert is_rust_accelerated() is True
 
 
+def test_rust_push_rejects_read_only_buffer():
+    import gms_rust_ring as r
+
+    with pytest.raises(BufferError, match="must be writable"):
+        r.push_record(bytes(64 + 8 * 512), 8, b"engine", [1], [2], 0, 1, 0)
+
+
 def test_rust_python_layout_parity(tmp_path):
     """Bytes written by Rust must be byte-identical to Python — both
     paths share the same on-disk format. Verified by pushing via Rust
