@@ -424,7 +424,7 @@ def test_hbm_claim_adoption_updates_generation(directory_daemon):
         assert [victim["slot_ids"] for victim in victims] == [[23]]
 
 
-def test_promotion_makes_crashed_writer_active_hbm_recoverable(directory_daemon):
+def test_promotion_drops_crashed_writer_unconfirmed_active_hbm(directory_daemon):
     _daemon, socket_path = directory_daemon
     item = _item(b"active-before-crash", 27, generation=4)
     item.update(tier="hbm", active=True)
@@ -447,12 +447,12 @@ def test_promotion_makes_crashed_writer_active_hbm_recoverable(directory_daemon)
         after, _epoch, _writer = client.directory_lookup(
             "manifest-a", [item["content_hash"]]
         )
-        assert after[0]["state"] == "ready"
+        assert after == [None]
         protected, rejected = client.directory_hbm_inventory(
             "engine-shadow", shadow_epoch
         )
         assert not rejected
-        assert protected == {"0": [27]}
+        assert protected == {}
 
 
 def test_promotion_releases_crashed_writer_claims(directory_daemon):
@@ -625,7 +625,7 @@ def test_directory_delta_gap_requires_atomic_resnapshot(directory_daemon):
     assert revision == delta["directory_revision"]
 
 
-def test_directory_promotion_emits_recoverable_hbm_delta(directory_daemon):
+def test_directory_promotion_emits_removal_delta_for_unconfirmed_hbm(directory_daemon):
     _daemon, socket_path = directory_daemon
     item = _item(b"promotion-delta", 81, generation=5)
     item.update(tier="hbm", active=True)
@@ -647,7 +647,7 @@ def test_directory_promotion_emits_recoverable_hbm_delta(directory_daemon):
     assert delta["directory_epoch"] == shadow_epoch
     assert len(delta["changes"]) == 1
     assert delta["changes"][0]["content_hash"] == item["content_hash"]
-    assert delta["changes"][0]["entry"]["state"] == "ready"
+    assert delta["changes"][0]["entry"] is None
 
 
 def test_directory_snapshot_and_changes_are_read_only(directory_daemon):
