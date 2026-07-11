@@ -351,6 +351,41 @@ def test_authoritative_directory_publishes_and_restores_prefix():
     assert [triple[0] for triple in conn.restore_calls[0]] == original_slots
 
 
+def test_authoritative_restore_uses_directory_entry_owner_after_promotion():
+    conn = _FakeBlockConnector(available=True)
+    conn.storage[7] = 7
+    cache = _build_cache(conn, _FakeAllocator())
+
+    class Directory:
+        enabled = True
+        authoritative = False
+        mode = "authoritative"
+
+        def lookup(self, hashes):
+            assert hashes == [b"hash"]
+            return [
+                {
+                    "state": "ready",
+                    "engine_id": "dead-primary",
+                    "tier": "storage",
+                    "slot_ids": [7],
+                    "generations": [3],
+                }
+            ]
+
+    cache._content_directory = Directory()
+    key = RadixKey(token_ids=[10], extra_key=None)
+
+    assert cache._restore_directory_suffix(
+        key,
+        torch.empty((0,), dtype=torch.int64),
+        [b"hash"],
+        0,
+    )
+    assert conn.host_restore_calls == [("dead-primary", [(7, 1_000_000, 3)])]
+    assert _match(cache, [10]).device_indices.tolist() == [1_000_000]
+
+
 def test_directory_hashes_preserve_sglang_extra_key_scope():
     cache = _build_cache(_FakeBlockConnector(available=True), _FakeAllocator())
     tokens = [10, 20, 30, 40]
