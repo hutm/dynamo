@@ -754,11 +754,15 @@ def make_gms_radix_cache_class():
                 return False
 
             pages: list[tuple[list[int], list[int]]] = []
+            source_engine_id = None
             tier = None
             for entry in raw_entries:
                 if entry is None or entry.get("state") != "ready":
                     break
-                if str(entry.get("engine_id")) != str(self._source_engine_id):
+                entry_source = str(entry.get("engine_id"))
+                if source_engine_id is None:
+                    source_engine_id = entry_source
+                if entry_source != source_engine_id:
                     break
                 entry_tier = str(entry.get("tier", ""))
                 if tier is None:
@@ -836,10 +840,10 @@ def make_gms_radix_cache_class():
                         (src, dst, generation)
                         for src, dst, generation in zip(source, fresh_list, generations)
                     ]
-                    foreign = str(self._source_engine_id) != str(self._engine_id)
+                    foreign = source_engine_id != str(self._engine_id)
                     if foreign or not self._gds.is_available():
                         results = self._gds.restore_blocks_remap_from_host(
-                            self._source_engine_id, triples
+                            source_engine_id, triples
                         )
                     else:
                         results = self._gds.restore_blocks_remap(triples)
@@ -1092,6 +1096,68 @@ def make_gms_radix_cache_class():
                     exc_info=True,
                 )
                 raise
+
+        def _commit_finished_hbm_prefix(self, token_ids, extra_key=None) -> None:
+            """Seal exactly the native pages for a completed request prefix.
+
+            ``insert`` runs before SGLang has finished reconciling duplicate
+            pages, so its publication is intentionally ACTIVE and fail-closed.
+            Once ``cache_finished_req`` returns, a fresh native lookup yields
+            the canonical tree pages whose KV bytes are final.  Sealing those
+            leases and then marking their directory entries dormant is the
+            crash-survival commit point.
+            """
+            if (
+                not self._content_directory.authoritative
+                or not token_ids
+                or not hasattr(
+                    self.token_to_kv_pool_allocator, "_gms_kv_leases_by_page"
+                )
+            ):
+                return
+            from sglang.srt.mem_cache.radix_cache import RadixKey
+
+            key = RadixKey(
+                token_ids=token_ids,
+                extra_key=extra_key,
+                is_bigram=self.is_eagle,
+            ).page_aligned(int(self.page_size))
+            if len(key) == 0:
+                return
+            if _new_api is not None:
+                match = super().match_prefix(_MatchPrefixParams(key=key))
+                indices = match.device_indices
+            else:
+                match = super().match_prefix(key)
+                indices = getattr(match, "device_indices", None)
+                if indices is None and isinstance(match, tuple) and match:
+                    indices = match[0]
+            if indices is None or len(indices) != len(key):
+                raise RuntimeError("completed SGLang prefix is not fully resident")
+
+            from gpu_memory_service.integrations.sglang.install_kv_leases import (
+                retain_hbm_indices,
+            )
+
+            leases = retain_hbm_indices(self.token_to_kv_pool_allocator, indices)
+            expected_pages = len(indices) // int(self.page_size)
+            if len(leases) != expected_pages:
+                raise RuntimeError(
+                    "could not seal every completed SGLang HBM prefix page"
+                )
+            hashes = self._gms_prefix_hashes(
+                self._key_to_int_list(key),
+                extra_key=getattr(key, "extra_key", None),
+            )
+            mark_dormant = getattr(
+                self._content_directory,
+                "mark_hbm_dormant_deferred",
+                self._content_directory.mark_hbm_dormant,
+            )
+            mark_dormant(hashes)
+            flush = getattr(self._content_directory, "flush_deferred", None)
+            if flush is not None and not flush(timeout=2.0):
+                raise TimeoutError("GMS SGLang HBM durability commit timed out")
 
         def _retain_hbm_node(self, node) -> bool:
             """Publish an evictable native leaf and keep its GMS pages alive."""
@@ -1901,6 +1967,15 @@ def make_gms_radix_cache_class():
                     value = args[1] if len(args) > 1 else kwargs.get("value")
                     prefix_len = int(getattr(result, "prefix_len", result or 0))
                     self._publish_inserted_hbm(key, value, prefix_len)
+            return result
+
+        def cache_finished_req(self, req, is_insert: bool = True):
+            committed_len = int(req._cache_commit_len())
+            token_ids = (req.origin_input_ids + req.output_ids)[:committed_len]
+            extra_key = req.extra_key
+            result = super().cache_finished_req(req, is_insert=is_insert)
+            if is_insert and not self.disable_finished_insert:
+                self._commit_finished_hbm_prefix(token_ids, extra_key)
             return result
 
         if _new_api is not None:
