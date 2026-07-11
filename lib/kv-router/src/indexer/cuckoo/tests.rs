@@ -2479,6 +2479,7 @@ fn store_event(
     RouterEvent {
         worker_id: worker.worker_id,
         storage_tier: StorageTier::Device,
+        gms_placement: None,
         event: KvCacheEvent {
             event_id: 1,
             data: KvCacheEventData::Stored(KvCacheStoreData {
@@ -2504,6 +2505,7 @@ fn remove_event(worker: WorkerWithDpRank, hashes: &[u64]) -> RouterEvent {
     RouterEvent {
         worker_id: worker.worker_id,
         storage_tier: StorageTier::Device,
+        gms_placement: None,
         event: KvCacheEvent {
             event_id: 2,
             data: KvCacheEventData::Removed(KvCacheRemoveData {
@@ -2522,6 +2524,7 @@ fn clear_event(worker_id: u64) -> RouterEvent {
     RouterEvent {
         worker_id,
         storage_tier: StorageTier::Device,
+        gms_placement: None,
         event: KvCacheEvent {
             event_id: 3,
             data: KvCacheEventData::Cleared,
