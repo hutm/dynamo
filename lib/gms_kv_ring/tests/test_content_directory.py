@@ -57,6 +57,11 @@ def directory_daemon(tmp_path):
         thread.join(timeout=3)
 
 
+@pytest.fixture(autouse=True)
+def synchronous_read_for_facade_tests(monkeypatch):
+    monkeypatch.setenv("GMS_KV_DIRECTORY_ASYNC_READ", "0")
+
+
 def _promote(client, writer_id="engine-primary"):
     _entries, epoch, _writer = client.directory_lookup("manifest-a", [])
     promoted, new_epoch, active = client.directory_promote(epoch, writer_id)
@@ -888,6 +893,34 @@ def test_deferred_hbm_publish_and_dormancy_commit_in_order(
         assert entries[0]["generations"] == [8]
     finally:
         directory.close()
+
+
+def test_async_directory_defaults_on_and_publication_can_be_disabled(monkeypatch):
+    monkeypatch.delenv("GMS_KV_DIRECTORY_ASYNC_READ", raising=False)
+    monkeypatch.delenv("GMS_KV_DIRECTORY_ASYNC_PUBLISH", raising=False)
+    directory = ContentDirectory(
+        "/tmp/unused-gms-directory.sock",
+        engine="test",
+        block_size=16,
+        mode="authoritative",
+    )
+    try:
+        assert directory.async_read_enabled
+        assert directory.async_publish_enabled
+    finally:
+        directory.close()
+
+    monkeypatch.setenv("GMS_KV_DIRECTORY_ASYNC_PUBLISH", "0")
+    synchronous = ContentDirectory(
+        "/tmp/unused-gms-directory.sock",
+        engine="test",
+        block_size=16,
+        mode="authoritative",
+    )
+    try:
+        assert not synchronous.async_publish_enabled
+    finally:
+        synchronous.close()
 
 
 def test_deferred_publication_close_is_a_durability_boundary(
