@@ -685,10 +685,11 @@ class ManagedProcess:
         # Step 4: SIGKILL all snapshotted process groups to ensure nothing
         # survives (e.g. processes that ignored SIGTERM or timed out).
         # _stop_started_processes handles per-process wait/escalation afterward.
+        # Always attempt the kill: deciding a group is dead from the SNAPSHOTTED
+        # pids alone would skip groups whose snapshotted members exited but which
+        # still have live members spawned/reparented after the snapshot, letting
+        # them leak. killpg on an already-empty group just raises ESRCH.
         for pgid in all_pgids:
-            known_pids = pgid_to_pids.get(pgid, set())
-            if known_pids and not self._live_process_groups_for_pids(known_pids):
-                continue
             try:
                 os.killpg(pgid, signal.SIGKILL)
             except ProcessLookupError:
