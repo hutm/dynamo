@@ -669,7 +669,39 @@ Under the hood, pausing calls `unmap_all_vas()` + `abort()` to release GPU memor
 
 Tensor pointers remain valid because the original virtual addresses are preserved.
 
-This enables a shadow engine to release its GPU memory, let a primary engine use the GPU, and then reclaim the memory after the primary is killed. The mutable KV cache always moves through a fresh RW layout in its own GMS tag before it is reallocated.
+This enables a shadow engine to release its GPU memory, let a primary engine use the GPU, and then reclaim the memory after the primary is killed. The legacy pause/resume path rebuilds mutable KV state. The experimental persistent-KV path instead combines shared leases with an authoritative content directory so sealed HBM blocks can be fenced, adopted, and reused by the promoted engine.
+
+#### Persistent-KV failover contract
+
+Persistent-KV failover is a single-node, single-tenant feature. Every engine and
+the failover process must use the same lease namespace and the exact same
+`GMS_KV_DIRECTORY_MANIFEST`. The manifest is a complete compatibility identity
+for the model, attention layout, KV dtype, block geometry, and hash/keyspace
+version. Authoritative promotion fails closed when it is absent.
+
+The directory Unix socket is mode `0600`. This prevents access from other Unix
+users, but it is not authentication between tenants running as the same UID.
+Deploy separate tenants under separate UIDs and isolated socket directories; do
+not expose a directory socket across a same-UID multi-tenant boundary.
+
+Relevant experimental controls:
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `GMS_KV_DIRECTORY_MODE` | `off` | `shadow` compares directory results; `authoritative` enables recovery decisions. |
+| `GMS_KV_DIRECTORY_MANIFEST` | none | Required complete compatibility identity for authoritative failover. |
+| `GMS_KV_DIRECTORY_ASYNC_READ` | `1` | Maintain a fail-closed background metadata view for request-path misses and host/storage hits; HBM adoption remains a transactional daemon claim. Set to `0` for synchronous diagnostics. |
+| `GMS_KV_DIRECTORY_ASYNC_PUBLISH` | `1` | Commit ordered directory mutations off the request hot path; request finalization and clean shutdown flush accepted mutations. A crash before commit produces a safe cache miss. Set to `0` for synchronous diagnostics. |
+| `GMS_KV_LEASES_RETAIN_PREFIX_CACHE` | `0` | Retain dormant prefixes without an authoritative directory. Enable only for an isolated single-writer lease namespace. |
+| `DYN_GMS_FAILOVER_POST_LOCK_FENCE_MS` | backend-specific | Delay after lock acquisition before promotion/reclaim. |
+| `DYN_GMS_FAILOVER_WAKEUP_TIMEOUT_SECS` | `120` | Bound promoted-shadow memory remapping. |
+| `DYN_GMS_FAILOVER_UNREGISTER_TIMEOUT_SECS` | `5` | Bound graceful router unregister during shutdown. |
+
+Prefix retention defaults on only with an authoritative directory. Enabling
+`GMS_KV_LEASES_RETAIN_PREFIX_CACHE` without that directory avoids the legacy
+prefix-cache performance loss, but shifts correctness and capacity isolation to
+the operator; it is intentionally opt-in until the real vLLM hit path is covered
+by the GPU failover matrix.
 
 ### Configuration via `model_loader_extra_config`
 
