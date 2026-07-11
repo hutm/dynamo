@@ -1427,6 +1427,80 @@ impl StudyRng {
     }
 }
 
+fn workers() -> [WorkerWithDpRank; DC_COUNT] {
+    std::array::from_fn(|lane| WorkerWithDpRank::new(100 + lane as u64, 0))
+}
+
+fn workers_with_shared_worker() -> [WorkerWithDpRank; DC_COUNT] {
+    std::array::from_fn(|lane| match lane {
+        0 => WorkerWithDpRank::new(7, 0),
+        1 => WorkerWithDpRank::new(7, 1),
+        _ => WorkerWithDpRank::new(100 + lane as u64, 0),
+    })
+}
+
+fn store_event(
+    worker: WorkerWithDpRank,
+    sequence_hashes: &[u64],
+    token_hash_base: u64,
+) -> RouterEvent {
+    RouterEvent {
+        worker_id: worker.worker_id,
+        storage_tier: StorageTier::Device,
+        gms_placement: None,
+        event: KvCacheEvent {
+            event_id: 1,
+            data: KvCacheEventData::Stored(KvCacheStoreData {
+                parent_hash: None,
+                start_position: Some(0),
+                blocks: sequence_hashes
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(index, hash)| KvCacheStoredBlockData {
+                        block_hash: ExternalSequenceBlockHash(hash),
+                        tokens_hash: LocalBlockHash(token_hash_base + index as u64),
+                        mm_extra_info: None,
+                    })
+                    .collect(),
+            }),
+            dp_rank: worker.dp_rank,
+        },
+    }
+}
+
+fn remove_event(worker: WorkerWithDpRank, hashes: &[u64]) -> RouterEvent {
+    RouterEvent {
+        worker_id: worker.worker_id,
+        storage_tier: StorageTier::Device,
+        gms_placement: None,
+        event: KvCacheEvent {
+            event_id: 2,
+            data: KvCacheEventData::Removed(KvCacheRemoveData {
+                block_hashes: hashes
+                    .iter()
+                    .copied()
+                    .map(ExternalSequenceBlockHash)
+                    .collect(),
+            }),
+            dp_rank: worker.dp_rank,
+        },
+    }
+}
+
+fn clear_event(worker_id: u64) -> RouterEvent {
+    RouterEvent {
+        worker_id,
+        storage_tier: StorageTier::Device,
+        gms_placement: None,
+        event: KvCacheEvent {
+            event_id: 3,
+            data: KvCacheEventData::Cleared,
+            dp_rank: 0,
+        },
+    }
+}
+
 fn colliding_hashes(
     addressing: CkfAddressing,
 ) -> (
