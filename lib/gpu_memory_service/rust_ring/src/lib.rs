@@ -168,12 +168,14 @@ unsafe fn enter_lease_mutation(ptr: *mut u8) -> PyResult<LeaseMutationGuard> {
 
 struct LeaseRecoveryGuard {
     active: *const AtomicU64,
+    owner_pid: *const AtomicU64,
 }
 
 impl Drop for LeaseRecoveryGuard {
     fn drop(&mut self) {
         // SAFETY: only the post-fence recovery owner can hold the barrier.
         unsafe {
+            (*self.owner_pid).store(0, Ordering::Release);
             (*self.active).store(0, Ordering::Release);
         }
     }
@@ -202,7 +204,10 @@ unsafe fn enter_lease_recovery(ptr: *mut u8) -> PyResult<LeaseRecoveryGuard> {
         ) {
             Ok(_) => {
                 (*pid_ptr).store(me, Ordering::Release);
-                return Ok(LeaseRecoveryGuard { active });
+                return Ok(LeaseRecoveryGuard {
+                    active,
+                    owner_pid: pid_ptr,
+                });
             }
             Err(cur) => {
                 if cur == LEASE_RECOVERY_BARRIER {
@@ -216,7 +221,10 @@ unsafe fn enter_lease_recovery(ptr: *mut u8) -> PyResult<LeaseRecoveryGuard> {
                         ));
                     }
                     (*pid_ptr).store(me, Ordering::Release);
-                    return Ok(LeaseRecoveryGuard { active });
+                    return Ok(LeaseRecoveryGuard {
+                        active,
+                        owner_pid: pid_ptr,
+                    });
                 }
                 if budget == 0 {
                     // A non-zero count that never drains means prior writers
@@ -224,7 +232,10 @@ unsafe fn enter_lease_recovery(ptr: *mut u8) -> PyResult<LeaseRecoveryGuard> {
                     // barrier; guarded mutator drops will not corrupt it.
                     (*active).store(LEASE_RECOVERY_BARRIER, Ordering::Release);
                     (*pid_ptr).store(me, Ordering::Release);
-                    return Ok(LeaseRecoveryGuard { active });
+                    return Ok(LeaseRecoveryGuard {
+                        active,
+                        owner_pid: pid_ptr,
+                    });
                 }
                 budget -= 1;
                 std::hint::spin_loop();
@@ -630,6 +641,7 @@ fn kv_lease_init(
         write_u64(ptr, L_RESERVATION_EPOCH, 0);
         write_u32(ptr, L_RESERVED_BLOCKS, 0);
         write_u64(ptr, L_RESERVED_OWNER_HASH, 0);
+        write_u64(ptr, L_RECOVERY_OWNER_PID, 0);
 
         for block_id in 0..total_blocks {
             let base = lease_record_off(block_id);
@@ -1348,5 +1360,8 @@ fn gms_rust_ring(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("KV_LEASE_RECORD_SIZE", LEASE_RECORD_SIZE)?;
     m.add("KV_LEASE_MAGIC", LEASE_MAGIC)?;
     m.add("KV_LEASE_VERSION", LEASE_VERSION)?;
+    m.add("KV_LEASE_ACTIVE_MUTATIONS_OFFSET", L_ACTIVE_MUTATIONS)?;
+    m.add("KV_LEASE_RECOVERY_OWNER_PID_OFFSET", L_RECOVERY_OWNER_PID)?;
+    m.add("KV_LEASE_RECOVERY_BARRIER", LEASE_RECOVERY_BARRIER)?;
     Ok(())
 }
