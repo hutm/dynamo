@@ -7,19 +7,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from typing_extensions import override
-from vllm.v1.kv_offload.base import (
-    LookupResult,
-    OffloadKey,
-    ReqContext,
-    RequestOffloadingContext,
-)
-from vllm.v1.kv_offload.tiering.base import (
-    JobMetadata,
-    JobResult,
-    SecondaryTierManager,
-)
-
 from gpu_memory_service.integrations.common.persistent_kv import (
     KVKey,
     KVLookup,
@@ -27,6 +14,14 @@ from gpu_memory_service.integrations.common.persistent_kv import (
     OperationId,
     PersistentKVTier,
 )
+from typing_extensions import override
+from vllm.v1.kv_offload.base import (
+    LookupResult,
+    OffloadKey,
+    ReqContext,
+    RequestOffloadingContext,
+)
+from vllm.v1.kv_offload.tiering.base import JobMetadata, JobResult, SecondaryTierManager
 
 if TYPE_CHECKING:
     from vllm.v1.kv_offload.base import OffloadingSpec

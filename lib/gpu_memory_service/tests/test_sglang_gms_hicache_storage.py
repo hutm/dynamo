@@ -2,15 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
+from gpu_memory_service.integrations.sglang.gms_hicache_storage import GMSHiCacheStorage
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
-)
-
-from gpu_memory_service.integrations.sglang.gms_hicache_storage import (
-    GMSHiCacheStorage,
 )
 
 

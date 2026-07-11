@@ -39,13 +39,9 @@ def _truthy_env(name: str) -> bool:
 
 
 def configure_shared_failover_env() -> None:
-    from gpu_memory_service.integrations.sglang.kv_identity import (
-        shared_kv_enabled,
-    )
-    if not (
-        shared_kv_enabled()
-        and _truthy_env("DYN_GMS_FAILOVER_SHADOW_MODE")
-    ):
+    from gpu_memory_service.integrations.sglang.kv_identity import shared_kv_enabled
+
+    if not (shared_kv_enabled() and _truthy_env("DYN_GMS_FAILOVER_SHADOW_MODE")):
         return
     os.environ.setdefault("SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK", "0")
     logger.info(

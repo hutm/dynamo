@@ -27,11 +27,13 @@ pytestmark = [
 ]
 
 
-pytest.importorskip("gms_rust_ring")
+gms_rust_ring = pytest.importorskip("gms_rust_ring")
 
 
 _LEASE_FREE_COUNT_OFFSET = 16
-_LEASE_ACTIVE_MUTATIONS_OFFSET = 24
+_LEASE_ACTIVE_MUTATIONS_OFFSET = int(gms_rust_ring.KV_LEASE_ACTIVE_MUTATIONS_OFFSET)
+_LEASE_RECOVERY_OWNER_PID_OFFSET = int(gms_rust_ring.KV_LEASE_RECOVERY_OWNER_PID_OFFSET)
+_LEASE_RECOVERY_BARRIER = int(gms_rust_ring.KV_LEASE_RECOVERY_BARRIER)
 _LEASE_RECORD_OFFSET = 64
 _LEASE_STATE_TRANSITION = 4
 
@@ -63,6 +65,20 @@ def _crash_in_lease_transition(path: str, operation: str, phase: int) -> None:
     finally:
         # Deliberately bypass close/finally behavior, as SIGKILL would.
         os._exit(99)
+
+
+def _crash_while_owning_recovery_barrier(path: str) -> None:
+    """Model SIGKILL after recovery fences mutations but before it finishes."""
+    fd = os.open(path, os.O_RDWR)
+    buf = mmap.mmap(fd, 0)
+    try:
+        struct.pack_into("<Q", buf, _LEASE_RECOVERY_OWNER_PID_OFFSET, os.getpid())
+        struct.pack_into(
+            "<Q", buf, _LEASE_ACTIVE_MUTATIONS_OFFSET, _LEASE_RECOVERY_BARRIER
+        )
+        buf.flush()
+    finally:
+        os._exit(98)
 
 
 def test_shared_memory_lease_client_coordinates_two_clients(tmp_path):
@@ -244,6 +260,37 @@ def test_post_fence_reclaim_recovers_process_death_at_every_transition_step(
             assert shadow.raw_free_count() == 0
         shadow.release(current)
         assert shadow.raw_free_count() == 4
+    finally:
+        shadow.close()
+
+
+def test_post_fence_reclaim_steals_barrier_from_crashed_recovery_owner(tmp_path):
+    path = str(tmp_path / "crashed-recovery-owner.shm")
+    old = SharedMemoryKVLeaseClient(
+        path, namespace="crashed-recovery-owner", owner_id="old", total_blocks=4
+    )
+    old.acquire(2)
+    old.close()
+
+    proc = mp.get_context("spawn").Process(
+        target=_crash_while_owning_recovery_barrier, args=(path,)
+    )
+    proc.start()
+    proc.join(timeout=10)
+    assert not proc.is_alive()
+    assert proc.exitcode == 98
+
+    shadow = SharedMemoryKVLeaseClient(
+        path, namespace="crashed-recovery-owner", owner_id="shadow", total_blocks=4
+    )
+    try:
+        assert shadow.reclaim_foreign() == 2
+        assert shadow.raw_free_count() == 4
+        with open(path, "rb") as lease_file:
+            lease_file.seek(_LEASE_ACTIVE_MUTATIONS_OFFSET)
+            assert struct.unpack("<Q", lease_file.read(8))[0] == 0
+            lease_file.seek(_LEASE_RECOVERY_OWNER_PID_OFFSET)
+            assert struct.unpack("<Q", lease_file.read(8))[0] == 0
     finally:
         shadow.close()
 

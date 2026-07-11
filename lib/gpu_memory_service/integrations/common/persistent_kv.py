@@ -17,7 +17,6 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import NewType
 
-
 KVKey = NewType("KVKey", bytes)
 OperationId = NewType("OperationId", int)
 

@@ -5,10 +5,6 @@ from collections import deque
 
 import numpy as np
 import pytest
-from vllm.v1.kv_offload.base import LookupResult, ReqContext, make_offload_key
-from vllm.v1.kv_offload.tiering.base import JobMetadata
-from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
-
 from gpu_memory_service.integrations.common.persistent_kv import (
     KVLookup,
     KVTransferResult,
@@ -17,6 +13,9 @@ from gpu_memory_service.integrations.vllm.gms_secondary_tier import (
     GMSSecondaryTierManager,
     register_gms_secondary_tier,
 )
+from vllm.v1.kv_offload.base import LookupResult, ReqContext, make_offload_key
+from vllm.v1.kv_offload.tiering.base import JobMetadata
+from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
 
 pytestmark = [pytest.mark.unit, pytest.mark.gpu_0]
 

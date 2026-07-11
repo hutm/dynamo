@@ -665,9 +665,9 @@ def test_block_gds_restore_remap_directly(tmp_path):
                     got = bytes(
                         dev[start : start + block_bytes].cpu().numpy().tobytes()
                     )
-                    assert got == patterns[(src, L)], (
-                        f"remap src={src} dst={dst} layer={L} mismatch"
-                    )
+                    assert (
+                        got == patterns[(src, L)]
+                    ), f"remap src={src} dst={dst} layer={L} mismatch"
         finally:
             h.close()
     finally:
@@ -907,9 +907,9 @@ def test_connector_evict_raises_does_not_block_get_finished(tmp_path):
 
             # Failure counter increments by the number of failed
             # blocks (2).
-            assert after - before >= 2, (
-                f"expected evict_failures to increment by ≥2, got {after - before}"
-            )
+            assert (
+                after - before >= 2
+            ), f"expected evict_failures to increment by ≥2, got {after - before}"
             # The crucial invariant: get_finished still returns
             # the req_id so vLLM unpins blocks.
             done, _recv = worker.get_finished({"r-doomed"})
@@ -2071,9 +2071,9 @@ def test_prefix_index_snapshot_load_logs_count(tmp_path, caplog):
         _PrefixIndex(max_entries=64, snapshot_path=snap)
 
     msgs = [r.message for r in caplog.records]
-    assert any("loaded 2 entries" in m for m in msgs), (
-        f"expected load INFO log; got: {msgs}"
-    )
+    assert any(
+        "loaded 2 entries" in m for m in msgs
+    ), f"expected load INFO log; got: {msgs}"
 
 
 def test_prefix_index_drop_slots_removes_pointers_only(tmp_path):
@@ -2149,9 +2149,9 @@ def test_daemon_scrub_drops_corrupted_host_tier_slot(tmp_path):
         before = metrics.daemon_scrub_corruptions.get(engine_id="e")
         scanned2, corruptions2 = d.scrub_once()
         assert scanned2 == 1
-        assert corruptions2 == 1, (
-            f"scrub did not detect poisoned slot; corruptions={corruptions2}"
-        )
+        assert (
+            corruptions2 == 1
+        ), f"scrub did not detect poisoned slot; corruptions={corruptions2}"
         # Slot was dropped → host_tier empty.
         assert d.host_tier.n_slots() == 0
         # Metric incremented exactly once.
@@ -2180,9 +2180,9 @@ def test_daemon_scrub_ignores_zero_crc_and_unready_slots(tmp_path):
         d.host_tier.mark_ready("e", 0, 64, crc=0)
 
         scanned, corruptions = d.scrub_once()
-        assert scanned == 0, (
-            f"scrubber scanned slots it shouldn't have (scanned={scanned})"
-        )
+        assert (
+            scanned == 0
+        ), f"scrubber scanned slots it shouldn't have (scanned={scanned})"
         assert corruptions == 0
         # Both slots still present.
         assert d.host_tier.n_slots() == 2
@@ -2266,9 +2266,9 @@ def test_backend_scrub_detects_corrupt_storage_file(tmp_path):
         )
         scanned2, corruptions2 = d.scrub_backend_once()
         assert scanned2 == 1
-        assert corruptions2 == 1, (
-            f"backend scrub did not detect poisoned file; corruptions={corruptions2}"
-        )
+        assert (
+            corruptions2 == 1
+        ), f"backend scrub did not detect poisoned file; corruptions={corruptions2}"
         # Slot dropped from the backend index.
         assert d.storage_tier.n_slots() == 0
         after = metrics.daemon_backend_scrub_corruptions.get(

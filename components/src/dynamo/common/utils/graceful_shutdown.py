@@ -35,7 +35,9 @@ def fast_failover_exit_enabled() -> bool:
 
 def failover_unregister_timeout_secs() -> float:
     try:
-        return max(0.0, float(os.getenv("DYN_GMS_FAILOVER_UNREGISTER_TIMEOUT_SECS", "5")))
+        return max(
+            0.0, float(os.getenv("DYN_GMS_FAILOVER_UNREGISTER_TIMEOUT_SECS", "5"))
+        )
     except ValueError:
         return 5.0
 
