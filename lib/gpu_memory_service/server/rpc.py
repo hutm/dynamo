@@ -304,8 +304,6 @@ class GMSRPCServer:
         try:
             os.chmod(self.socket_path, 0o600)
         except OSError:
-            logger.warning(
-                "Could not chmod GMS socket %s to 0600", self.socket_path
-            )
+            logger.warning("Could not chmod GMS socket %s to 0600", self.socket_path)
         logger.info("Server started: %s", self.socket_path)
         await self._server.serve_forever()

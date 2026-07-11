@@ -130,7 +130,8 @@ def test_deferred_persistent_pool_uses_semantic_tag_plan():
     try:
         assert allocator._gms_malloc(1024, 0, 0) == 0x1001
         assert allocator._gms_malloc(2048, 0, 0) == 0x1002
-        assert allocator._gms_malloc(4096, 0, 0) == 0x1003
+        with pytest.raises(RuntimeError, match="persistent tag plan exhausted"):
+            allocator._gms_malloc(4096, 0, 0)
     finally:
         allocator._active_tag.reset(token)
         allocator.clear_persistent_allocator_tag_plan("kv_pool")
@@ -138,7 +139,6 @@ def test_deferred_persistent_pool_uses_semantic_tag_plan():
     assert manager.scratch_calls == [
         (1024, "kv_pool:v2:aaa", False),
         (2048, "kv_pool:v2:bbb", False),
-        (4096, "kv_pool#2", False),
     ]
 
 

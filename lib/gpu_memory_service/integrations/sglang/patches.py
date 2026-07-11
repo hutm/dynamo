@@ -272,9 +272,7 @@ def patch_shared_kv_pool_geometry() -> None:
             resolve_kv_lease_namespace_total_blocks,
             resolve_lease_device,
         )
-        from gpu_memory_service.integrations.sglang.kv_identity import (
-            shared_kv_enabled,
-        )
+        from gpu_memory_service.integrations.sglang.kv_identity import shared_kv_enabled
         from sglang.srt.model_executor import model_runner_kv_cache_mixin as mixin
         from sglang.srt.model_executor.pool_configurator import (
             create_memory_pool_configurator,

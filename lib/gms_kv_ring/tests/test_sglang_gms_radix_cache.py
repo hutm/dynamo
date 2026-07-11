@@ -506,9 +506,9 @@ def test_phase_b_drop_on_restore_failure(monkeypatch):
 
     # First match: restore is attempted and fails.
     _match(cache, [1, 2, 3, 4])
-    assert fail_seen["n"] == 1, (
-        f"expected exactly one restore attempt; got {fail_seen['n']}"
-    )
+    assert (
+        fail_seen["n"] == 1
+    ), f"expected exactly one restore attempt; got {fail_seen['n']}"
     assert len(cache._spilled) == 0, "Phase B: spill record must be dropped on failure"
 
     # Second match: must NOT retry the daemon. The tree node
@@ -782,9 +782,9 @@ def test_install_idempotent_when_env_set(monkeypatch):
                 False,
             ), "expected patched init after first install()"
         second = inst.install()
-        assert second is False, (
-            "install() must be idempotent — second call should be a no-op"
-        )
+        assert (
+            second is False
+        ), "install() must be idempotent — second call should be a no-op"
     finally:
         # Best-effort restore; subsequent tests reset
         # `inst._INSTALLED` themselves.

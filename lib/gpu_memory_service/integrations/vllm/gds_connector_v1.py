@@ -738,15 +738,16 @@ def _build_layers_and_layout(
     return layers, block_layout, n_layers, block_bytes
 
 
+from gms_kv_ring.common.content_directory import (  # noqa: E402
+    ContentDirectory as _ContentDirectory,
+)
+
 # Re-export the shared cross-engine prefix-block hash. Both vLLM and
 # SGLang connectors must use the SAME implementation so cross-node
 # transfers between heterogeneous engines work — see
 # `gms_kv_ring/common/prefix_hashes.py` for the wire-format definition.
 from gms_kv_ring.common.prefix_hashes import (  # noqa: E402
     prefix_block_hashes as _prefix_block_hashes,
-)
-from gms_kv_ring.common.content_directory import (  # noqa: E402
-    ContentDirectory as _ContentDirectory,
 )
 
 # Snapshot file format for `_PrefixIndex.snapshot/_load_snapshot`.

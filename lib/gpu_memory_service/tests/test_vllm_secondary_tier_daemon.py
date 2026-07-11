@@ -7,12 +7,11 @@ import threading
 import time
 
 import numpy as np
-from vllm.v1.kv_offload.base import LookupResult, ReqContext, make_offload_key
-from vllm.v1.kv_offload.tiering.base import JobMetadata
-
 from gpu_memory_service.integrations.vllm.gms_secondary_tier import (
     GMSSecondaryTierManager,
 )
+from vllm.v1.kv_offload.base import LookupResult, ReqContext, make_offload_key
+from vllm.v1.kv_offload.tiering.base import JobMetadata
 
 
 def _spawn_daemon(socket_path):

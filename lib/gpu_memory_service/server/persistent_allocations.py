@@ -213,7 +213,9 @@ class PersistentAllocationManager:
         va_daemon = 0
         mapped = False
         try:
-            va_daemon = int(cumem_address_reserve_checked(aligned_size, self._granularity))
+            va_daemon = int(
+                cumem_address_reserve_checked(aligned_size, self._granularity)
+            )
             cumem_map_checked(va_daemon, aligned_size, int(handle))
             mapped = True
             cumem_set_access_checked(
