@@ -492,11 +492,12 @@ def test_gms_authoritative_hbm_failover_sglang(
             weights_hash=weights_state.memory_layout_hash,
             cleared_layouts=1,
         )
-        assert_completion_ok(
+        primary_output = assert_completion_ok(
             manager.frontend_port,
             _HBM_RECOVERY_PROMPT,
             failure_message="Primary SGLang HBM recovery warmup failed",
             success_message="Primary SGLang HBM recovery warmup OK",
+            body_overrides={"temperature": 0},
         )
 
         with DaemonClient(manager.kv_directory_socket) as directory:
@@ -531,13 +532,15 @@ def test_gms_authoritative_hbm_failover_sglang(
             weights_with_primary,
             min_weight_ro_sessions=1,
         )
-        assert_completion_ok(
+        shadow_output = assert_completion_ok(
             manager.frontend_port,
             _HBM_RECOVERY_PROMPT,
             failure_message="Shadow SGLang HBM recovery probe failed",
             success_message="Shadow SGLang HBM recovery probe OK",
             retry_timeout=30.0,
+            body_overrides={"temperature": 0},
         )
+        assert shadow_output == primary_output
         deadline = time.monotonic() + 10.0
         while "adopted_hbm_pages=" not in shadow.read_logs():
             if time.monotonic() >= deadline:
