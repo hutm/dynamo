@@ -268,9 +268,7 @@ def install(factory: Callable[[int], KVLeaseClient] | None = None) -> bool:
         self._gms_kv_lease_client = client
         self._gms_kv_leases_by_block: dict[int, KVLease] = {}
         self._gms_kv_directory = _make_directory(int(self.hash_block_size))
-        start_directory_sync = getattr(
-            self._gms_kv_directory, "start_async_read", None
-        )
+        start_directory_sync = getattr(self._gms_kv_directory, "start_async_read", None)
         if start_directory_sync is not None:
             start_directory_sync()
         hydrate = os.environ.get("GMS_VLLM_HYDRATE_HBM")
@@ -446,9 +444,7 @@ def install(factory: Callable[[int], KVLeaseClient] | None = None) -> bool:
                 block = self.blocks[block_id]
                 if block.ref_cnt != 0 or block.block_hash is not None:
                     continue
-                selected.append(
-                    (key, entry, KVLease(block_id, int(generations[0])))
-                )
+                selected.append((key, entry, KVLease(block_id, int(generations[0]))))
             if not selected or token is None:
                 return 0
 
@@ -462,15 +458,11 @@ def install(factory: Callable[[int], KVLeaseClient] | None = None) -> bool:
             stale = []
             while pending:
                 group = pending.pop()
-                group_leases = client.adopt(
-                    [old for _key, _entry, old in group]
-                )
+                group_leases = client.adopt([old for _key, _entry, old in group])
                 if group_leases:
                     expected_ids = [old.block_id for _key, _entry, old in group]
                     if [lease.block_id for lease in group_leases] != expected_ids:
-                        raise RuntimeError(
-                            "bulk HBM adoption returned different slots"
-                        )
+                        raise RuntimeError("bulk HBM adoption returned different slots")
                     adopted_pairs.extend(zip(group, group_leases))
                 elif len(group) == 1:
                     stale.extend(group)
@@ -505,7 +497,7 @@ def install(factory: Callable[[int], KVLeaseClient] | None = None) -> bool:
                     directory, [(key, entry) for key, entry, _old in stale]
                 )
 
-            for ((key, entry, _old), lease) in adopted_pairs:
+            for (key, entry, _old), lease in adopted_pairs:
                 block = self.blocks[int(lease.block_id)]
                 self._insert_block_hash(key, block, self.hash_block_size)
                 self._gms_kv_leases_by_block[int(block.block_id)] = lease
@@ -530,9 +522,8 @@ def install(factory: Callable[[int], KVLeaseClient] | None = None) -> bool:
             directory.mark_hbm_dormant(
                 [selected_item[0] for selected_item, _lease in adopted_pairs]
             )
-            if (
-                len(candidates) < limit
-                and getattr(directory, "read_view_is_current_writer", False)
+            if len(candidates) < limit and getattr(
+                directory, "read_view_is_current_writer", False
             ):
                 self._gms_hydrate_hbm = False
             log_hydration = (

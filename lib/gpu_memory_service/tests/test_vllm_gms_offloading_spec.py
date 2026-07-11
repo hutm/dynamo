@@ -3,15 +3,14 @@
 
 from types import SimpleNamespace
 
-from vllm.v1.kv_offload.factory import OffloadingSpecFactory
-from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
-
 from gpu_memory_service.integrations.vllm.gms_offloading_spec import (
     GMSTieringOffloadingSpec,
 )
 from gpu_memory_service.integrations.vllm.gms_secondary_tier import (
     GMSSecondaryTierManager,
 )
+from vllm.v1.kv_offload.factory import OffloadingSpecFactory
+from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
 
 
 def test_custom_spec_import_registers_gms_in_current_process():

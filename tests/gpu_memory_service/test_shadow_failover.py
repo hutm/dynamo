@@ -10,8 +10,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
-from gpu_memory_service.server.fsm import ServerState
 from gms_kv_ring.daemon.client import DaemonClient
+from gpu_memory_service.server.fsm import ServerState
 
 from tests.gpu_memory_service.common.runtime import (
     GMSProcessManager,
@@ -42,6 +42,7 @@ pytestmark = [pytest.mark.nightly, pytest.mark.fault_tolerance]
 # 6. Shadow A enters a new RW KV layout, hits allocation_oom, then finishes resume.
 
 logger = logging.getLogger(__name__)
+
 
 def _directory_diagnostics(*processes: ManagedProcess) -> str:
     lines = []
@@ -193,9 +194,9 @@ def _resume_shadow_after_primary_failover(
         result = resume_future.result(timeout=resume_timeout_s)
         kv_with_shadow = kv_cache_gms.get_runtime_state()
         assert kv_with_shadow.state == ServerState.RW
-        assert kv_with_shadow.allocation_count == kv_with_primary.allocation_count, (
-            "failover changed the committed shared KV allocation count"
-        )
+        assert (
+            kv_with_shadow.allocation_count == kv_with_primary.allocation_count
+        ), "failover changed the committed shared KV allocation count"
         return result
 
 
@@ -398,9 +399,8 @@ def test_gms_authoritative_hbm_failover_vllm(
             body_overrides={"temperature": 0},
         )
         for index in range(3):
-            sibling = (
-                f"GMS native-index hydration sibling {index}. "
-                + ("This prefix is deliberately distinct and deterministic. " * 64)
+            sibling = f"GMS native-index hydration sibling {index}. " + (
+                "This prefix is deliberately distinct and deterministic. " * 64
             )
             assert_completion_ok(
                 manager.frontend_port,
@@ -504,9 +504,7 @@ def test_gms_authoritative_hbm_failover_sglang(
             _entries, epoch, writer = directory.directory_lookup(
                 manager.kv_directory_manifest, []
             )
-            assert writer == "engine-primary", _directory_diagnostics(
-                primary, shadow
-            )
+            assert writer == "engine-primary", _directory_diagnostics(primary, shadow)
             protected, rejected = directory.directory_hbm_inventory(
                 writer, epoch, scope="sglang"
             )

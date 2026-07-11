@@ -429,14 +429,10 @@ class WorkerFactory:
         standby. On timeout, raise so the process exits and the kernel releases
         the flock for another standby.
         """
-        timeout = float(
-            os.environ.get("DYN_GMS_FAILOVER_WAKEUP_TIMEOUT_SECS", "120")
-        )
+        timeout = float(os.environ.get("DYN_GMS_FAILOVER_WAKEUP_TIMEOUT_SECS", "120"))
         try:
             await asyncio.wait_for(
-                handler.engine_client.collective_rpc(
-                    "wake_up", kwargs={"tags": tags}
-                ),
+                handler.engine_client.collective_rpc("wake_up", kwargs={"tags": tags}),
                 timeout=timeout,
             )
         except asyncio.TimeoutError:

@@ -28,8 +28,8 @@ def test_block_pool_hbm_directory_survives_engine_replacement(monkeypatch):
     from collections import defaultdict
     from types import SimpleNamespace
 
-    from gpu_memory_service.integrations.common.kv_lease_client import KVLease
     import gpu_memory_service.integrations.vllm.install_kv_leases as leases_mod
+    from gpu_memory_service.integrations.common.kv_lease_client import KVLease
     from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheManager
 

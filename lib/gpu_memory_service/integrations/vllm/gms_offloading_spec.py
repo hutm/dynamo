@@ -3,15 +3,14 @@
 
 """vLLM-native spec entry point that registers GMS inside EngineCore."""
 
+from gpu_memory_service.integrations.vllm.gms_secondary_tier import (
+    register_gms_secondary_tier,
+)
 from typing_extensions import override
 from vllm.v1.kv_offload.base import CanonicalKVCaches, GPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
-
-from gpu_memory_service.integrations.vllm.gms_secondary_tier import (
-    register_gms_secondary_tier,
-)
 
 register_gms_secondary_tier()
 

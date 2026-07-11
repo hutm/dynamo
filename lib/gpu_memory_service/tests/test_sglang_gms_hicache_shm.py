@@ -7,11 +7,10 @@ import threading
 import time
 
 import torch
-from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
-
 from gpu_memory_service.integrations.sglang.gms_hicache_storage_shm import (
     GMSSharedMemoryHiCacheStorage,
 )
+from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
 
 
 class _HostPool:

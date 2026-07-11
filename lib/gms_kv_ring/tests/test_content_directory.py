@@ -572,9 +572,10 @@ def test_directory_snapshot_then_delta_has_no_lost_update(directory_daemon):
     assert delta["reset_required"] is False
     assert delta["has_more"] is False
     assert delta["next_revision"] == delta["directory_revision"]
-    assert [(change["content_hash"], change["entry"]["slot_ids"]) for change in delta["changes"]] == [
-        (second["content_hash"], [62])
-    ]
+    assert [
+        (change["content_hash"], change["entry"]["slot_ids"])
+        for change in delta["changes"]
+    ] == [(second["content_hash"], [62])]
 
 
 def test_directory_delta_reports_slot_reuse_delete_before_upsert(directory_daemon):
@@ -592,7 +593,9 @@ def test_directory_delta_reports_slot_reuse_delete_before_upsert(directory_daemo
         )
         delta = client.directory_changes("manifest-a", revision)
 
-    assert [(change["content_hash"], change["entry"]) for change in delta["changes"]] == [
+    assert [
+        (change["content_hash"], change["entry"]) for change in delta["changes"]
+    ] == [
         (old["content_hash"], None),
         (
             new["content_hash"],
@@ -843,9 +846,7 @@ def test_directory_changes_long_poll_wakes_on_commit(directory_daemon):
             with DaemonClient(socket_path) as reader:
                 ready.set()
                 result.update(
-                    reader.directory_changes(
-                        "manifest-a", revision, wait_ms=1_000
-                    )
+                    reader.directory_changes("manifest-a", revision, wait_ms=1_000)
                 )
 
         thread = threading.Thread(target=wait_for_change)
@@ -963,9 +964,7 @@ def test_deferred_publication_surfaces_stale_writer_failure(
         assert primary.publish([_item(b"deferred-owner", 98)]) == 1
         with DaemonClient(socket_path) as client:
             _entries, epoch, _writer = client.directory_lookup("manifest-a", [])
-            promoted, _epoch, writer = client.directory_promote(
-                epoch, "engine-shadow"
-            )
+            promoted, _epoch, writer = client.directory_promote(epoch, "engine-shadow")
             assert promoted and writer == "engine-shadow"
         primary.publish_deferred([_item(b"deferred-stale", 99)])
         with pytest.raises(RuntimeError, match="mutation worker failed"):

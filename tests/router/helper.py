@@ -623,6 +623,8 @@ def managed_runtime(
         yield runtime
     finally:
         runtime.shutdown()
+
+
 def _validate_stream_response_chunks(chunks: list[bytes], context: str) -> None:
     """Validate an OpenAI-compatible SSE stream completed cleanly.
 

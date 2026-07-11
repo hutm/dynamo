@@ -30,9 +30,7 @@ def main() -> None:
         if args.directory_socket:
             from gms_kv_ring.daemon.directory_server import DirectoryDaemon
 
-            servers.append(
-                DirectoryDaemon(args.directory_socket).serve()
-            )
+            servers.append(DirectoryDaemon(args.directory_socket).serve())
         await asyncio.gather(*servers)
 
     asyncio.run(serve())

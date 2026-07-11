@@ -4,7 +4,6 @@
 from collections import deque
 
 import pytest
-
 from gpu_memory_service.integrations.common.persistent_kv import (
     KVKey,
     KVLookup,
