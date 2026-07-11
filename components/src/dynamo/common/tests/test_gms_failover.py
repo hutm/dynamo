@@ -320,6 +320,32 @@ async def test_gms_failover_post_lock_fence_honors_backend_override(monkeypatch)
     assert sleeps == [0.025]
 
 
+def test_explicit_directory_manifest_is_complete_shared_identity(monkeypatch):
+    from gms_kv_ring.common.content_directory import resolve_manifest_id
+
+    monkeypatch.setenv("GMS_KV_DIRECTORY_MANIFEST", "model-layout-v7")
+
+    assert (
+        resolve_manifest_id("vllm", 16, keyspace="vllm-native-hbm-v1")
+        == "model-layout-v7"
+    )
+    assert resolve_manifest_id("vllm", 0) == "model-layout-v7"
+
+
+def test_authoritative_failover_requires_explicit_directory_manifest(monkeypatch):
+    from dynamo.common.gms_failover import _promote_content_directory_after_fence
+
+    monkeypatch.setenv("GMS_KV_DIRECTORY_MODE", "authoritative")
+    monkeypatch.setenv("GMS_KV_DIRECTORY_SOCKET", "/tmp/not-contacted.sock")
+    monkeypatch.delenv("GMS_KV_DIRECTORY_MANIFEST", raising=False)
+
+    with pytest.raises(
+        RuntimeError,
+        match="requires GMS_KV_DIRECTORY_MANIFEST",
+    ):
+        _promote_content_directory_after_fence("vllm", "shadow")
+
+
 @pytest.mark.asyncio
 async def test_gms_failover_promotes_directory_before_lease_reclaim(monkeypatch):
     monkeypatch.setenv("GMS_KV_DIRECTORY_MODE", "shadow")
