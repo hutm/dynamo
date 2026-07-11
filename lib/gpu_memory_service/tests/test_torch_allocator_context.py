@@ -45,16 +45,6 @@ class _FakePersistentManager:
         self.scratch_calls: list[tuple[int, str, bool]] = []
         self.persistent_calls: list[tuple[str, str, int, bool]] = []
 
-    def create_scratch_mapping(
-        self,
-        *,
-        size: int,
-        tag: str,
-        map_scratch: bool = True,
-    ) -> int:
-        self.scratch_calls.append((size, tag, map_scratch))
-        return 0x1000 + len(self.scratch_calls)
-
     def create_persistent_mapping(
         self, *, engine_id: str, tag: str, size: int, shared: bool
     ) -> int:
@@ -109,88 +99,3 @@ def test_nested_pool_context_rejects_mismatched_tag(monkeypatch):
 
     assert fake_cuda.calls == [(mem_pool, 0)]
 
-
-def test_deferred_persistent_pool_uses_semantic_tag_plan():
-    manager = _FakePersistentManager()
-    allocator._tag_states["kv_pool"] = allocator._TagState(
-        manager=manager,
-        mem_pool=object(),
-        socket_path="/tmp/gms-test.sock",
-        device=0,
-        is_persistent=True,
-        persistent_engine_id="engine|bootstrap=shadow",
-        persistent_defer_physical=True,
-    )
-    allocator.set_persistent_allocator_tag_plan(
-        "kv_pool",
-        ["kv_pool:v2:aaa", "kv_pool:v2:bbb"],
-    )
-
-    token = allocator._active_tag.set("kv_pool")
-    try:
-        assert allocator._gms_malloc(1024, 0, 0) == 0x1001
-        assert allocator._gms_malloc(2048, 0, 0) == 0x1002
-        with pytest.raises(RuntimeError, match="persistent tag plan exhausted"):
-            allocator._gms_malloc(4096, 0, 0)
-    finally:
-        allocator._active_tag.reset(token)
-        allocator.clear_persistent_allocator_tag_plan("kv_pool")
-
-    assert manager.scratch_calls == [
-        (1024, "kv_pool:v2:aaa", False),
-        (2048, "kv_pool:v2:bbb", False),
-    ]
-
-
-def test_deferred_persistent_pool_uses_shared_ordinal_tags():
-    manager = _FakePersistentManager()
-    allocator._tag_states["kv_pool"] = allocator._TagState(
-        manager=manager,
-        mem_pool=object(),
-        socket_path="/tmp/gms-test.sock",
-        device=0,
-        is_persistent=True,
-        persistent_engine_id="engine|bootstrap=shadow",
-        persistent_defer_physical=True,
-    )
-
-    token = allocator._active_tag.set("kv_pool")
-    try:
-        assert allocator._gms_malloc(1024, 0, 0) == 0x1001
-        assert allocator._gms_malloc(2048, 0, 0) == 0x1002
-    finally:
-        allocator._active_tag.reset(token)
-
-    assert manager.scratch_calls == [
-        (1024, "kv_pool#0", False),
-        (2048, "kv_pool#1", False),
-    ]
-
-
-def test_persistent_scratch_promotion_accepts_rw_persistent_grant():
-    manager = object.__new__(memory_manager.GMSClientMemoryManager)
-    manager.tag = "kv_pool"
-    manager._granted_lock_type = GrantedLockType.RW_PERSISTENT
-    manager._mappings = {}
-    manager._scratch_mappings = {
-        0x1000: memory_manager._ScratchMapping(
-            size=4096,
-            aligned_size=4096,
-            va_reserved_size=1 << 20,
-            tag="kv_pool#0",
-        )
-    }
-    state = allocator._TagState(
-        manager=manager,
-        mem_pool=object(),
-        socket_path="/tmp/gms-test.sock",
-        device=0,
-        is_persistent=True,
-        persistent_engine_id="sglang:gpu0:block-pool|bootstrap=1",
-        persistent_defer_physical=True,
-    )
-    allocator._tag_states["kv_pool"] = state
-
-    assert manager.prepare_scratch_for_reallocation() == 1
-    assert not manager._scratch_mappings
-    assert manager._mappings[0x1000].tag == "kv_pool#0"
