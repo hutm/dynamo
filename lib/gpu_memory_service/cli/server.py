@@ -48,6 +48,15 @@ def _child_command(device: int, tag: str | None = None) -> list[str]:
     return command
 
 
+def _directory_command(socket_path: str) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "gms_kv_ring.daemon.directory_server",
+        socket_path,
+    ]
+
+
 def _terminate_all(processes: list[subprocess.Popen]) -> None:
     for process in processes:
         if process.poll() is None:
@@ -84,6 +93,16 @@ def main() -> None:
     vmm.ensure_initialized()
     devices = vmm.list_devices()
     processes = []
+    directory_socket = os.environ.get("GMS_DIRECTORY_SOCKET")
+    if directory_socket:
+        proc = subprocess.Popen(_directory_command(directory_socket))
+        logger.info(
+            "Started GMS content directory socket=%s pid=%d",
+            directory_socket,
+            proc.pid,
+        )
+        processes.append(proc)
+
     for device in list_devices():
         for tag in _tags_from_env():
             proc = subprocess.Popen(_child_command(device, tag))
