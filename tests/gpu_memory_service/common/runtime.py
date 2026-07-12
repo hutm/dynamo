@@ -563,7 +563,10 @@ class SGLangWithGMSProcess(GMSEngineProcess):
             "--disable-cuda-graph",
             "--disable-piecewise-cuda-graph",
             "--mem-fraction-static",
-            "0.8",
+            # The local failover harness intentionally co-locates a paused
+            # shadow with the active engine. Keep the production-compatible
+            # default while allowing the one-GPU test to reserve headroom.
+            os.environ.get("SGLANG_GMS_MEM_FRACTION_STATIC", "0.8"),
             "--port",
             str(self.serve_port),
             "--tp-size",
