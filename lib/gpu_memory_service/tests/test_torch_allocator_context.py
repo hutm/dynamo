@@ -98,4 +98,3 @@ def test_nested_pool_context_rejects_mismatched_tag(monkeypatch):
                 pass
 
     assert fake_cuda.calls == [(mem_pool, 0)]
-
