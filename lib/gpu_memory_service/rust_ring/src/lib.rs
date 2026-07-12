@@ -300,6 +300,49 @@ unsafe fn try_acquire_lease_block(
     Some((block_id, generation))
 }
 
+#[inline(always)]
+fn reservation_applies_to_owner(
+    reserved_blocks: u32,
+    reserved_owner_hash: u64,
+    owner_hash: u64,
+) -> bool {
+    reserved_blocks > 0 && (reserved_owner_hash == 0 || reserved_owner_hash != owner_hash)
+}
+
+unsafe fn load_lease_reservation(ptr: *const u8) -> (u32, u64, u64) {
+    let epoch_ptr = ptr.add(L_RESERVATION_EPOCH) as *const AtomicU64;
+    // Bounded seqlock read. A writer killed between its two epoch bumps strands
+    // an odd epoch forever; rather than hang the hot acquire path under the GIL,
+    // after a spin budget we conservatively report "no reservation". A stranded
+    // half-write is treated as absent, which only releases reserved headroom
+    // (never over-reserves), so failing this direction is safe.
+    const RESERVATION_READ_BUDGET: u32 = 1 << 20;
+    let mut budget = RESERVATION_READ_BUDGET;
+    loop {
+        let before = (*epoch_ptr).load(Ordering::Acquire);
+        if before & 1 != 0 {
+            if budget == 0 {
+                return (0, 0, before);
+            }
+            budget -= 1;
+            std::hint::spin_loop();
+            continue;
+        }
+        let reserved_blocks =
+            (*(ptr.add(L_RESERVED_BLOCKS) as *const AtomicU32)).load(Ordering::Acquire);
+        let reserved_owner_hash =
+            (*(ptr.add(L_RESERVED_OWNER_HASH) as *const AtomicU64)).load(Ordering::Acquire);
+        let after = (*epoch_ptr).load(Ordering::Acquire);
+        if before == after {
+            return (reserved_blocks, reserved_owner_hash, after);
+        }
+        if budget == 0 {
+            return (0, 0, after);
+        }
+        budget -= 1;
+    }
+}
+
 /// Initialize a shared-memory KV lease namespace.
 #[pyfunction]
 #[pyo3(signature = (buf, total_blocks, reserved_blocks))]
@@ -373,6 +416,68 @@ fn kv_lease_free_count(py: Python<'_>, buf: PyBuffer<u8>) -> PyResult<u32> {
         validate_lease_buffer(ptr, buf_len)?;
         let free_count_ptr = ptr.add(L_FREE_COUNT) as *const AtomicU64;
         Ok((*free_count_ptr).load(Ordering::Acquire) as u32)
+    }
+}
+
+/// Return free KV leases visible to an owner after active reservation headroom.
+#[pyfunction]
+#[pyo3(signature = (buf, owner_hash = 0))]
+fn kv_lease_free_count_for_owner(
+    py: Python<'_>,
+    buf: PyBuffer<u8>,
+    owner_hash: u64,
+) -> PyResult<u32> {
+    let _ = py;
+    let ptr = buf.buf_ptr() as *mut u8;
+    let buf_len = buf.len_bytes();
+    unsafe {
+        validate_lease_buffer(ptr, buf_len)?;
+        let free = (*(ptr.add(L_FREE_COUNT) as *const AtomicU64)).load(Ordering::Acquire);
+        let (reserved_blocks, reserved_owner_hash, _reservation_epoch) =
+            load_lease_reservation(ptr);
+        if reservation_applies_to_owner(reserved_blocks, reserved_owner_hash, owner_hash) {
+            Ok(free.saturating_sub(reserved_blocks as u64) as u32)
+        } else {
+            Ok(free as u32)
+        }
+    }
+}
+
+/// Store active reservation headroom in the lease shared-memory header.
+#[pyfunction]
+#[pyo3(signature = (buf, reserved_blocks, reserved_owner_hash = 0))]
+fn kv_lease_set_reservation(
+    py: Python<'_>,
+    buf: PyBuffer<u8>,
+    reserved_blocks: u32,
+    reserved_owner_hash: u64,
+) -> PyResult<(u32, u64, u64)> {
+    let _ = py;
+    let ptr = buf.buf_ptr() as *mut u8;
+    let buf_len = buf.len_bytes();
+    unsafe {
+        let total_blocks = validate_lease_buffer(ptr, buf_len)?;
+        let bounded = reserved_blocks.min(total_blocks);
+        let epoch_ptr = ptr.add(L_RESERVATION_EPOCH) as *const AtomicU64;
+        (*epoch_ptr).fetch_add(1, Ordering::AcqRel);
+        (*(ptr.add(L_RESERVED_OWNER_HASH) as *const AtomicU64))
+            .store(reserved_owner_hash, Ordering::Release);
+        (*(ptr.add(L_RESERVED_BLOCKS) as *const AtomicU32)).store(bounded, Ordering::Release);
+        let epoch = (*epoch_ptr).fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        Ok((bounded, reserved_owner_hash, epoch))
+    }
+}
+
+/// Read active reservation headroom from the lease shared-memory header.
+#[pyfunction]
+#[pyo3(signature = (buf))]
+fn kv_lease_reservation(py: Python<'_>, buf: PyBuffer<u8>) -> PyResult<(u32, u64, u64)> {
+    let _ = py;
+    let ptr = buf.buf_ptr() as *mut u8;
+    let buf_len = buf.len_bytes();
+    unsafe {
+        validate_lease_buffer(ptr, buf_len)?;
+        Ok(load_lease_reservation(ptr))
     }
 }
 
@@ -465,6 +570,75 @@ fn kv_lease_acquire(
             strict_preferred,
             owner_hash,
         )
+    }
+}
+
+/// Acquire KV block leases only if no reservation applies to this owner.
+///
+/// Returns None when a transition reservation is active or becomes active
+/// during acquisition; callers should retry under the reservation lock.
+#[pyfunction]
+#[pyo3(signature = (
+    buf,
+    preferred_blocks,
+    count,
+    allow_partial = false,
+    strict_preferred = false,
+    owner_hash = 0,
+))]
+fn kv_lease_acquire_lockless_if_unreserved(
+    py: Python<'_>,
+    buf: PyBuffer<u8>,
+    preferred_blocks: Vec<u32>,
+    count: u32,
+    allow_partial: bool,
+    strict_preferred: bool,
+    owner_hash: u64,
+) -> PyResult<Option<Vec<(u32, u32)>>> {
+    let _ = py;
+    if count == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    let ptr = buf.buf_ptr() as *mut u8;
+    let buf_len = buf.len_bytes();
+
+    unsafe {
+        let total_blocks = validate_lease_buffer(ptr, buf_len)?;
+        let _mutation = enter_lease_mutation(ptr)?;
+        let (before_reserved_blocks, before_reserved_owner_hash, before_epoch) =
+            load_lease_reservation(ptr);
+        if reservation_applies_to_owner(
+            before_reserved_blocks,
+            before_reserved_owner_hash,
+            owner_hash,
+        ) {
+            return Ok(None);
+        }
+
+        let acquired = acquire_lease_blocks(
+            ptr,
+            total_blocks,
+            &preferred_blocks,
+            count,
+            allow_partial,
+            strict_preferred,
+            owner_hash,
+        )?;
+
+        let (after_reserved_blocks, after_reserved_owner_hash, after_epoch) =
+            load_lease_reservation(ptr);
+        if after_epoch != before_epoch
+            && reservation_applies_to_owner(
+                after_reserved_blocks,
+                after_reserved_owner_hash,
+                owner_hash,
+            )
+        {
+            release_acquired_lease_blocks(ptr, &acquired);
+            return Ok(None);
+        }
+
+        Ok(Some(acquired))
     }
 }
 
@@ -821,7 +995,14 @@ fn kv_lease_reclaim_foreign_except(
 fn gms_rust_ring(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(kv_lease_init, m)?)?;
     m.add_function(wrap_pyfunction!(kv_lease_free_count, m)?)?;
+    m.add_function(wrap_pyfunction!(kv_lease_free_count_for_owner, m)?)?;
+    m.add_function(wrap_pyfunction!(kv_lease_set_reservation, m)?)?;
+    m.add_function(wrap_pyfunction!(kv_lease_reservation, m)?)?;
     m.add_function(wrap_pyfunction!(kv_lease_acquire, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        kv_lease_acquire_lockless_if_unreserved,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(kv_lease_seal, m)?)?;
     m.add_function(wrap_pyfunction!(kv_lease_adopt, m)?)?;
     m.add_function(wrap_pyfunction!(kv_lease_release, m)?)?;
