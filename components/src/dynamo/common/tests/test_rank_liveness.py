@@ -86,6 +86,30 @@ def test_legacy_monitor_does_not_require_unseen_ranks():
         monitor.stop()
 
 
+def test_wait_for_ranks_is_a_bounded_registration_barrier():
+    endpoint = _endpoint()
+    monitor = rl.RankLivenessMonitor(
+        lambda _rank, _reason: None,
+        bind_addr=endpoint,
+        timeout_ms_override=200,
+    )
+    client = rl.RankLivenessClient(
+        "unused",
+        1,
+        interval_ms=20,
+        connect_addr=endpoint,
+    )
+
+    monitor.start()
+    try:
+        assert monitor.wait_for_ranks({1}, timeout=0.02) is False
+        client.start()
+        assert monitor.wait_for_ranks({1}, timeout=1.0) is True
+    finally:
+        client.stop()
+        monitor.stop()
+
+
 def test_registered_rank_silence_fires_liveness_timeout():
     endpoint = _endpoint()
     fired = threading.Event()
@@ -144,3 +168,55 @@ def test_unexpected_multipart_identity_does_not_arm_monitor():
     finally:
         socket.close(0)
         monitor.stop()
+
+
+def test_worker_detects_leader_loss_after_acknowledgement():
+    endpoint = _endpoint()
+    fired = threading.Event()
+    calls: list[tuple[int, str]] = []
+    monitor = rl.RankLivenessMonitor(
+        lambda _rank, _reason: None,
+        bind_addr=endpoint,
+        timeout_ms_override=80,
+    )
+    client = rl.RankLivenessClient(
+        "unused",
+        1,
+        interval_ms=20,
+        connect_addr=endpoint,
+        on_leader_lost=lambda rank, reason: (calls.append((rank, reason)), fired.set()),
+        timeout_ms_override=80,
+        startup_grace_ms_override=500,
+    )
+
+    monitor.start()
+    client.start()
+    try:
+        time.sleep(0.12)
+        monitor.stop()
+        _wait(fired)
+        assert calls == [(0, "liveness-timeout")]
+    finally:
+        client.stop()
+        monitor.stop()
+
+
+def test_worker_detects_leader_that_never_appears():
+    fired = threading.Event()
+    calls: list[tuple[int, str]] = []
+    client = rl.RankLivenessClient(
+        "unused",
+        1,
+        interval_ms=20,
+        connect_addr=_endpoint(),
+        on_leader_lost=lambda rank, reason: (calls.append((rank, reason)), fired.set()),
+        timeout_ms_override=80,
+        startup_grace_ms_override=40,
+    )
+
+    client.start()
+    try:
+        _wait(fired)
+        assert calls == [(0, "startup-timeout")]
+    finally:
+        client.stop()

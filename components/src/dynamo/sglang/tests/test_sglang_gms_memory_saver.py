@@ -56,8 +56,16 @@ class _FakeManager:
         self.calls.append("remap_all_vas")
         self.is_unmapped = False
 
-    def remap_persistent_vas(self, engine_id: str, *, shared: bool) -> None:
-        self.calls.append(("remap_persistent_vas", engine_id, shared))
+    def remap_persistent_vas(
+        self,
+        engine_id: str,
+        *,
+        shared: bool,
+        synchronize_per_mapping: bool = True,
+    ) -> None:
+        self.calls.append(
+            ("remap_persistent_vas", engine_id, shared, synchronize_per_mapping)
+        )
         self.is_unmapped = False
 
 
@@ -189,7 +197,7 @@ def test_pause_resume_routes_only_managed_tags(build_impl):
         "unmap_all_vas",
         "abort",
         ("connect", RequestedLockType.RW_PERSISTENT, None),
-        ("remap_persistent_vas", "sglang-test", True),
+        ("remap_persistent_vas", "sglang-test", True, False),
     ]
 
 
@@ -203,8 +211,6 @@ def test_region_requires_rw_allocator(build_impl):
             pass
 
 
-
-
 @pytest.mark.parametrize(
     "name",
     ("DYN_SGLANG_GMS_PRIVATE_BOOTSTRAP_KV", "GMS_SGLANG_PRIVATE_BOOTSTRAP_KV"),
@@ -214,5 +220,7 @@ def test_removed_private_bootstrap_options_fail_closed(monkeypatch, name):
     monkeypatch.delenv("GMS_SGLANG_PRIVATE_BOOTSTRAP_KV", raising=False)
     monkeypatch.setenv(name, "1")
 
-    with pytest.raises(RuntimeError, match="private-bootstrap KV is no longer supported"):
+    with pytest.raises(
+        RuntimeError, match="private-bootstrap KV is no longer supported"
+    ):
         kv_identity.private_bootstrap_kv_enabled()
