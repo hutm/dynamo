@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import pytest
+
 from gpu_memory_service.integrations.vllm.install_kv_leases import (
     install_gms_engine_core_sleep,
 )
@@ -62,6 +64,7 @@ def test_block_pool_hbm_directory_survives_engine_replacement(monkeypatch):
         free = set(range(1, 8))
         generations = defaultdict(int)
         held = {}
+        seal_batches = []
 
     state = LeaseState()
     owners = iter(("primary", "shadow"))
@@ -92,8 +95,8 @@ def test_block_pool_hbm_directory_survives_engine_replacement(monkeypatch):
                 result.append(KVLease(block, generation))
             return result
 
-        def seal(self, _leases):
-            return None
+        def seal(self, leases):
+            state.seal_batches.append([lease.block_id for lease in leases])
 
         def release(self, released):
             for lease in released:
@@ -124,6 +127,7 @@ def test_block_pool_hbm_directory_survives_engine_replacement(monkeypatch):
 
         def __init__(self):
             self.entries = {}
+            self.ensure_calls = []
 
         def publish(self, items):
             for item in items:
@@ -177,8 +181,25 @@ def test_block_pool_hbm_directory_survives_engine_replacement(monkeypatch):
                 self.entries[value]["state"] = "ready"
             return len(hashes)
 
-        def ensure_hbm_capacity(self, _required):
-            return []
+        def ensure_hbm_capacity(self, required):
+            self.ensure_calls.append(required)
+            victims = []
+            freed = 0
+            for content_hash, entry in list(self.entries.items()):
+                if entry.get("tier") != "hbm" or entry.get("state") != "ready":
+                    continue
+                victims.append(
+                    {
+                        "content_hash": content_hash,
+                        "slot_ids": list(entry["slot_ids"]),
+                        "generations": list(entry["generations"]),
+                    }
+                )
+                freed += len(entry["slot_ids"])
+                del self.entries[content_hash]
+                if freed >= required:
+                    break
+            return victims
 
         def close(self):
             return None
@@ -202,7 +223,11 @@ def test_block_pool_hbm_directory_survives_engine_replacement(monkeypatch):
             0,
         )
         content_hashes = [block.block_hash for block in blocks]
+        # Full-block hashing alone is not a durability event: incomplete or
+        # still-referenced KV must never be advertised to a replacement.
+        assert directory.entries == {}
         primary.free_blocks(blocks)
+        assert state.seal_batches == [[block.block_id for block in blocks]]
         assert all(directory.entries[key]["state"] == "ready" for key in content_hashes)
         assert all(block.block_id not in state.free for block in blocks)
 
@@ -252,6 +277,34 @@ def test_block_pool_hbm_directory_survives_engine_replacement(monkeypatch):
             assert shadow.get_cached_block(b"new-miss" * 4, [0]) is None
         finally:
             directory.lookup_and_claim = lookup
+
+        # Saturating the shared ring retires READY entries at finalization, so
+        # the next request can allocate from local shared memory without a
+        # synchronous directory-capacity RPC. Directory visibility disappears
+        # before native hashes and leases are released.
+        pressure_blocks = shadow.get_new_blocks(4)
+        shadow.cache_full_blocks(
+            SimpleNamespace(block_hashes=[bytes([value]) * 32 for value in range(3, 7)]),
+            pressure_blocks,
+            0,
+            4,
+            4,
+            0,
+        )
+        pressure_hashes = [block.block_hash for block in pressure_blocks]
+        shadow.free_blocks(pressure_blocks)
+        assert directory.ensure_calls == [4]
+        assert len(state.free) == 4
+        advertised_slots = {
+            slot
+            for entry in directory.entries.values()
+            for slot in entry.get("slot_ids", [])
+        }
+        assert advertised_slots.isdisjoint(state.free)
+        assert all(shadow.blocks[block_id].block_hash is None for block_id in state.free)
+        assert sum(
+            content_hash not in directory.entries for content_hash in pressure_hashes
+        ) == 3
     finally:
         for name, original in originals.items():
             setattr(BlockPool, name, original)
@@ -259,3 +312,30 @@ def test_block_pool_hbm_directory_survives_engine_replacement(monkeypatch):
         leases_mod.ContentDirectory = original_directory
         leases_mod._factory = original_factory
         leases_mod._patched = original_patched
+
+
+@pytest.mark.parametrize(
+    ("engine_id", "expected"),
+    [("0", False), ("1", True), ("shadow-a", True)],
+)
+def test_failover_directory_role_is_derived_in_engine_core(
+    monkeypatch, engine_id, expected
+):
+    import gpu_memory_service.integrations.vllm.install_kv_leases as leases_mod
+
+    monkeypatch.setenv("DYN_GMS_FAILOVER_SHADOW_MODE", "true")
+    monkeypatch.setenv("DYN_GMS_FAILOVER_PRIMARY_ENGINE_ID", "0")
+    monkeypatch.setenv("ENGINE_ID", engine_id)
+    # A stale deployment knob must not override the authoritative replica ID.
+    monkeypatch.setenv("GMS_KV_DIRECTORY_STANDBY", "0" if expected else "1")
+
+    assert leases_mod._failover_directory_standby() is expected
+
+
+def test_non_failover_directory_role_remains_deployment_configurable(monkeypatch):
+    import gpu_memory_service.integrations.vllm.install_kv_leases as leases_mod
+
+    monkeypatch.delenv("DYN_GMS_FAILOVER_SHADOW_MODE", raising=False)
+    monkeypatch.delenv("DYN_VLLM_GMS_SHADOW_MODE", raising=False)
+
+    assert leases_mod._failover_directory_standby() is None
