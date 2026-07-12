@@ -17,8 +17,9 @@ logger = logging.getLogger(__name__)
 
 
 class SGLangEnginePauseController:
-    def __init__(self, engine: Any):
+    def __init__(self, engine: Any, *, release_memory_on_quiesce: bool = True) -> None:
         self._engine = engine
+        self._release_memory_on_quiesce = release_memory_on_quiesce
         self._is_paused = False
         self._generation_paused = False
 
@@ -57,10 +58,20 @@ class SGLangEnginePauseController:
         return True
 
     async def quiesce(self, tags: list[str] | None = None) -> bool:
-        # GMS failover quiesce == pause: release the engine's memory occupation
-        # (compute/activation) while the GMS-owned KV pool persists, so a shadow
-        # coexists out-of-discovery until it is promoted.
-        return await self.pause(tags)
+        if self._release_memory_on_quiesce:
+            return await self.pause(tags)
+        if self._is_paused or self._generation_paused:
+            return False
+
+        # A sleeping standby is already initialized against the shared,
+        # lease-protected GMS KV pool. Keep those VA mappings and CUDA graph
+        # bindings warm, but stop scheduling before it waits for ownership.
+        # It remains absent from discovery, so it cannot receive a request or
+        # write KV until the failover lock has fenced the old owner.
+        await self._engine.tokenizer_manager.pause_generation(PauseGenerationReqInput())
+        self._generation_paused = True
+        logger.info("[GMS failover] SGLang standby quiesced with KV mapped")
+        return True
 
     async def resume(self, tags: list[str] | None = None) -> bool:
         if not self._is_paused and not self._generation_paused:

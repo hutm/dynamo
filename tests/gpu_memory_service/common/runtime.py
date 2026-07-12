@@ -62,12 +62,14 @@ class GMSProcessManager:
         read_only_weights: bool = False,
         tags: tuple[str, ...] = ("weights", "kv_cache"),
         kv_directory: bool = False,
+        migration_limit: int = 0,
     ):
         self._request = request
         self._engine_cls = engine_cls
         self._read_only_weights = read_only_weights
         self._tags = tags
         self._kv_directory = bool(kv_directory)
+        self._migration_limit = int(migration_limit)
         self._directory_env: dict[str, str] = {}
         self.kv_directory_socket: str | None = None
         self.kv_directory_manifest: str | None = None
@@ -134,6 +136,7 @@ class GMSProcessManager:
                 DynamoFrontendProcess(
                     self._request,
                     frontend_port=0,
+                    migration_limit=self._migration_limit,
                     display_name="frontend",
                 )
             )

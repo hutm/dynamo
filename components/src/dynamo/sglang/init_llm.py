@@ -39,6 +39,36 @@ from dynamo.sglang.request_handlers import DecodeWorkerHandler, PrefillWorkerHan
 from dynamo.sglang.request_handlers.handler_base import SGLangEnginePauseController
 
 
+def _enable_gms_nccl_prewarm(server_args) -> None:
+    """Pay lazy TP communicator setup at startup, before standby quiesce."""
+
+    shadow = os.environ.get("DYN_GMS_FAILOVER_SHADOW_MODE", "").lower()
+    if shadow not in {"1", "true", "yes", "on"}:
+        return
+    if int(getattr(server_args, "nnodes", 1) or 1) <= 1:
+        return
+    if getattr(server_args, "pre_warm_nccl", False):
+        return
+    server_args.pre_warm_nccl = True
+    logging.info("[GMS failover] enabled SGLang NCCL pre-warm for multi-node standby")
+
+
+def _uses_mapped_sleeping_standby() -> bool:
+    """Keep KV mapped only on the explicit post-init standby path."""
+
+    lock_before_init = os.environ.get("DYN_SGLANG_GMS_LOCK_BEFORE_INIT", "1")
+    return lock_before_init.strip().lower() in {"0", "false", "no", "off"}
+
+
+def _can_prewarm_mapped_standby() -> bool:
+    if not _uses_mapped_sleeping_standby():
+        return False
+    enabled = os.environ.get(
+        "GMS_SGLANG_KV_LEASES", os.environ.get("GMS_KV_LEASES", "")
+    )
+    return enabled.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _rank_liveness_leader_host(server_args) -> Optional[str]:
     """Leader host that worker nodes heartbeat — derived from --dist-init-addr."""
     addr = getattr(server_args, "dist_init_addr", None)
@@ -52,9 +82,14 @@ class _NonLeaderFailoverController:
     """Rank-local failover controller for SGLang non-leader nodes."""
 
     def __init__(self, engine: sgl.Engine) -> None:
+        # On the post-init TP path the leader owns request quiescence. Keep
+        # worker schedulers collective-ready so the leader can run one
+        # lease-protected standby warmup before waiting for the lock.
+        mapped_standby = _uses_mapped_sleeping_standby()
         self._delegate = (
             SGLangEnginePauseController(engine)
-            if getattr(engine, "tokenizer_manager", None) is not None
+            if not mapped_standby
+            and getattr(engine, "tokenizer_manager", None) is not None
             else None
         )
         self._is_quiesced = False
@@ -141,6 +176,7 @@ async def init_decode(
     snapshot_engine: Optional[sgl.Engine] = None,
 ) -> None:
     server_args, dynamo_args = config.server_args, config.dynamo_args
+    _enable_gms_nccl_prewarm(server_args)
 
     if server_args.node_rank >= 1:
         os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
@@ -256,6 +292,7 @@ async def init_decode(
             handler.generate, health_check_payload, backend_name="sglang"
         )
 
+    rank_liveness_monitor = None
     if early_failover_activation is not None and early_failover_activation.enabled:
         early_failover_activation.attach_to(handler)
         await promotion_warmup()
@@ -264,7 +301,42 @@ async def init_decode(
         # shadow can quiesce (pause/release memory) before discovery; without it
         # gms_failover falls back to the raw handler, which has no quiesce.
         if getattr(handler, "_quiesce_controller", None) is None:
-            handler._quiesce_controller = SGLangEnginePauseController(engine)
+            handler._quiesce_controller = SGLangEnginePauseController(
+                engine,
+                release_memory_on_quiesce=not _uses_mapped_sleeping_standby(),
+            )
+        activation_barrier = None
+        if server_args.nnodes and server_args.nnodes > 1:
+            # Bind the shadow leader's liveness endpoint before waiting for its
+            # pod-local lock. Non-leaders heartbeat only after their own lock and
+            # lease reclaim finish, so registration is a fail-closed TP barrier.
+            rank_liveness_monitor = maybe_start_rank_liveness(
+                handler,
+                engine,
+                node_rank=0,
+                leader_host=None,
+                expected_ranks=None,
+            )
+            if rank_liveness_monitor is not None:
+                expected_ranks = frozenset(range(1, server_args.nnodes))
+
+                async def activation_barrier() -> None:
+                    from dynamo.common import rank_liveness
+
+                    ready = await asyncio.to_thread(
+                        rank_liveness_monitor.wait_for_ranks,
+                        expected_ranks,
+                        rank_liveness.startup_grace_ms() / 1000.0,
+                    )
+                    if not ready:
+                        raise RuntimeError(
+                            "SGLang TP failover activation timed out waiting for "
+                            f"locally fenced ranks {sorted(expected_ranks)}"
+                        )
+                    logging.info(
+                        "[GMS failover] sglang all non-leader ranks fenced and ready"
+                    )
+
         failover_activation = await prepare_gms_failover(
             handler,
             runtime,
@@ -274,13 +346,19 @@ async def init_decode(
             # namespace so promotion does not remap weights on the hot path.
             tags=["kv_cache"],
             promotion_warmup=promotion_warmup,
+            warm_standby_before_quiesce=_can_prewarm_mapped_standby(),
+            activation_barrier=activation_barrier,
         )
         failover_activation.attach_to(handler)
     maybe_start_gms_failover_child_watchdog(handler, engine)
     # Leader side of the cross-node liveness channel: watch worker heartbeats and,
     # on a worker crash, reuse the fence+release path to fail over to the warm shadow.
-    if server_args.nnodes and server_args.nnodes > 1:
-        maybe_start_rank_liveness(
+    if (
+        server_args.nnodes
+        and server_args.nnodes > 1
+        and rank_liveness_monitor is None
+    ):
+        rank_liveness_monitor = maybe_start_rank_liveness(
             handler,
             engine,
             node_rank=0,
@@ -358,6 +436,7 @@ async def init_prefill(
     snapshot_engine: Optional[sgl.Engine] = None,
 ) -> None:
     server_args, dynamo_args = config.server_args, config.dynamo_args
+    _enable_gms_nccl_prewarm(server_args)
 
     if server_args.node_rank >= 1:
         os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"

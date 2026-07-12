@@ -14,7 +14,10 @@ import threading
 import time
 from typing import Any, Iterable
 
-from dynamo.common.gms_failover import release_attached_gms_failover_lock
+from dynamo.common.gms_failover import (
+    release_attached_gms_failover_lock,
+    release_attached_gms_failover_lock_nowait,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +174,7 @@ class SGLangGmsFailoverChildWatchdog:
         self._loop = loop
         self._stop = threading.Event()
         self._released = threading.Event()
+        self._trigger_lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._previous_sigquit_handler: Any = None
         self._previous_sigquit_callback: tuple[Any, tuple[Any, ...]] | None = None
@@ -314,18 +318,25 @@ class SGLangGmsFailoverChildWatchdog:
         logger.info("[GMS failover] hooked SGLang subprocess watchdog")
 
     def _trigger_failure(self, reason: str) -> None:
-        if (
-            self._released.is_set()
-            or getattr(self._target, "_gms_failover_lock", None) is None
-        ):
-            return
+        with self._trigger_lock:
+            if (
+                self._released.is_set()
+                or getattr(self._target, "_gms_failover_lock", None) is None
+            ):
+                return
+            # Claim the failure before fencing. SIGQUIT, the subprocess hook,
+            # and the polling thread can report the same crash concurrently.
+            self._released.set()
 
         logger.warning(
             "[GMS failover] %s; fencing children before releasing active lock",
             reason,
         )
         _fence_children(self._engine)
-        self._released.set()
+        # The request loop can be blocked by the failed collective. Release the
+        # kernel flock directly from this watchdog thread before scheduling
+        # discovery cleanup; otherwise promotion waits for process teardown.
+        release_attached_gms_failover_lock_nowait(self._target, backend_name="sglang")
         future = asyncio.run_coroutine_threadsafe(
             self._release_after_fence(), self._loop
         )
@@ -415,7 +426,26 @@ def maybe_start_rank_liveness(
                 "[GMS liveness] no leader host for worker rank %d; skipping", node_rank
             )
             return None
-        client = rl.RankLivenessClient(leader_host, node_rank)
+
+        def on_leader_lost(rank: int, reason: str) -> None:
+            watchdog = getattr(target, "_gms_failover_child_watchdog", None)
+            if watchdog is not None:
+                watchdog._trigger_failure(
+                    f"cross-node leader rank {rank} liveness lost ({reason})"
+                )
+                return
+            logger.warning(
+                "[GMS liveness] leader rank %d lost (%s); fencing + releasing "
+                "worker lock directly",
+                rank,
+                reason,
+            )
+            _fence_children(engine)
+            release_attached_gms_failover_lock_nowait(target, backend_name="sglang")
+
+        client = rl.RankLivenessClient(
+            leader_host, node_rank, on_leader_lost=on_leader_lost
+        )
         if target is not None:
             setattr(target, "_gms_rank_liveness_client", client)
         client.start()
