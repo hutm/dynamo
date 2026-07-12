@@ -10,7 +10,8 @@ import logging
 import os
 import time
 import uuid
-from typing import Any, Callable
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, Iterable
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +188,22 @@ async def run_gms_failover_promotion_warmup(
     raise RuntimeError(
         f"GMS failover promotion warmup failed for {backend_name}: {last_error}"
     )
+
+
+@dataclass
+class GmsFailoverActivation:
+    """Result of failover gating.
+
+    Holding ``lock`` keeps the kernel flock fd alive for the active engine.
+    Attach it to the long-lived request handler once the handler exists.
+    """
+
+    enabled: bool = False
+    lock: Any | None = None
+
+    def attach_to(self, target: Any) -> None:
+        if self.lock is not None:
+            setattr(target, "_gms_failover_lock", self.lock)
 
 
 async def release_attached_gms_failover_lock(
@@ -407,4 +424,217 @@ async def run_gms_failover_post_lock_fence(
         )
     _reclaim_foreign_kv_leases_after_fence(
         backend_name, role, protected_blocks=protected_blocks
+    )
+
+
+def _controller_from(owner: Any) -> Any:
+    controller = getattr(owner, "_quiesce_controller", owner)
+    if controller is None:
+        raise RuntimeError(
+            "GMS failover shadow mode requires an engine quiesce controller"
+        )
+    return controller
+
+
+def _lock_factory_or_default(
+    lock_factory: Callable[[str], Any] | None
+) -> Callable[[str], Any]:
+    if lock_factory is not None:
+        return lock_factory
+
+    from gpu_memory_service.failover_lock.flock import FlockFailoverLock
+
+    return FlockFailoverLock
+
+
+def _failover_lock_inputs(
+    lock_factory: Callable[[str], Any] | None,
+) -> tuple[str, str, bool, Any]:
+    factory = _lock_factory_or_default(lock_factory)
+    lock_path = os.environ.get("FAILOVER_LOCK_PATH", DEFAULT_FAILOVER_LOCK_PATH)
+    engine_id = os.environ.get("ENGINE_ID", "0")
+    primary_engine_id = os.environ.get("DYN_GMS_FAILOVER_PRIMARY_ENGINE_ID", "0")
+    engine_name = f"engine-{engine_id}"
+    is_shadow = engine_id != primary_engine_id
+    return lock_path, engine_name, is_shadow, factory(lock_path)
+
+
+def _private_bootstrap_enabled(backend_name: str) -> bool:
+    backend_env = (
+        f"DYN_{backend_name.upper().replace('-', '_')}_GMS_PRIVATE_BOOTSTRAP_KV"
+    )
+    requested = _truthy_env(
+        backend_env,
+        default=_truthy_env("DYN_GMS_FAILOVER_PRIVATE_BOOTSTRAP_KV"),
+    )
+    if not requested:
+        return False
+    _lock_path, _engine_name, is_shadow, _lock = _failover_lock_inputs(None)
+    return is_shadow
+
+
+def _keep_shadow_ready() -> bool:
+    return _truthy_env(KEEP_SHADOW_READY_ENV, default=True)
+
+
+async def _try_acquire_active_lock(lock: Any, engine_name: str) -> bool:
+    """Try to become active without blocking.
+
+    Inter-pod failover replacement pods can reuse pod index 0 after a failover,
+    while the active holder is now index 1. Static primary-index checks would
+    make that replacement block forever without quiescing. The lock is the
+    source of truth: if it is free, this worker is active; if it is busy, this
+    worker must become a warm shadow and wait.
+    """
+
+    try:
+        from gpu_memory_service.failover_lock.interface import FailoverLockError
+    except ImportError:  # pragma: no cover - default lock import would also fail.
+        FailoverLockError = RuntimeError  # type: ignore[assignment]
+
+    try:
+        await lock.acquire(engine_id=engine_name, timeout=0.0)
+        return True
+    except TypeError:
+        # Minimal test doubles may not accept keyword arguments. Treat those as
+        # uncontended locks so existing unit fakes keep the simple acquire path.
+        await lock.acquire(engine_name)
+        return True
+    except FailoverLockError:
+        return False
+
+
+async def acquire_gms_failover_lock_before_init(
+    *,
+    backend_name: str,
+    lock_factory: Callable[[str], Any] | None = None,
+) -> GmsFailoverActivation:
+    """Acquire the failover lock before engine initialization.
+
+    Use this when the backend may write shared GMS KV during warmup/init. It
+    serializes primary and shadow initialization so only the active engine can
+    create CUDA contexts and mutate the shared KV namespace.
+    """
+
+    if not _truthy_env("DYN_GMS_FAILOVER_SHADOW_MODE"):
+        return GmsFailoverActivation()
+
+    lock_path, engine_name, is_shadow, lock = _failover_lock_inputs(lock_factory)
+    role = "shadow" if is_shadow else "primary"
+    logger.info(
+        "[GMS failover] %s %s acquiring active lock before engine init at %s",
+        backend_name,
+        role,
+        lock_path,
+    )
+    await lock.acquire(engine_id=engine_name)
+    logger.info(
+        "[GMS failover] %s %s acquired active lock before engine init",
+        backend_name,
+        role,
+    )
+    await run_gms_failover_post_lock_fence(backend_name=backend_name, role=role)
+    return GmsFailoverActivation(
+        enabled=True,
+        lock=lock,
+    )
+
+
+async def prepare_gms_failover(
+    owner: Any,
+    runtime: Any,
+    *,
+    backend_name: str,
+    tags: Iterable[str] = DEFAULT_FAILOVER_TAGS,
+    lock_factory: Callable[[str], Any] | None = None,
+    promotion_warmup: Callable[[], Awaitable[None]] | None = None,
+) -> GmsFailoverActivation:
+    """Gate model registration until this engine owns the shared GMS namespace.
+
+    Bulwark injects ``ENGINE_ID`` and ``FAILOVER_LOCK_PATH`` for all pods. This
+    helper only activates when ``DYN_GMS_FAILOVER_SHADOW_MODE`` is true, so
+    standalone GMS deployments keep the vanilla Dynamo registration path.
+    """
+
+    if not _truthy_env("DYN_GMS_FAILOVER_SHADOW_MODE"):
+        return GmsFailoverActivation()
+
+    lock_path, engine_name, _is_shadow, lock = _failover_lock_inputs(lock_factory)
+
+    private_bootstrap = _private_bootstrap_enabled(backend_name)
+    if not private_bootstrap:
+        logger.info(
+            "[GMS failover] %s attempting active lock at %s",
+            backend_name,
+            lock_path,
+        )
+        if await _try_acquire_active_lock(lock, engine_name):
+            logger.info("[GMS failover] %s active", backend_name)
+            await run_gms_failover_post_lock_fence(
+                backend_name=backend_name,
+                role="active",
+            )
+            return GmsFailoverActivation(
+                enabled=True,
+                lock=lock,
+            )
+        logger.info(
+            "[GMS failover] %s active lock is held; preparing warm shadow",
+            backend_name,
+        )
+
+    controller = _controller_from(owner)
+    tag_list = list(tags)
+
+    role = "private-bootstrap member" if private_bootstrap else "shadow"
+    logger.info(
+        "[GMS failover] %s %s quiescing before discovery registration",
+        backend_name,
+        role,
+    )
+    await controller.quiesce(tag_list)
+
+    set_health_status = getattr(runtime, "set_health_status", None)
+    keep_shadow_ready = _keep_shadow_ready()
+    if set_health_status is not None:
+        if keep_shadow_ready:
+            # Warm shadows stay Kubernetes-ready but remain out of route
+            # discovery until they acquire the active lock.
+            set_health_status(True)
+        else:
+            set_health_status(False)
+
+    logger.info(
+        "[GMS failover] %s %s waiting for active lock at %s",
+        backend_name,
+        role,
+        lock_path,
+    )
+    await lock.acquire(engine_id=engine_name)
+    logger.info(
+        "[GMS failover] %s %s acquired active lock",
+        backend_name,
+        role,
+    )
+    await run_gms_failover_post_lock_fence(backend_name=backend_name, role=role)
+
+    await controller.resume(tag_list)
+    mark_resumed = getattr(controller, "mark_resumed", None)
+    if mark_resumed is not None:
+        mark_resumed()
+
+    if promotion_warmup is not None:
+        await promotion_warmup()
+
+    if not keep_shadow_ready and set_health_status is not None:
+        set_health_status(True)
+
+    logger.info(
+        "[GMS failover] %s %s resumed; registering with discovery",
+        backend_name,
+        role,
+    )
+    return GmsFailoverActivation(
+        enabled=True,
+        lock=lock,
     )
