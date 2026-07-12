@@ -73,6 +73,7 @@ class _BusyOnTryLock(_Lock):
         await super().acquire(engine_id, timeout=timeout)
 
 
+@pytest.mark.asyncio
 async def test_gms_failover_promotion_warmup_drains_non_error_stream(monkeypatch):
     monkeypatch.delenv("DYN_GMS_FAILOVER_PROMOTION_WARMUP", raising=False)
     seen = []
@@ -158,6 +159,7 @@ async def test_gms_failover_post_lock_fence_honors_backend_override(monkeypatch)
     assert sleeps == [0.025]
 
 
+@pytest.mark.asyncio
 async def test_release_attached_gms_failover_lock_releases_and_detaches():
     class _Handler:
         pass

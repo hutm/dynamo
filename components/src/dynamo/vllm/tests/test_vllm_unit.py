@@ -1806,6 +1806,7 @@ def test_vllm_gms_failover_jit_cache_isolation_can_be_disabled(monkeypatch):
     assert os.environ["TMPDIR"] == "/dev/shm/dynamo-jit/tmp"
 
 
+@pytest.mark.asyncio
 async def test_gms_reject_removed_private_bootstrap_options(monkeypatch):
     from dynamo.vllm.worker_factory import WorkerFactory
 
