@@ -39,27 +39,6 @@ from dynamo.sglang.request_handlers import DecodeWorkerHandler, PrefillWorkerHan
 from dynamo.sglang.request_handlers.handler_base import SGLangEnginePauseController
 
 
-def _truthy_env(name: str, *, default: bool = False) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.lower() in {"1", "true", "yes", "on"}
-
-
-def _private_bootstrap_shadow_prewarm_enabled() -> bool:
-    return _truthy_env("DYN_SGLANG_GMS_SHADOW_PREWARM", default=False)
-
-
-def _is_private_bootstrap_shadow() -> bool:
-    if not _truthy_env("DYN_GMS_FAILOVER_SHADOW_MODE"):
-        return False
-    if not _truthy_env("DYN_SGLANG_GMS_PRIVATE_BOOTSTRAP_KV"):
-        return False
-    engine_id = os.environ.get("ENGINE_ID", "0")
-    primary_engine_id = os.environ.get("DYN_GMS_FAILOVER_PRIMARY_ENGINE_ID", "0")
-    return engine_id != primary_engine_id
-
-
 def _rank_liveness_leader_host(server_args) -> Optional[str]:
     """Leader host that worker nodes heartbeat — derived from --dist-init-addr."""
     addr = getattr(server_args, "dist_init_addr", None)
@@ -281,19 +260,6 @@ async def init_decode(
         early_failover_activation.attach_to(handler)
         await promotion_warmup()
     else:
-        shadow_prewarmed = False
-        if (
-            _private_bootstrap_shadow_prewarm_enabled()
-            and _is_private_bootstrap_shadow()
-        ):
-            logging.info(
-                "[GMS failover] sglang private-bootstrap shadow prewarm starting"
-            )
-            await promotion_warmup()
-            shadow_prewarmed = True
-            logging.info(
-                "[GMS failover] sglang private-bootstrap shadow prewarm complete"
-            )
         # Give the serving handler a quiesce-capable failover controller so a
         # shadow can quiesce (pause/release memory) before discovery; without it
         # gms_failover falls back to the raw handler, which has no quiesce.
@@ -307,7 +273,7 @@ async def init_decode(
             # primary and shadow during prewarm.  Quiesce only the private KV
             # namespace so promotion does not remap weights on the hot path.
             tags=["kv_cache"],
-            promotion_warmup=None if shadow_prewarmed else promotion_warmup,
+            promotion_warmup=promotion_warmup,
         )
         failover_activation.attach_to(handler)
     maybe_start_gms_failover_child_watchdog(handler, engine)

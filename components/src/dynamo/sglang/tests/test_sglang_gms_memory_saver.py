@@ -11,6 +11,7 @@ import pytest
 
 pytest.importorskip("gpu_memory_service", reason="gpu_memory_service is required")
 torch = pytest.importorskip("torch", reason="torch is required")
+from gpu_memory_service.integrations.sglang import kv_identity  # noqa: E402
 
 import gpu_memory_service.integrations.sglang.memory_saver as gms_memory_saver  # noqa: E402
 from gpu_memory_service.common.locks import (  # noqa: E402
@@ -59,9 +60,6 @@ class _FakeManager:
         self.calls.append("remap_all_vas")
         self.is_unmapped = False
 
-    def prepare_scratch_for_reallocation(self) -> None:
-        self.calls.append("prepare_scratch_for_reallocation")
-
     def remap_persistent_vas(self, engine_id: str, *, shared: bool) -> None:
         self.calls.append(("remap_persistent_vas", engine_id, shared))
         self.is_unmapped = False
@@ -79,18 +77,12 @@ def build_impl(monkeypatch, tmp_path):
         *,
         weights_lock: GrantedLockType = GrantedLockType.RW,
         kv_cache_lock: GrantedLockType = GrantedLockType.RW,
-        private_bootstrap: bool = False,
         allocation_engine_id: str = "sglang-test",
-        promotion_engine_id: str = "sglang-test",
         allocation_shared: bool = True,
-        shared_kv_enabled: bool = True,
     ):
         weights = _FakeManager(granted_lock_type=weights_lock)
         kv_cache = _FakeManager(granted_lock_type=kv_cache_lock)
         pool_calls: list[tuple[str, torch.device]] = []
-        retarget_calls: list[tuple[str, str, bool]] = []
-        release_calls: list[str] = []
-        persistent_allocator_calls: list[tuple[str, int, str, str, bool, bool]] = []
 
         @contextmanager
         def fake_use_mem_pool(tag: str, device: torch.device):
@@ -108,18 +100,7 @@ def build_impl(monkeypatch, tmp_path):
             lambda device: allocation_engine_id,
         )
         monkeypatch.setattr(
-            gms_memory_saver, "promotion_engine_id", lambda device: promotion_engine_id
-        )
-        monkeypatch.setattr(
-            gms_memory_saver,
-            "private_bootstrap_kv_enabled",
-            lambda: private_bootstrap,
-        )
-        monkeypatch.setattr(
             gms_memory_saver, "allocation_shared", lambda: allocation_shared
-        )
-        monkeypatch.setattr(
-            gms_memory_saver, "shared_kv_enabled", lambda: shared_kv_enabled
         )
         monkeypatch.setattr(
             gms_memory_saver,
@@ -128,30 +109,14 @@ def build_impl(monkeypatch, tmp_path):
         )
 
         def fake_get_or_create_persistent_allocator(
-            socket_path, device, engine_id, tag, *, shared, defer_physical=False
+            socket_path, device, engine_id, tag, *, shared
         ):
-            persistent_allocator_calls.append(
-                (socket_path, device, engine_id, tag, shared, defer_physical)
-            )
             return kv_cache
 
         monkeypatch.setattr(
             gms_memory_saver,
             "get_or_create_persistent_allocator",
             fake_get_or_create_persistent_allocator,
-        )
-        monkeypatch.setattr(
-            gms_memory_saver,
-            "retarget_persistent_allocator",
-            lambda tag, engine_id, shared: retarget_calls.append(
-                (tag, engine_id, shared)
-            ),
-        )
-        monkeypatch.setattr(
-            gms_memory_saver,
-            "release_private_bootstrap_kv_pool",
-            lambda manager, engine_id, logger=None: release_calls.append(engine_id)
-            or 1,
         )
         monkeypatch.setattr(gms_memory_saver, "gms_use_mem_pool", fake_use_mem_pool)
         monkeypatch.setattr(
@@ -162,9 +127,6 @@ def build_impl(monkeypatch, tmp_path):
             weights,
             kv_cache,
             pool_calls,
-            retarget_calls,
-            release_calls,
-            persistent_allocator_calls,
         )
 
     return build
@@ -189,7 +151,7 @@ def test_region_uses_gms_pool_only_for_rw_managed_tags(
     weights_lock,
     expected_pool_calls,
 ):
-    impl, _, _, pool_calls, _, _, _ = build_impl(
+    impl, _, _, pool_calls = build_impl(
         weights_lock=weights_lock,
         kv_cache_lock=GrantedLockType.RW,
     )
@@ -201,7 +163,7 @@ def test_region_uses_gms_pool_only_for_rw_managed_tags(
 
 
 def test_pause_resume_routes_only_managed_tags(build_impl):
-    impl, weights, kv_cache, _, _, _, _ = build_impl(
+    impl, weights, kv_cache, _ = build_impl(
         weights_lock=GrantedLockType.RO,
         kv_cache_lock=GrantedLockType.RW,
     )
@@ -227,7 +189,7 @@ def test_pause_resume_routes_only_managed_tags(build_impl):
 
 
 def test_region_requires_rw_allocator(build_impl):
-    impl, _, _, _, _, _, _ = build_impl()
+    impl, _, _, _ = build_impl()
     tag = "weights"
     impl.allocators[tag].abort()
 
@@ -239,7 +201,7 @@ def test_region_requires_rw_allocator(build_impl):
 def test_write_publication_follows_outermost_region_and_switches_weights_ro(
     build_impl, monkeypatch
 ):
-    impl, weights, _, _, _, _, _ = build_impl()
+    impl, weights, _, _ = build_impl()
     model = torch.nn.Module()
     impl.preloaded_weights_bytes = 456
     finalized_models = []
@@ -292,7 +254,7 @@ def test_write_publication_follows_outermost_region_and_switches_weights_ro(
 def test_nested_region_failure_discards_pending_publication(
     build_impl, monkeypatch, failure_source
 ):
-    impl, weights, _, _, _, _, _ = build_impl()
+    impl, weights, _, _ = build_impl()
     stale_model = torch.nn.Module()
     fresh_model = torch.nn.Module()
     finalize = Mock(return_value=SimpleNamespace(committed_bytes=1))
@@ -322,7 +284,7 @@ def test_nested_region_failure_discards_pending_publication(
 
 
 def test_failed_finalization_is_cleared_and_not_retried(build_impl, monkeypatch):
-    impl, weights, _, _, _, _, _ = build_impl()
+    impl, weights, _, _ = build_impl()
     model = torch.nn.Module()
     finalize = Mock(side_effect=ValueError("finalization failed"))
     monkeypatch.setattr(gms_memory_saver, "finalize_gms_write", finalize)
@@ -339,7 +301,7 @@ def test_failed_finalization_is_cleared_and_not_retried(build_impl, monkeypatch)
 def test_invalid_or_duplicate_publication_preserves_first_model(
     build_impl, monkeypatch
 ):
-    impl, weights, _, _, _, _, _ = build_impl()
+    impl, weights, _, _ = build_impl()
     first_model = torch.nn.Module()
     finalize = Mock(return_value=SimpleNamespace(committed_bytes=1))
     monkeypatch.setattr(gms_memory_saver, "finalize_gms_write", finalize)
@@ -354,35 +316,16 @@ def test_invalid_or_duplicate_publication_preserves_first_model(
     finalize.assert_called_once_with(weights, first_model)
 
 
-def test_private_bootstrap_kv_resume_promotes_to_shared_namespace(build_impl):
-    (
-        impl,
-        _,
-        kv_cache,
-        _,
-        retarget_calls,
-        release_calls,
-        persistent_allocator_calls,
-    ) = build_impl(
-        private_bootstrap=True,
-        allocation_engine_id="sglang-test|bootstrap=1",
-        promotion_engine_id="sglang-test",
-        allocation_shared=False,
-        shared_kv_enabled=True,
-    )
 
-    impl.pause("kv_cache")
-    impl.resume("kv_cache")
 
-    assert kv_cache.calls == [
-        "unmap_all_vas",
-        "abort",
-        ("connect", RequestedLockType.RW_PERSISTENT, None),
-        "prepare_scratch_for_reallocation",
-        ("remap_persistent_vas", "sglang-test", True),
-    ]
-    assert persistent_allocator_calls[-1][4:] == (False, True)
-    assert retarget_calls == [("kv_pool:cuda0", "sglang-test", True)]
-    assert release_calls == ["sglang-test|bootstrap=1"]
-    assert impl._kv_engine_id == "sglang-test"
-    assert impl._kv_private_bootstrap is False
+@pytest.mark.parametrize(
+    "name",
+    ("DYN_SGLANG_GMS_PRIVATE_BOOTSTRAP_KV", "GMS_SGLANG_PRIVATE_BOOTSTRAP_KV"),
+)
+def test_removed_private_bootstrap_options_fail_closed(monkeypatch, name):
+    monkeypatch.delenv("DYN_SGLANG_GMS_PRIVATE_BOOTSTRAP_KV", raising=False)
+    monkeypatch.delenv("GMS_SGLANG_PRIVATE_BOOTSTRAP_KV", raising=False)
+    monkeypatch.setenv(name, "1")
+
+    with pytest.raises(RuntimeError, match="private-bootstrap KV is no longer supported"):
+        kv_identity.private_bootstrap_kv_enabled()

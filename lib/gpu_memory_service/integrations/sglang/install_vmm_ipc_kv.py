@@ -33,7 +33,6 @@ from gpu_memory_service.integrations.sglang.kv_identity import (
     allocation_engine_id,
     allocation_shared,
     allocator_tag,
-    private_bootstrap_kv_enabled,
 )
 
 logger = logging.getLogger(__name__)
@@ -115,7 +114,6 @@ def _wrap_init(cls, name: str) -> None:
                 engine_id,
                 tag=allocator_tag(device),
                 shared=allocation_shared(),
-                defer_physical=private_bootstrap_kv_enabled(),
             )
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(
