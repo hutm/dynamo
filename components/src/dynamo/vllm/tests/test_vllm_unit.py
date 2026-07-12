@@ -119,6 +119,11 @@ def test_kv_event_block_size_falls_back_to_cache_config():
         cache_config=SimpleNamespace(block_size=16),
     )
     assert get_configured_kv_event_block_size(vllm_config) == 16
+@pytest.fixture(autouse=True)
+def _clear_gms_failover_env_leaks(monkeypatch):
+    monkeypatch.delenv("DYN_VLLM_GMS_ACTIVE_LOCK_HELD", raising=False)
+    yield
+    monkeypatch.delenv("DYN_VLLM_GMS_ACTIVE_LOCK_HELD", raising=False)
 
 
 def test_custom_jinja_template_invalid_path(mock_vllm_cli):
@@ -2149,3 +2154,303 @@ async def test_generate_text_mode_notifies_for_empty_decoded_token():
 
     assert chunks[0]["choices"][0]["delta"]["content"] == ""
     assert context.notifications == 1
+    assert len(chunks) == 1
+    assert chunks[0]["id"] == "chatcmpl-test"
+    assert chunks[0]["model"] == "test-model"
+    assert chunks[0]["choices"][0]["finish_reason"] == (
+        "error: This model's maximum context length is 100 tokens. "
+        "However, you requested 101 tokens "
+        "(3 in the messages, 98 in the completion). "
+        "Please reduce the length of the messages or completion."
+    )
+    assert engine_client.generate_called is False
+
+
+@pytest.mark.asyncio
+async def test_generate_text_mode_rejects_string_prompt_over_context():
+    from dynamo.vllm.handlers import DecodeWorkerHandler
+
+    class Tokenizer:
+        def encode(self, text):
+            assert text == "rendered chat prompt"
+            return [1, 2, 3]
+
+    class InputParams:
+        tokenizer = Tokenizer()
+
+        def get_input_param(self, request, use_tokenizer):
+            assert use_tokenizer is True
+            return "rendered chat prompt"
+
+    class EngineClient:
+        def __init__(self):
+            self.generate_called = False
+
+        def generate(self, *args, **kwargs):
+            self.generate_called = True
+            raise AssertionError("engine should not be called")
+
+    @asynccontextmanager
+    async def abort_monitor(*args, **kwargs):
+        yield
+
+    engine_client = EngineClient()
+    handler = SimpleNamespace(
+        input_param_manager=InputParams(),
+        default_sampling_params={},
+        model_max_len=100,
+        config=SimpleNamespace(disaggregation_mode=DisaggregationMode.AGGREGATED),
+        engine_client=engine_client,
+        _deferred_aborts={},
+        _shutdown_on_engine_dead=lambda exc: None,
+        _abort_monitor=abort_monitor,
+        _to_local_dp_rank=lambda rank: None,
+    )
+    context = SimpleNamespace(trace_headers=lambda: {})
+    request = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 98,
+    }
+
+    chunks = [
+        chunk
+        async for chunk in DecodeWorkerHandler._generate_text_mode(
+            handler, request, context, "req-1"
+        )
+    ]
+
+    assert len(chunks) == 1
+    assert chunks[0]["choices"][0]["finish_reason"] == (
+        "error: This model's maximum context length is 100 tokens. "
+        "However, you requested 101 tokens "
+        "(3 in the messages, 98 in the completion). "
+        "Please reduce the length of the messages or completion."
+    )
+    assert engine_client.generate_called is False
+
+
+def test_gms_shadow_init_geometry_wait_honors_generic_timeout(monkeypatch):
+    from dynamo.vllm import main as vllm_main
+
+    monkeypatch.setenv("GMS_KV_LEASE_GEOMETRY_WAIT_MS", "300000")
+    monkeypatch.delenv("GMS_VLLM_KV_GEOMETRY_WAIT_MS", raising=False)
+    monkeypatch.delenv("DYN_VLLM_GMS_SHADOW_INIT_GEOMETRY_WAIT_MS", raising=False)
+
+    assert vllm_main._gms_shadow_init_geometry_wait_ms() == 300_000
+
+
+def test_gms_shadow_init_geometry_wait_clamps_negative_timeout(monkeypatch):
+    from dynamo.vllm import main as vllm_main
+
+    monkeypatch.setenv("DYN_VLLM_GMS_SHADOW_INIT_GEOMETRY_WAIT_MS", "-1")
+
+    assert vllm_main._gms_shadow_init_geometry_wait_ms() == 0
+
+
+def test_vllm_gms_failover_isolates_jit_cache_by_container(monkeypatch):
+    from dynamo.vllm import main as vllm_main
+
+    monkeypatch.setenv("DYN_GMS_FAILOVER_SHADOW_MODE", "true")
+    monkeypatch.setenv("CONTAINER_NAME", "engine-1")
+    monkeypatch.setenv("TMPDIR", "/dev/shm/dynamo-jit/tmp")
+    monkeypatch.setenv("FLASHINFER_CUBIN_DIR", "/dev/shm/dynamo-jit/flashinfer-cubins")
+
+    changed = vllm_main._maybe_isolate_jit_cache_dirs_by_container()
+
+    assert os.environ["TMPDIR"] == "/dev/shm/dynamo-jit/engine-1/tmp"
+    assert (
+        os.environ["FLASHINFER_CUBIN_DIR"]
+        == "/dev/shm/dynamo-jit/engine-1/flashinfer-cubins"
+    )
+    assert changed["TMPDIR"] == (
+        "/dev/shm/dynamo-jit/tmp",
+        "/dev/shm/dynamo-jit/engine-1/tmp",
+    )
+
+
+def test_vllm_gms_failover_jit_cache_isolation_can_be_disabled(monkeypatch):
+    from dynamo.vllm import main as vllm_main
+
+    monkeypatch.setenv("DYN_GMS_FAILOVER_SHADOW_MODE", "true")
+    monkeypatch.setenv("DYN_VLLM_ISOLATE_JIT_CACHE_BY_CONTAINER", "0")
+    monkeypatch.setenv("CONTAINER_NAME", "engine-1")
+    monkeypatch.setenv("TMPDIR", "/dev/shm/dynamo-jit/tmp")
+
+    assert vllm_main._maybe_isolate_jit_cache_dirs_by_container() == {}
+    assert os.environ["TMPDIR"] == "/dev/shm/dynamo-jit/tmp"
+
+
+async def test_gms_reject_removed_private_bootstrap_options(monkeypatch):
+    from dynamo.vllm.worker_factory import WorkerFactory
+
+    for name in WorkerFactory._REMOVED_PRIVATE_BOOTSTRAP_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+    # No knobs set -> no error.
+    WorkerFactory._reject_removed_private_bootstrap_options()
+
+    # Each removed knob must fail closed rather than silently run a shadow
+    # against the shared KV pool before it owns the failover lock.
+    for name in WorkerFactory._REMOVED_PRIVATE_BOOTSTRAP_ENV_VARS:
+        monkeypatch.setenv(name, "1")
+        with pytest.raises(RuntimeError, match="private-bootstrap"):
+            WorkerFactory._reject_removed_private_bootstrap_options()
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.mark.asyncio
+async def test_gms_primary_acquires_active_lock_before_registration(monkeypatch):
+    from dynamo.vllm.worker_factory import WorkerFactory
+
+    events = []
+    lock = object()
+    factory = WorkerFactory(
+        lambda *args, **kwargs: None,
+        lambda *args, **kwargs: None,
+        lambda *args, **kwargs: None,
+        lambda *args, **kwargs: None,
+        lambda *args, **kwargs: None,
+    )
+
+    async def fake_acquire():
+        events.append("lock")
+        return lock
+
+    async def fake_promotion_warmup():
+        events.append("warmup")
+
+    async def fake_post_lock_fence(*, backend_name, role):
+        events.append(("fence", backend_name, role))
+
+    class QuiesceController:
+        async def quiesce(self, *args, **kwargs):
+            raise AssertionError("primary must not quiesce before registration")
+
+    class EngineClient:
+        async def collective_rpc(self, *args, **kwargs):
+            raise AssertionError("primary must not wake_up/promote KV before serving")
+
+    class Runtime:
+        def set_health_status(self, status):
+            events.append(("health", status))
+
+    handler = SimpleNamespace(
+        _quiesce_controller=QuiesceController(),
+        engine_client=EngineClient(),
+    )
+    config = SimpleNamespace(gms_shadow_mode=True)
+
+    monkeypatch.setenv("ENGINE_ID", "0")
+    monkeypatch.setenv("DYN_GMS_FAILOVER_PRIMARY_ENGINE_ID", "0")
+    monkeypatch.setattr(factory, "_acquire_failover_lock", fake_acquire)
+    monkeypatch.setattr(
+        "dynamo.vllm.worker_factory.run_gms_failover_post_lock_fence",
+        fake_post_lock_fence,
+    )
+
+    await factory._maybe_wait_for_failover_lock(
+        handler,
+        Runtime(),
+        config,
+        promotion_warmup=fake_promotion_warmup,
+    )
+
+    assert getattr(handler, "_gms_failover_lock") is lock
+    assert events == [
+        "lock",
+        ("fence", "vllm", "active"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_gms_preinit_lock_owner_starts_rank_liveness_monitor(monkeypatch):
+    from dynamo.vllm.worker_factory import WorkerFactory
+
+    factory = WorkerFactory(
+        lambda *args, **kwargs: None,
+        lambda *args, **kwargs: None,
+        lambda *args, **kwargs: None,
+        lambda *args, **kwargs: None,
+        lambda *args, **kwargs: None,
+    )
+    handler = SimpleNamespace()
+    runtime = SimpleNamespace()
+    config = SimpleNamespace(gms_shadow_mode=True)
+    monitored = []
+    monkeypatch.setattr(
+        factory,
+        "_maybe_start_rank_liveness_monitor",
+        lambda candidate, candidate_config: monitored.append(
+            (candidate, candidate_config)
+        ),
+    )
+
+    await factory._maybe_wait_for_failover_lock(
+        handler,
+        runtime,
+        config,
+        lock_already_acquired=True,
+        post_lock_fence_already_run=True,
+    )
+
+    assert monitored == [(handler, config)]
+
+
+@pytest.mark.asyncio
+async def test_gms_shadow_sleeps_until_lock_then_wakes(monkeypatch):
+    from dynamo.vllm.worker_factory import WorkerFactory
+
+    events = []
+    lock = object()
+    factory = WorkerFactory(
+        lambda *args, **kwargs: None,
+        lambda *args, **kwargs: None,
+        lambda *args, **kwargs: None,
+        lambda *args, **kwargs: None,
+        lambda *args, **kwargs: None,
+    )
+
+    async def fake_acquire():
+        events.append("lock")
+        return lock
+
+    async def fake_post_lock_fence(*, backend_name, role):
+        events.append(("fence", backend_name, role))
+
+    class PauseController:
+        async def pause(self, *args, **kwargs):
+            events.append(("pause", args, kwargs))
+
+        async def resume(self, *args, **kwargs):
+            events.append("resume")
+
+        def mark_resumed(self):
+            events.append("mark_resumed")
+
+    class Runtime:
+        def set_health_status(self, status):
+            events.append(("health", status))
+
+    handler = SimpleNamespace(_pause_controller=PauseController())
+    config = SimpleNamespace(gms_shadow_mode=True)
+
+    monkeypatch.setenv("ENGINE_ID", "1")
+    monkeypatch.setenv("DYN_GMS_FAILOVER_PRIMARY_ENGINE_ID", "0")
+    monkeypatch.setattr(factory, "_acquire_failover_lock", fake_acquire)
+    monkeypatch.setattr(
+        "dynamo.vllm.worker_factory.run_gms_failover_post_lock_fence",
+        fake_post_lock_fence,
+    )
+
+    await factory._maybe_wait_for_failover_lock(handler, Runtime(), config)
+
+    assert getattr(handler, "_gms_failover_lock") is lock
+    assert events == [
+        ("pause", (1,), {"clear_cache": False}),
+        ("health", True),
+        "lock",
+        ("fence", "vllm", "shadow"),
+        "resume",
+        "mark_resumed",
+    ]
