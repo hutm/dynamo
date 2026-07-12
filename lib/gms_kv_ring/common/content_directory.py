@@ -257,15 +257,26 @@ class ContentDirectory:
                 else:
                     raise AssertionError(f"unknown directory mutation {kind!r}")
             except BaseException as exc:  # noqa: BLE001
-                # A single mutation failure -- a transient daemon error, or this
-                # engine being fenced/demoted mid-drain -- must NOT permanently
-                # kill the writer and silently stop ALL future publications. An
-                # unpublished entry is a safe cache miss (recompute), never a
-                # stale hit, so skip this one and keep serving the queue: a
-                # transient error self-heals on the next mutation, and a fenced
-                # writer simply drops its now-rejected publications. Record the
-                # failure for observability and advance the committed sequence so
-                # flush_deferred does not block on the skipped mutation.
+                stale_writer = (
+                    isinstance(exc, RuntimeError)
+                    and "rejected stale writer" in str(exc)
+                )
+                if stale_writer:
+                    logger.error(
+                        "GMS deferred directory mutation rejected a stale writer; "
+                        "stopping the writer to preserve the generation fence",
+                        exc_info=True,
+                    )
+                    with self._mutation_condition:
+                        self._mutation_error = exc
+                        self._mutations.clear()
+                        self._mutation_condition.notify_all()
+                    return
+
+                # Other publication failures are safe cache misses. Keep the
+                # ordered writer alive so a transient daemon error can heal on
+                # the next mutation, and advance the committed sequence so an
+                # explicit flush cannot strand forever on the skipped entry.
                 logger.warning(
                     "GMS deferred directory mutation (%s) failed; skipping "
                     "(published entry will be a safe cache miss)",
