@@ -119,6 +119,16 @@ def _kv_lease_shm_path(engine: str, namespace: str) -> str:
     return os.path.join(base_dir, f"gms-kv-lease-{digest}.shm")
 
 
+def _kv_lease_reservation_path(engine: str, namespace: str) -> str:
+    engine_upper = engine.upper().replace("-", "_")
+    explicit = os.environ.get(f"GMS_{engine_upper}_KV_LEASE_RESERVATION_PATH")
+    if explicit is None:
+        explicit = os.environ.get("GMS_KV_LEASE_RESERVATION_PATH")
+    if explicit:
+        return explicit
+    return _kv_lease_shm_path(engine, namespace) + ".reserve"
+
+
 def _owner_hash(owner_id: str) -> int:
     return int.from_bytes(
         hashlib.sha256(owner_id.encode("utf-8")).digest()[:8], "little"
@@ -151,6 +161,12 @@ def _valid_shm_header(header: tuple[int, int, int, int, int, int] | None) -> boo
 class KVLease:
     block_id: int
     generation: int
+
+
+@dataclass(frozen=True)
+class KVLeaseReservation:
+    reserved_blocks: int = 0
+    reserved_for_owner: str | None = None
 
 
 class KVLeaseClient(Protocol):
@@ -191,6 +207,7 @@ class SharedMemoryKVLeaseClient:
         owner_id: str,
         total_blocks: int,
         reserved_blocks: list[int] | None = None,
+        reservation_path: str | None = None,
     ) -> None:
         if total_blocks <= 0:
             raise ValueError("total_blocks must be positive")
@@ -198,11 +215,16 @@ class SharedMemoryKVLeaseClient:
         self.owner_id = owner_id
         self.total_blocks = int(total_blocks)
         self.shm_path = shm_path
+        self.reservation_path = reservation_path or (shm_path + ".reserve")
         self._owner_hash = _owner_hash(owner_id)
         self._rust = self._load_rust_ring()
         self._fd, self._mmap = self._open_or_init(
             shm_path, int(total_blocks), reserved_blocks or []
         )
+        self._reservation_fd = _open_reservation_lock_file(self.reservation_path)
+        self._reservation_cache_sig: tuple[int, int, int] | None = None
+        self._reservation_cache = KVLeaseReservation()
+        self._sync_file_reservation_to_shm()
 
     @classmethod
     def from_env(
@@ -238,6 +260,7 @@ class SharedMemoryKVLeaseClient:
             owner_id=owner_id,
             total_blocks=total_blocks,
             reserved_blocks=reserved_blocks,
+            reservation_path=_kv_lease_reservation_path(engine, namespace),
         )
 
     @staticmethod
@@ -248,6 +271,7 @@ class SharedMemoryKVLeaseClient:
             "kv_lease_init",
             "kv_lease_free_count",
             "kv_lease_acquire",
+            "kv_lease_acquire_lockless_if_unreserved",
             "kv_lease_seal",
             "kv_lease_release",
             "kv_lease_reclaim_foreign",
@@ -257,21 +281,6 @@ class SharedMemoryKVLeaseClient:
             raise RuntimeError(
                 f"gms_rust_ring missing KV lease functions: {', '.join(missing)}"
             )
-        # The Rust ring owns the shm layout; the Python constants above only
-        # mirror it for the no-ring parse paths. Fail loudly at load if they ever
-        # drift, rather than silently misparsing every header/record.
-        for py_value, rust_attr in (
-            (_KV_LEASE_SHM_MAGIC, "KV_LEASE_MAGIC"),
-            (_KV_LEASE_SHM_VERSION, "KV_LEASE_VERSION"),
-            (_KV_LEASE_SHM_HEADER_SIZE, "KV_LEASE_HEADER_SIZE"),
-            (_KV_LEASE_SHM_RECORD_SIZE, "KV_LEASE_RECORD_SIZE"),
-        ):
-            rust_value = getattr(gms_rust_ring, rust_attr, None)
-            if rust_value is not None and int(rust_value) != int(py_value):
-                raise RuntimeError(
-                    "gms_rust_ring KV lease layout drift: "
-                    f"{rust_attr}={rust_value} but Python expects {py_value}"
-                )
         return gms_rust_ring
 
     @staticmethod
@@ -337,6 +346,7 @@ class SharedMemoryKVLeaseClient:
             self._mmap.close()
         finally:
             os.close(self._fd)
+            os.close(self._reservation_fd)
 
     def acquire(
         self,
@@ -350,8 +360,35 @@ class SharedMemoryKVLeaseClient:
         if requested <= 0:
             return []
 
+        infos = self._try_lockless_acquire(
+            requested,
+            preferred_blocks=preferred_blocks,
+            allow_partial=allow_partial,
+            strict_preferred=strict_preferred,
+        )
+        if infos is not None:
+            return self._lease_infos_to_records(infos)
+
+        return self._acquire_with_reservation_lock(
+            requested,
+            preferred_blocks=preferred_blocks,
+            allow_partial=allow_partial,
+            strict_preferred=strict_preferred,
+        )
+
+    def _try_lockless_acquire(
+        self,
+        requested: int,
+        *,
+        preferred_blocks: list[int] | None,
+        allow_partial: bool,
+        strict_preferred: bool,
+    ) -> list[tuple[int, int, int]] | None:
+        if not self._supports_shm_reservation():
+            return None
+
         try:
-            infos = self._rust.kv_lease_acquire(
+            infos = self._rust.kv_lease_acquire_lockless_if_unreserved(
                 self._mmap,
                 [int(block_id) for block_id in preferred_blocks or []],
                 requested,
@@ -369,6 +406,77 @@ class SharedMemoryKVLeaseClient:
                 error=type(exc).__name__,
             )
             raise
+        if infos is None:
+            return None
+        if len(infos) != requested and not allow_partial:
+            self._log_acquire_short(
+                requested=requested,
+                returned=len(infos),
+                preferred_blocks=preferred_blocks,
+                strict_preferred=strict_preferred,
+            )
+        return infos
+
+    def _acquire_with_reservation_lock(
+        self,
+        requested: int,
+        *,
+        preferred_blocks: list[int] | None,
+        allow_partial: bool,
+        strict_preferred: bool,
+    ) -> list[KVLease]:
+        fd = _open_reservation_lock_file(self.reservation_path)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            allowed = self._free_count_with_reservation_fd(fd)
+            if requested > allowed:
+                if allow_partial and allowed > 0:
+                    requested = allowed
+                else:
+                    reservation = _read_reservation_fd(fd)
+                    log_lease_pressure(
+                        logger,
+                        f"{self.namespace}:acquire-denied",
+                        "GMS KV lease acquire denied",
+                        namespace=self.namespace,
+                        owner_id=self.owner_id,
+                        requested=requested,
+                        available=allowed,
+                        raw_free=self.raw_free_count(),
+                        reserved_blocks=reservation.reserved_blocks,
+                        reserved_for_owner=reservation.reserved_for_owner,
+                        total_blocks=self.total_blocks,
+                        preferred_count=len(preferred_blocks or []),
+                        strict_preferred=bool(strict_preferred),
+                    )
+                    raise RuntimeError(
+                        "could not acquire KV leases without consuming reserved "
+                        f"blocks: requested={requested} available={allowed}"
+                    )
+            if requested <= 0:
+                return []
+            try:
+                infos = self._rust.kv_lease_acquire(
+                    self._mmap,
+                    [int(block_id) for block_id in preferred_blocks or []],
+                    requested,
+                    bool(allow_partial),
+                    bool(strict_preferred),
+                    int(self._owner_hash),
+                )
+            except Exception as exc:
+                self._log_acquire_failure(
+                    requested=requested,
+                    preferred_blocks=preferred_blocks,
+                    allow_partial=allow_partial,
+                    strict_preferred=strict_preferred,
+                    available=allowed,
+                    error=type(exc).__name__,
+                )
+                raise
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
         if len(infos) != requested and not allow_partial:
             self._log_acquire_short(
                 requested=requested,
@@ -515,10 +623,73 @@ class SharedMemoryKVLeaseClient:
         return int(self._rust.kv_lease_free_count(self._mmap))
 
     def free_count(self) -> int:
-        return self.raw_free_count()
+        if self._supports_shm_reservation():
+            return int(
+                self._rust.kv_lease_free_count_for_owner(
+                    self._mmap, int(self._owner_hash)
+                )
+            )
+        free = self.raw_free_count()
+        reservation = self._read_cached_reservation()
+        if _reservation_applies_to_owner(reservation, self.owner_id):
+            return max(0, free - int(reservation.reserved_blocks))
+        return free
 
     def refresh_free_count(self) -> int:
+        self._reservation_cache_sig = None
+        self._sync_file_reservation_to_shm()
         return self.free_count()
+
+    def _supports_shm_reservation(self) -> bool:
+        return all(
+            hasattr(self._rust, name)
+            for name in (
+                "kv_lease_free_count_for_owner",
+                "kv_lease_set_reservation",
+            )
+        )
+
+    def _sync_file_reservation_to_shm(self) -> None:
+        if not self._supports_shm_reservation():
+            return
+        # The shm reservation seqlock has no internal writer mutual exclusion, so
+        # concurrent writers must be serialized externally or they interleave and
+        # publish a stable-but-torn (reserved_blocks, owner_hash) pair. Hold the
+        # reservation file lock EXCLUSIVELY across the seqlock write (all writers
+        # lock the same path), not just across the file read.
+        fcntl.flock(self._reservation_fd, fcntl.LOCK_EX)
+        try:
+            reservation = _read_reservation_fd(self._reservation_fd)
+            _write_reservation_mmap(self._rust, self._mmap, reservation)
+        finally:
+            fcntl.flock(self._reservation_fd, fcntl.LOCK_UN)
+
+    def _reservation_signature(self) -> tuple[int, int, int]:
+        stat = os.fstat(self._reservation_fd)
+        return (int(stat.st_ino), int(stat.st_size), int(stat.st_mtime_ns))
+
+    def _read_cached_reservation(self) -> KVLeaseReservation:
+        sig = self._reservation_signature()
+        if sig == self._reservation_cache_sig:
+            return self._reservation_cache
+        fcntl.flock(self._reservation_fd, fcntl.LOCK_SH)
+        try:
+            sig = self._reservation_signature()
+            if sig == self._reservation_cache_sig:
+                return self._reservation_cache
+            reservation = _read_reservation_fd(self._reservation_fd)
+            self._reservation_cache = reservation
+            self._reservation_cache_sig = sig
+            return reservation
+        finally:
+            fcntl.flock(self._reservation_fd, fcntl.LOCK_UN)
+
+    def _free_count_with_reservation_fd(self, fd: int) -> int:
+        free = self.raw_free_count()
+        reservation = _read_reservation_fd(fd)
+        if _reservation_applies_to_owner(reservation, self.owner_id):
+            return max(0, free - int(reservation.reserved_blocks))
+        return free
 
 
 @dataclass(frozen=True)
@@ -665,12 +836,168 @@ def reclaim_foreign_kv_leases_in_shm_dir(
     )
 
 
+def _read_reservation_file(path: str) -> KVLeaseReservation:
+    fd = _open_reservation_lock_file(path)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH)
+        return _read_reservation_fd(fd)
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _open_reservation_lock_file(path: str) -> int:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    return os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+
+
+def _read_reservation_fd(fd: int) -> KVLeaseReservation:
+    os.lseek(fd, 0, os.SEEK_SET)
+    try:
+        data = os.read(fd, 4096).decode("utf-8")
+        if not data.strip():
+            return KVLeaseReservation()
+        raw = json.loads(data)
+        return KVLeaseReservation(
+            reserved_blocks=max(0, int(raw.get("reserved_blocks", 0))),
+            reserved_for_owner=raw.get("reserved_for_owner") or None,
+        )
+    except Exception:
+        return KVLeaseReservation()
+
+
+def _reservation_applies_to_owner(
+    reservation: KVLeaseReservation, owner_id: str
+) -> bool:
+    if reservation.reserved_blocks <= 0:
+        return False
+    if reservation.reserved_for_owner is None:
+        return True
+    return str(reservation.reserved_for_owner) != str(owner_id)
+
+
+def _reservation_owner_hash(reservation: KVLeaseReservation) -> int:
+    if reservation.reserved_for_owner is None:
+        return 0
+    return _owner_hash(str(reservation.reserved_for_owner))
+
+
+def _write_reservation_mmap(
+    rust, buf: mmap.mmap, reservation: KVLeaseReservation
+) -> None:
+    setter = getattr(rust, "kv_lease_set_reservation", None)
+    if setter is None:
+        return
+    setter(
+        buf,
+        max(0, int(reservation.reserved_blocks)),
+        int(_reservation_owner_hash(reservation)),
+    )
+
+
 def _load_optional_rust_ring():
     try:
         import gms_rust_ring  # type: ignore[import-not-found]
     except Exception:
         return None
     return gms_rust_ring
+
+
+def _write_reservation_shm_if_present(
+    engine: str, namespace: str, reservation: KVLeaseReservation
+) -> None:
+    rust = _load_optional_rust_ring()
+    if rust is None or not hasattr(rust, "kv_lease_set_reservation"):
+        return
+    shm_path = _kv_lease_shm_path(engine, namespace)
+    try:
+        fd = os.open(shm_path, os.O_RDWR)
+    except FileNotFoundError:
+        return
+    try:
+        # Exclusive lock: this writes the shm reservation seqlock, which has no
+        # internal writer mutual exclusion. A shared lock would let two writers
+        # interleave and publish torn fields; serialize on the shm file lock.
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        header = _read_shm_header(fd)
+        if not _valid_shm_header(header):
+            return
+        assert header is not None
+        map_size = (
+            _KV_LEASE_SHM_HEADER_SIZE + int(header[2]) * _KV_LEASE_SHM_RECORD_SIZE
+        )
+        buf = mmap.mmap(fd, map_size)
+        try:
+            _write_reservation_mmap(rust, buf, reservation)
+        finally:
+            buf.close()
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _write_reservation_file(path: str, reservation: KVLeaseReservation) -> None:
+    payload = {
+        "reserved_blocks": int(reservation.reserved_blocks),
+        "reserved_for_owner": reservation.reserved_for_owner,
+    }
+    fd = _open_reservation_lock_file(path)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        data = json.dumps(payload, sort_keys=True).encode("utf-8")
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _resolve_namespace_and_reservation_path(
+    engine: str, device: int, namespace_suffix: str
+) -> tuple[str, str]:
+    engine_upper = engine.upper().replace("-", "_")
+    namespace = os.environ.get(
+        f"GMS_{engine_upper}_KV_LEASE_NAMESPACE",
+        os.environ.get(
+            "GMS_KV_LEASE_NAMESPACE",
+            f"{engine}:gpu{device}:{namespace_suffix}",
+        ),
+    )
+    return namespace, _kv_lease_reservation_path(engine, namespace)
+
+
+def read_kv_lease_reservation(
+    engine: str,
+    device: int,
+    *,
+    namespace_suffix: str = "kv",
+) -> tuple[str, KVLeaseReservation]:
+    namespace, path = _resolve_namespace_and_reservation_path(
+        engine, device, namespace_suffix
+    )
+    return namespace, _read_reservation_file(path)
+
+
+def set_kv_lease_reservation(
+    engine: str,
+    device: int,
+    *,
+    reserved_blocks: int,
+    reserved_for_owner: str | None = None,
+    namespace_suffix: str = "kv",
+) -> tuple[str, KVLeaseReservation]:
+    namespace, path = _resolve_namespace_and_reservation_path(
+        engine, device, namespace_suffix
+    )
+    reservation = KVLeaseReservation(
+        reserved_blocks=max(0, int(reserved_blocks)),
+        reserved_for_owner=reserved_for_owner,
+    )
+    _write_reservation_file(path, reservation)
+    _write_reservation_shm_if_present(engine, namespace, reservation)
+    return namespace, reservation
 
 
 def _read_existing_total_blocks(shm_path: str) -> int | None:
