@@ -7,6 +7,7 @@ import types
 
 import gpu_memory_service.integrations.sglang as sglang_gms
 import pytest
+import torch
 from gpu_memory_service.common.locks import GrantedLockType
 from gpu_memory_service.integrations.sglang import patches
 from gpu_memory_service.integrations.sglang.memory_saver import GMSMemorySaverImpl
@@ -160,3 +161,120 @@ def test_sglang_hbm_page_adoption_and_retention_are_exact():
         assert state["retained_pages"] == set()
     finally:
         install_kv_leases._STATE.pop(id(allocator), None)
+
+
+def test_sglang_paged_alloc_reserves_before_mutation_and_skips_preserved_pages(
+    monkeypatch,
+):
+    from gpu_memory_service.integrations.common.kv_lease_client import KVLease
+    from gpu_memory_service.integrations.sglang import install_kv_leases
+
+    events = []
+
+    class Base:
+        def __init__(self):
+            self.page_size = 64
+            self.size = 20 * self.page_size
+            self.free_pages = torch.arange(1, 21, dtype=torch.int64)
+            self.need_sort = False
+
+        def available_size(self):
+            return len(self.free_pages) * self.page_size
+
+    class Token(Base):
+        def alloc(self, _need_size):
+            return None
+
+        def free(self, _indices):
+            return None
+
+        def clear(self):
+            return None
+
+        def available_size(self):
+            return super().available_size()
+
+    class Paged(Base):
+        def alloc(self, _need_size):
+            return None
+
+        def alloc_extend(self, *_args, num_new_pages=None, **_kwargs):
+            events.append("allocator-mutated")
+            assert int(self.free_pages[0]) == 13
+            out = self.free_pages[:1].clone() * self.page_size
+            self.free_pages = self.free_pages[int(num_new_pages) :]
+            return out
+
+        def alloc_decode(self, *_args, **_kwargs):
+            return None
+
+        def free(self, _indices):
+            return None
+
+        def clear(self):
+            return None
+
+    allocator_module = types.ModuleType("sglang.srt.mem_cache.allocator")
+    allocator_module.BaseTokenToKVPoolAllocator = Base
+    allocator_module.TokenToKVPoolAllocator = Token
+    allocator_module.PagedTokenToKVPoolAllocator = Paged
+    utils_module = types.ModuleType("sglang.srt.utils")
+    utils_module.get_num_new_pages = lambda **_kwargs: 1
+    monkeypatch.setitem(
+        sys.modules, "sglang.srt.mem_cache.allocator", allocator_module
+    )
+    from sglang.srt import mem_cache
+
+    monkeypatch.setattr(mem_cache, "allocator", allocator_module, raising=False)
+    monkeypatch.setitem(sys.modules, "sglang.srt.utils", utils_module)
+
+    class Client:
+        namespace = "test"
+        owner_id = "shadow"
+
+        def acquire(
+            self, count, *, preferred_blocks, allow_partial=False, strict_preferred
+        ):
+            events.append("lease-reserved")
+            assert count == 1
+            assert preferred_blocks == [1]
+            assert allow_partial is False
+            assert strict_preferred is False
+            return [KVLease(13, 7)]
+
+        def free_count(self):
+            return 8
+
+        def release(self, _leases):
+            events.append("lease-released")
+
+    monkeypatch.setattr(install_kv_leases, "_patched", False)
+    monkeypatch.setattr(install_kv_leases, "_factory", None)
+    assert install_kv_leases.install(lambda _allocator, _total: Client()) is True
+
+    allocator = Paged()
+    out = allocator.alloc_extend(
+        torch.tensor([0]),
+        torch.tensor([0]),
+        torch.tensor([1]),
+        torch.tensor([1]),
+        torch.tensor([-1]),
+        1,
+        num_new_pages=1,
+    )
+
+    assert events == ["lease-reserved", "allocator-mutated"]
+    assert out.tolist() == [13 * 64]
+    assert 13 not in allocator.free_pages.tolist()
+    assert allocator._gms_kv_leases_by_page[13] == KVLease(13, 7)
+    install_kv_leases._STATE.pop(id(allocator), None)
+
+
+def test_sglang_rejected_lease_pages_return_at_tail():
+    from gpu_memory_service.integrations.sglang import install_kv_leases
+
+    allocator = types.SimpleNamespace(
+        free_pages=torch.tensor([3, 4], dtype=torch.int64),
+    )
+    install_kv_leases._append_free_pages(allocator, [1, 2])
+    assert allocator.free_pages.tolist() == [3, 4, 1, 2]

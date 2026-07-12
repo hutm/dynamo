@@ -213,6 +213,10 @@ class GMSMemorySaverImpl:
                 self.allocators[target_tag].remap_persistent_vas(
                     self._kv_engine_id,
                     shared=self._kv_shared,
+                    # Map every region first, then perform one synchronization
+                    # and validate every VA. This preserves fail-closed pointer
+                    # validation without paying one device sync per KV tensor.
+                    synchronize_per_mapping=False,
                 )
             else:
                 self.allocators[target_tag].remap_all_vas()
