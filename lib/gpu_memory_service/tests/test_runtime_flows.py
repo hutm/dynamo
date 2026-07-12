@@ -888,6 +888,7 @@ def test_reallocate_all_handles_reuses_preserved_vas_in_new_layout(
     _wait_for_server_state(server, ServerState.EMPTY)
 
 
+@pytest.mark.asyncio
 async def test_allocation_manager_caches_exported_fd(monkeypatch):
     export_calls = 0
 
