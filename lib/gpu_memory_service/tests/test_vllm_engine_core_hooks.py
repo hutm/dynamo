@@ -6,6 +6,17 @@ from gpu_memory_service.integrations.vllm.install_kv_leases import (
 )
 
 
+def test_vllm_request_handler_binds_gms_placement_helper():
+    from dynamo.gms_router_policy import (
+        maybe_fetch_gms_placement,
+        resolve_vllm_gms_daemon_socket,
+    )
+    from dynamo.vllm import handlers
+
+    assert handlers.maybe_fetch_gms_placement is maybe_fetch_gms_placement
+    assert handlers.resolve_vllm_gms_daemon_socket is resolve_vllm_gms_daemon_socket
+
+
 def test_sleep_utility_is_visible_on_spawned_engine_core_proc():
     from vllm.v1.engine.core import EngineCore, EngineCoreProc
 
