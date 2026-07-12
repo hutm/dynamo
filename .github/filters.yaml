@@ -183,6 +183,7 @@ core:
   - 'components/src/dynamo/frontend/**'
   - 'components/src/dynamo/common/**'
   - 'components/src/dynamo/gpu_memory_service/**'
+  - 'components/src/dynamo/gms_router_policy.py'
   # TODO(will): Move TokenSpeed to a dedicated framework filter once CI has
   # TokenSpeed Docker images and backend-specific build/test jobs.
   - 'components/src/dynamo/tokenspeed/**'
@@ -403,6 +404,7 @@ frontend:
   - 'components/src/dynamo/common/**'
   - 'tests/frontend/router_aic_image_smoke.py'
   - 'deploy/inference-gateway/**'
+  - 'components/src/dynamo/gms_router_policy.py'
   - 'container/templates/frontend.Dockerfile'
   # The frontend image is rendered from these two: render.py generates its
   # Dockerfile, and context.yaml supplies EPP_IMAGE -- the `FROM` that the
