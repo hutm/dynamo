@@ -265,6 +265,7 @@ pub async fn run(
                 worker_monitor,
                 kv_chooser,
                 None,
+                None,
                 false,
                 router_config.session_affinity_ttl_secs,
             )
