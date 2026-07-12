@@ -206,6 +206,27 @@ class GmsFailoverActivation:
             setattr(target, "_gms_failover_lock", self.lock)
 
 
+def release_attached_gms_failover_lock_nowait(
+    target: Any,
+    *,
+    backend_name: str,
+) -> bool:
+    """Release a concrete flock from a watchdog thread, if supported."""
+
+    lock = getattr(target, "_gms_failover_lock", None)
+    release_nowait = getattr(lock, "release_nowait", None)
+    if lock is None or not callable(release_nowait):
+        return False
+    if not release_nowait():
+        return False
+    setattr(target, "_gms_failover_lock", None)
+    logger.info(
+        "[GMS failover] %s released active lock from watchdog thread",
+        backend_name,
+    )
+    return True
+
+
 async def release_attached_gms_failover_lock(
     target: Any,
     *,
@@ -225,6 +246,9 @@ async def release_attached_gms_failover_lock(
             backend_name,
         )
         return False
+
+    if release_attached_gms_failover_lock_nowait(target, backend_name=backend_name):
+        return True
 
     release = getattr(lock, "release", None)
     if release is None:
@@ -557,6 +581,8 @@ async def prepare_gms_failover(
     tags: Iterable[str] = DEFAULT_FAILOVER_TAGS,
     lock_factory: Callable[[str], Any] | None = None,
     promotion_warmup: Callable[[], Awaitable[None]] | None = None,
+    warm_standby_before_quiesce: bool = False,
+    activation_barrier: Callable[[], Awaitable[None]] | None = None,
 ) -> GmsFailoverActivation:
     """Gate model registration until this engine owns the shared GMS namespace.
 
@@ -583,6 +609,8 @@ async def prepare_gms_failover(
                 backend_name=backend_name,
                 role="active",
             )
+            if activation_barrier is not None:
+                await activation_barrier()
             return GmsFailoverActivation(
                 enabled=True,
                 lock=lock,
@@ -591,6 +619,17 @@ async def prepare_gms_failover(
             "[GMS failover] %s active lock is held; preparing warm shadow",
             backend_name,
         )
+
+    standby_prewarmed = False
+    if warm_standby_before_quiesce:
+        if promotion_warmup is None:
+            raise RuntimeError("warm_standby_before_quiesce requires promotion_warmup")
+        logger.info(
+            "[GMS failover] %s warming lease-protected standby before quiesce",
+            backend_name,
+        )
+        await promotion_warmup()
+        standby_prewarmed = True
 
     controller = _controller_from(owner)
     tag_list = list(tags)
@@ -626,13 +665,15 @@ async def prepare_gms_failover(
         role,
     )
     await run_gms_failover_post_lock_fence(backend_name=backend_name, role=role)
+    if activation_barrier is not None:
+        await activation_barrier()
 
     await controller.resume(tag_list)
     mark_resumed = getattr(controller, "mark_resumed", None)
     if mark_resumed is not None:
         mark_resumed()
 
-    if promotion_warmup is not None:
+    if promotion_warmup is not None and not standby_prewarmed:
         await promotion_warmup()
 
     if not keep_shadow_ready and set_health_status is not None:

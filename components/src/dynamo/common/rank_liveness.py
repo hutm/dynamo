@@ -1,8 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""ZMQ-based cross-rank liveness watcher for fast detection of a non-leader rank's
-death in a multi-node tensor-parallel cohort.
+"""Bidirectional ZMQ liveness for multi-node tensor-parallel cohorts.
 
 Motivation
 ----------
@@ -13,11 +12,11 @@ covers rank-0 death (the OS releases the flock on the leader's exit); it does no
 a remote worker die.
 
 This module adds a *GPU-independent* liveness channel. Each worker rank holds a ZMQ
-connection to a leader-side monitor and sends a heartbeat on a plain CPU thread. When
-the worker process dies, its heartbeats stop and the monitor fires within one
-heartbeat-timeout (sub-second), letting the leader proactively fence + release the GMS
-failover lock so the warm shadow takes over immediately — instead of waiting out the
-NCCL timeout.
+connection to a leader-side monitor and sends a heartbeat on a plain CPU thread. The
+leader acknowledges each heartbeat. Loss in either direction therefore fires within one
+heartbeat timeout: the leader fences a dead worker, while a surviving worker fences its
+orphaned local cohort when rank 0 dies. Both paths release pod-local ownership so the
+complete warm-shadow TP cohort can take over without waiting for the NCCL timeout.
 
 Two properties make this better than both the NFS-flock idea and the NCCL timeout:
   * The heartbeat runs on a CPU thread, so it keeps beating even while the GPU is busy
@@ -108,9 +107,11 @@ def leader_connect_addr(leader_host: str) -> str:
 
 
 class RankLivenessClient:
-    """Runs on a worker rank (rank>0). Holds a DEALER connection to the leader and
-    heartbeats on a daemon thread. On process death the socket drops and the leader's
-    monitor fires within one timeout window."""
+    """Worker heartbeat client with optional leader-loss detection.
+
+    When ``on_leader_lost`` is supplied, missing acknowledgements fence an orphaned
+    worker cohort within one timeout window.
+    """
 
     def __init__(
         self,
@@ -119,6 +120,9 @@ class RankLivenessClient:
         *,
         interval_ms: Optional[int] = None,
         connect_addr: Optional[str] = None,
+        on_leader_lost: Callable[[int, str], None] | None = None,
+        timeout_ms_override: Optional[int] = None,
+        startup_grace_ms_override: Optional[int] = None,
     ):
         self._leader_host = leader_host
         self._rank = int(rank)
@@ -126,6 +130,18 @@ class RankLivenessClient:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._connect_addr = connect_addr or leader_connect_addr(leader_host)
+        self._on_leader_lost = on_leader_lost
+        timeout_value = (
+            timeout_ms() if timeout_ms_override is None else max(1, timeout_ms_override)
+        )
+        self._timeout = timeout_value / 1000.0
+        grace_value = (
+            startup_grace_ms()
+            if startup_grace_ms_override is None
+            else max(0, startup_grace_ms_override)
+        )
+        self._startup_grace = grace_value / 1000.0
+        self._fired = False
 
     def start(self) -> None:
         if self._thread is not None:
@@ -159,8 +175,13 @@ class RankLivenessClient:
         sock.setsockopt(zmq.HEARTBEAT_IVL, int(self._interval * 1000))
         sock.setsockopt(zmq.HEARTBEAT_TIMEOUT, int(self._interval * 1000) * 3)
         sock.connect(self._connect_addr)
+        poller = zmq.Poller()
+        poller.register(sock, zmq.POLLIN)
+        started = time.monotonic()
+        last_ack: float | None = None
         try:
             while not self._stop.is_set():
+                cycle_started = time.monotonic()
                 try:
                     sock.send(b"hb", flags=zmq.NOBLOCK)
                 except zmq.ZMQError:
@@ -169,9 +190,48 @@ class RankLivenessClient:
                         self._rank,
                         exc_info=True,
                     )
-                self._stop.wait(self._interval)
+                events = dict(poller.poll(max(1, int(self._interval * 1000))))
+                now = time.monotonic()
+                if sock in events:
+                    while True:
+                        try:
+                            frame = sock.recv(flags=zmq.NOBLOCK)
+                        except zmq.Again:
+                            break
+                        if frame == b"ack":
+                            if last_ack is None:
+                                logger.info(
+                                    "[GMS liveness] rank %d received leader acknowledgement",
+                                    self._rank,
+                                )
+                            last_ack = now
+                if self._on_leader_lost is not None and not self._stop.is_set():
+                    if last_ack is None and now - started > self._startup_grace:
+                        self._fire(0, "startup-timeout")
+                        return
+                    if last_ack is not None and now - last_ack > self._timeout:
+                        self._fire(0, "liveness-timeout")
+                        return
+                # An acknowledgement normally arrives immediately. Preserve the
+                # configured send cadence instead of turning the client into a
+                # busy heartbeat/ack loop.
+                remaining = self._interval - (time.monotonic() - cycle_started)
+                if remaining > 0:
+                    self._stop.wait(remaining)
         finally:
             sock.close(0)
+
+    def _fire(self, rank: int, reason: str) -> bool:
+        if self._fired or self._stop.is_set():
+            return False
+        self._fired = True
+        logger.warning("[GMS liveness] leader rank %d lost (%s)", rank, reason)
+        try:
+            assert self._on_leader_lost is not None
+            self._on_leader_lost(rank, reason)
+        except Exception:
+            logger.exception("[GMS liveness] on_leader_lost callback failed")
+        return True
 
 
 class RankLivenessMonitor:
@@ -214,6 +274,8 @@ class RankLivenessMonitor:
         self._fired = False
         self._bind_ready = threading.Event()
         self._bind_error: Optional[BaseException] = None
+        self._seen_ranks: set[int] = set()
+        self._seen_changed = threading.Condition()
 
     def start(self) -> None:
         if self._thread is not None:
@@ -246,9 +308,34 @@ class RankLivenessMonitor:
 
     def stop(self) -> None:
         self._stop.set()
+        with self._seen_changed:
+            self._seen_changed.notify_all()
         if self._thread is not None:
             self._thread.join(timeout=0.5)
             self._thread = None
+
+    def wait_for_ranks(
+        self, expected_ranks: Iterable[int], timeout: float | None = None
+    ) -> bool:
+        """Wait until every expected rank has heartbeated this monitor.
+
+        This is also the TP activation barrier: a non-leader starts heartbeating
+        only after it owns and has fenced its pod-local failover namespace.
+        """
+
+        expected = frozenset(int(rank) for rank in expected_ranks)
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        with self._seen_changed:
+            while not expected.issubset(self._seen_ranks):
+                if self._stop.is_set() or self._fired:
+                    return False
+                remaining = (
+                    None if deadline is None else deadline - time.monotonic()
+                )
+                if remaining is not None and remaining <= 0:
+                    return False
+                self._seen_changed.wait(remaining)
+            return True
 
     def _run(self) -> None:
         import zmq
@@ -297,6 +384,17 @@ class RankLivenessMonitor:
                         if rank not in last_seen:
                             logger.info("[GMS liveness] rank %d registered", rank)
                         last_seen[rank] = now
+                        with self._seen_changed:
+                            self._seen_ranks.add(rank)
+                            self._seen_changed.notify_all()
+                        try:
+                            sock.send_multipart([frames[0], b"ack"], flags=zmq.NOBLOCK)
+                        except zmq.ZMQError:
+                            logger.debug(
+                                "[GMS liveness] leader acknowledgement failed for rank %d",
+                                rank,
+                                exc_info=True,
+                            )
 
                 if (
                     self._expected_ranks is not None
@@ -324,6 +422,8 @@ class RankLivenessMonitor:
         if self._fired:
             return False
         self._fired = True
+        with self._seen_changed:
+            self._seen_changed.notify_all()
         logger.warning("[GMS liveness] rank %d lost (%s)", rank, reason)
         try:
             self._on_rank_lost(rank, reason)
