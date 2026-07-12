@@ -18,7 +18,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 import dynamo.llm as dynamo_llm
-from dynamo.vllm import envs
+from dynamo.vllm import envs, headless
 from dynamo.vllm.args import (
     _connector_to_kv_transfer_json,
     _is_routable,
@@ -375,6 +375,38 @@ def test_headless_namespace_has_required_fields(mock_vllm_cli):
     # Core engine fields must survive the round-trip
     assert hasattr(ns, "model")
     assert hasattr(ns, "tensor_parallel_size")
+
+
+def test_headless_rank_fences_itself_when_leader_acknowledgements_stop(monkeypatch):
+    from dynamo.common import rank_liveness
+
+    captured = {}
+
+    class Client:
+        def __init__(self, leader_host, rank, **kwargs):
+            captured.update(leader_host=leader_host, rank=rank, **kwargs)
+
+        def start(self):
+            captured["started"] = True
+
+    monkeypatch.setattr(rank_liveness, "liveness_enabled", lambda: True)
+    monkeypatch.setattr(rank_liveness, "RankLivenessClient", Client)
+    killed = []
+    monkeypatch.setattr(headless.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+    config = SimpleNamespace(
+        gms_shadow_mode=True,
+        engine_args=SimpleNamespace(
+            node_rank=1, nnodes=2, master_addr="leader.example"
+        ),
+    )
+    headless._maybe_start_vllm_rank_liveness_client(config)
+
+    assert captured["started"] is True
+    captured["on_leader_lost"](0, "liveness-timeout")
+    import signal
+
+    assert killed == [(os.getpid(), signal.SIGTERM)]
 
 
 def test_rl_logprobs_force_converts_raw_mode():
