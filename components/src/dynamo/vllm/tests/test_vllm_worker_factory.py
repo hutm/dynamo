@@ -215,6 +215,7 @@ class TestCreate:
             shutdown_event,
             shutdown_endpoints,
             snapshot_engine=snapshot_engine,
+            engine_holder=None,
         )
 
 
