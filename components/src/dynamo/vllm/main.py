@@ -100,6 +100,7 @@ from dynamo.common.utils.prometheus import (
 )
 from dynamo.common.utils.runtime import create_runtime
 from dynamo.common.utils.topology import apply_topology_config
+from dynamo.gms_router_policy import resolve_vllm_gms_daemon_socket
 from dynamo.llm import (
     KvEventPublisher,
     ModelInput,
@@ -1114,6 +1115,10 @@ async def register_vllm_model(
             SPEC_DECODE_RUNTIME_KEY, json.dumps(spec_decode)
         )
         logging.info("Published vLLM spec decode runtime metadata: %s", spec_decode)
+
+    if resolve_vllm_gms_daemon_socket(vllm_config):
+        runtime_config.set_gms_placement_enabled()
+        logging.info("Publishing GMS placement capability to discovery")
 
     # Set topology and KV transfer policy for topology-aware routing
     apply_topology_config(runtime_config)
