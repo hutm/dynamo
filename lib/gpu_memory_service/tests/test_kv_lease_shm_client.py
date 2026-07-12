@@ -10,12 +10,13 @@ import struct
 import time
 
 import pytest
-from gpu_memory_service.integrations.common import kv_lease_client as _klc
 from gpu_memory_service.integrations.common.kv_lease_client import (
     SharedMemoryKVLeaseClient,
     read_any_kv_lease_namespace_total_blocks,
     read_kv_lease_namespace_total_blocks,
+    read_kv_lease_reservation,
     resolve_kv_lease_namespace_total_blocks,
+    set_kv_lease_reservation,
 )
 
 pytestmark = [
@@ -31,9 +32,7 @@ pytest.importorskip("gms_rust_ring")
 
 _LEASE_FREE_COUNT_OFFSET = 16
 _LEASE_ACTIVE_MUTATIONS_OFFSET = 24
-# Derive the first record offset from the client's layout constant so this test
-# cannot drift from the Rust ring's header size independently.
-_LEASE_RECORD_OFFSET = _klc._KV_LEASE_SHM_HEADER_SIZE
+_LEASE_RECORD_OFFSET = 64
 _LEASE_STATE_TRANSITION = 4
 
 
@@ -373,6 +372,81 @@ def test_resolve_lease_device_uses_engine_env_before_rank(monkeypatch):
     assert resolve_lease_device("GMS_VLLM_KV_LEASE_DEVICE") == 1
 
 
+def test_shared_memory_lease_acquire_uses_lockless_fast_path_without_reservation(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "fast-path.shm"
+    client = SharedMemoryKVLeaseClient(
+        str(path),
+        namespace="fast-path",
+        owner_id="primary",
+        total_blocks=4,
+        reserved_blocks=[0],
+    )
+    try:
+        from gpu_memory_service.integrations.common import kv_lease_client
+
+        def fail_open_reservation_file(_path: str) -> int:
+            raise AssertionError("reservation lock opened on no-reservation fast path")
+
+        monkeypatch.setattr(
+            kv_lease_client,
+            "_open_reservation_lock_file",
+            fail_open_reservation_file,
+        )
+
+        leases = client.acquire(2, preferred_blocks=[1, 2], strict_preferred=True)
+        assert [lease.block_id for lease in leases] == [1, 2]
+        client.release(leases)
+        assert client.free_count() == 3
+    finally:
+        client.close()
+
+
+def test_shared_memory_lease_reservation_is_owner_aware(tmp_path, monkeypatch):
+    path = tmp_path / "reserved.shm"
+    reserve_path = tmp_path / "reserved.json"
+    monkeypatch.setenv("GMS_VLLM_KV_LEASE_NAMESPACE", "reserved")
+    monkeypatch.setenv("GMS_VLLM_KV_LEASE_SHM_PATH", str(path))
+    monkeypatch.setenv("GMS_VLLM_KV_LEASE_RESERVATION_PATH", str(reserve_path))
+
+    primary = SharedMemoryKVLeaseClient(
+        str(path),
+        namespace="reserved",
+        owner_id="primary",
+        total_blocks=8,
+        reservation_path=str(reserve_path),
+    )
+    shadow = SharedMemoryKVLeaseClient(
+        str(path),
+        namespace="reserved",
+        owner_id="shadow",
+        total_blocks=8,
+        reservation_path=str(reserve_path),
+    )
+    try:
+        namespace, reservation = set_kv_lease_reservation(
+            "vllm", 0, reserved_blocks=3, reserved_for_owner="shadow"
+        )
+        assert namespace == "reserved"
+        assert reservation.reserved_blocks == 3
+        assert read_kv_lease_reservation("vllm", 0)[1] == reservation
+        assert primary.raw_free_count() == 8
+        assert primary.free_count() == 5
+        assert shadow.free_count() == 8
+
+        leases = primary.acquire(5)
+        assert len(leases) == 5
+        assert primary.raw_free_count() == 3
+        assert primary.free_count() == 0
+        with pytest.raises(RuntimeError, match="reserved"):
+            primary.acquire(1)
+        assert len(shadow.acquire(3)) == 3
+    finally:
+        primary.close()
+        shadow.close()
+
+
 def _lease_worker(path: str, active, lock, errors, loops: int) -> None:
     client = SharedMemoryKVLeaseClient(
         path,
@@ -402,6 +476,117 @@ def _lease_worker(path: str, active, lock, errors, loops: int) -> None:
     except Exception as exc:  # noqa: BLE001
         errors.append(repr(exc))
     finally:
+        client.close()
+
+
+def _reservation_primary_worker(
+    path: str,
+    reserve_path: str,
+    active,
+    lock,
+    errors,
+    start,
+    stop,
+    loops: int,
+) -> None:
+    owner = f"primary-{os.getpid()}"
+    client = SharedMemoryKVLeaseClient(
+        path,
+        namespace="reservation-stress",
+        owner_id=owner,
+        total_blocks=9,
+        reserved_blocks=[0],
+        reservation_path=reserve_path,
+    )
+    try:
+        if not start.wait(10):
+            errors.append(f"{owner} timed out waiting for start")
+            return
+        completed = 0
+        while completed < loops and not stop.is_set():
+            try:
+                leases = client.acquire(1)
+            except RuntimeError:
+                time.sleep(0.0005)
+                continue
+            block_id = leases[0].block_id
+            try:
+                with lock:
+                    previous = active.get(block_id)
+                    if previous is not None:
+                        errors.append(
+                            f"duplicate active block {block_id}: {previous} and {owner}"
+                        )
+                    active[block_id] = owner
+                time.sleep(0.001)
+            finally:
+                with lock:
+                    if active.get(block_id) == owner:
+                        active.pop(block_id, None)
+                client.release(leases)
+            completed += 1
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"{owner}: {exc!r}")
+    finally:
+        client.close()
+
+
+def _reservation_shadow_worker(
+    path: str,
+    reserve_path: str,
+    active,
+    lock,
+    errors,
+    start,
+    reservation_set,
+    shadow_done,
+) -> None:
+    owner = f"shadow-{os.getpid()}"
+    client = SharedMemoryKVLeaseClient(
+        path,
+        namespace="reservation-stress",
+        owner_id="shadow",
+        total_blocks=9,
+        reserved_blocks=[0],
+        reservation_path=reserve_path,
+    )
+    leases = []
+    try:
+        if not start.wait(10):
+            errors.append(f"{owner} timed out waiting for start")
+            return
+        if not reservation_set.wait(10):
+            errors.append(f"{owner} timed out waiting for reservation")
+            return
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                leases = client.acquire(4)
+                break
+            except RuntimeError:
+                time.sleep(0.001)
+        if len(leases) != 4:
+            errors.append(f"{owner} acquired {len(leases)} reserved blocks, want 4")
+            return
+        with lock:
+            for lease in leases:
+                previous = active.get(lease.block_id)
+                if previous is not None:
+                    errors.append(
+                        f"shadow duplicate active block {lease.block_id}: {previous} and {owner}"
+                    )
+                active[lease.block_id] = owner
+        time.sleep(0.05)
+        with lock:
+            for lease in leases:
+                if active.get(lease.block_id) == owner:
+                    active.pop(lease.block_id, None)
+        shadow_done.set()
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"{owner}: {exc!r}")
+    finally:
+        if leases:
+            client.release(leases)
         client.close()
 
 
@@ -439,6 +624,95 @@ def test_shared_memory_lease_client_cross_process_stress(tmp_path):
     )
     try:
         assert final.free_count() == 64
+    finally:
+        final.close()
+
+
+def test_shared_memory_lease_transition_reservation_cross_process_stress(
+    tmp_path, monkeypatch
+):
+    shm_path = str(tmp_path / "reservation-stress.shm")
+    reserve_path = str(tmp_path / "reservation-stress.reserve")
+    monkeypatch.setenv("GMS_VLLM_KV_LEASE_NAMESPACE", "reservation-stress")
+    monkeypatch.setenv("GMS_VLLM_KV_LEASE_SHM_PATH", shm_path)
+    monkeypatch.setenv("GMS_VLLM_KV_LEASE_RESERVATION_PATH", reserve_path)
+
+    client = SharedMemoryKVLeaseClient(
+        shm_path,
+        namespace="reservation-stress",
+        owner_id="parent",
+        total_blocks=9,
+        reserved_blocks=[0],
+        reservation_path=reserve_path,
+    )
+    client.close()
+
+    ctx = mp.get_context("fork")
+    start = ctx.Event()
+    stop = ctx.Event()
+    reservation_set = ctx.Event()
+    shadow_done = ctx.Event()
+    with ctx.Manager() as manager:
+        active = manager.dict()
+        lock = manager.Lock()
+        errors = manager.list()
+        procs = [
+            ctx.Process(
+                target=_reservation_primary_worker,
+                args=(shm_path, reserve_path, active, lock, errors, start, stop, 200),
+            )
+            for _ in range(8)
+        ]
+        shadow = ctx.Process(
+            target=_reservation_shadow_worker,
+            args=(
+                shm_path,
+                reserve_path,
+                active,
+                lock,
+                errors,
+                start,
+                reservation_set,
+                shadow_done,
+            ),
+        )
+        procs.append(shadow)
+        for proc in procs:
+            proc.start()
+        start.set()
+        time.sleep(0.05)
+
+        namespace, reservation = set_kv_lease_reservation(
+            "vllm", 0, reserved_blocks=4, reserved_for_owner="shadow"
+        )
+        assert namespace == "reservation-stress"
+        assert reservation.reserved_blocks == 4
+        reservation_set.set()
+
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline and not shadow_done.is_set():
+            time.sleep(0.02)
+        stop.set()
+        for proc in procs:
+            proc.join(timeout=20)
+        for proc in procs:
+            assert not proc.is_alive()
+            assert proc.exitcode == 0
+        assert shadow_done.is_set(), "shadow never acquired reserved KV headroom"
+        assert list(errors) == []
+
+    set_kv_lease_reservation("vllm", 0, reserved_blocks=0)
+    final = SharedMemoryKVLeaseClient(
+        shm_path,
+        namespace="reservation-stress",
+        owner_id="final",
+        total_blocks=9,
+        reserved_blocks=[0],
+        reservation_path=reserve_path,
+    )
+    try:
+        assert final.raw_free_count() == 8
+        assert final.free_count() == 8
     finally:
         final.close()
 
