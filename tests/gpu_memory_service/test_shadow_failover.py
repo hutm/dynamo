@@ -473,6 +473,7 @@ def test_gms_authoritative_hbm_failover_vllm(
 def test_gms_authoritative_hbm_failover_sglang(
     request, runtime_services_dynamic_ports, predownload_models, monkeypatch
 ):
+    monkeypatch.setenv("SGLANG_GMS_MEM_FRACTION_STATIC", "0.22")
     monkeypatch.setenv("GMS_KV_DIRECTORY_ASYNC_READ", "1")
     monkeypatch.setenv("GMS_KV_DIRECTORY_ASYNC_PUBLISH", "1")
     monkeypatch.setenv("GMS_KV_DIRECTORY_DIAGNOSTICS", "1")
