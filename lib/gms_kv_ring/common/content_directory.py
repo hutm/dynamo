@@ -136,11 +136,6 @@ class ContentDirectory:
         self._mutation_sequence = 0
         self._mutation_committed = 0
         self._mutation_error: Optional[BaseException] = None
-        # Best-effort failure accounting for the async publish worker. A single
-        # mutation failure must not kill the worker (see _mutation_loop); these
-        # give operators visibility into dropped publications.
-        self._mutation_failed = 0
-        self._mutation_last_error: Optional[BaseException] = None
         if self.mode != "off" and not self.socket_path:
             logger.warning("GMS KV directory requested without daemon socket")
             self.mode = "off"
@@ -252,24 +247,12 @@ class ContentDirectory:
                 else:
                     raise AssertionError(f"unknown directory mutation {kind!r}")
             except BaseException as exc:  # noqa: BLE001
-                # A single mutation failure -- a transient daemon error, or this
-                # engine being fenced/demoted mid-drain -- must NOT permanently
-                # kill the writer and silently stop ALL future publications. An
-                # unpublished entry is a safe cache miss (recompute), never a
-                # stale hit, so skip this one and keep serving the queue: a
-                # transient error self-heals on the next mutation, and a fenced
-                # writer simply drops its now-rejected publications. Record the
-                # failure for observability and advance the committed sequence so
-                # flush_deferred does not block on the skipped mutation.
-                logger.warning(
-                    "GMS deferred directory mutation (%s) failed; skipping "
-                    "(published entry will be a safe cache miss)",
-                    kind,
-                    exc_info=True,
-                )
+                logger.exception("GMS deferred directory mutation failed")
                 with self._mutation_condition:
-                    self._mutation_failed += 1
-                    self._mutation_last_error = exc
+                    self._mutation_error = exc
+                    self._mutations.clear()
+                    self._mutation_condition.notify_all()
+                return
             with self._mutation_condition:
                 self._mutation_committed = int(sequence)
                 self._mutation_condition.notify_all()
@@ -649,3 +632,17 @@ class ContentDirectory:
             ),
             {},
         )
+
+    def compare_prefix(
+        self,
+        content_hashes: list[bytes],
+        legacy_count: int,
+    ) -> tuple[list[Optional[dict]], bool]:
+        """Lookup once and report whether its contiguous prefix agrees."""
+        entries = self.lookup(content_hashes)
+        directory_count = 0
+        for entry in entries:
+            if entry is None:
+                break
+            directory_count += 1
+        return entries, directory_count == int(legacy_count)
