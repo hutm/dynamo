@@ -118,6 +118,10 @@ class ContentDirectory:
         self._view_revision = 0
         self._view_epoch: Optional[int] = None
         self._view_writer: Optional[str] = None
+        # Published last by the single view-reader thread. CPython object
+        # reference assignment is atomic under the GIL, so hot-path readers do
+        # not need the view mutex merely to consume this derived status bit.
+        self._view_current_writer = False
         self._view_ready = threading.Event()
         self._view_caught_up = False
         self._view_stop = threading.Event()
@@ -343,12 +347,11 @@ class ContentDirectory:
 
     @property
     def read_view_is_current_writer(self) -> bool:
-        if not self._view_ready.is_set():
-            return False
-        with self._view_lock:
-            return self._view_caught_up and self._view_writer == self.writer_id
+        return bool(self._view_current_writer)
 
     def _invalidate_read_view(self) -> None:
+        # Revoke the lock-free status before clearing any view state.
+        self._view_current_writer = False
         self._view_ready.clear()
         with self._view_lock:
             self._view = {}
@@ -370,6 +373,7 @@ class ContentDirectory:
             self._view_epoch = int(epoch)
             self._view_writer = writer_id
             self._view_caught_up = True
+            self._view_current_writer = writer_id == self.writer_id
         self._view_ready.set()
 
     def _apply_changes(self, response: dict) -> None:
@@ -389,6 +393,9 @@ class ContentDirectory:
             writer = response.get("writer_id")
             self._view_writer = None if writer is None else str(writer)
             self._view_caught_up = not bool(response["has_more"])
+            self._view_current_writer = (
+                self._view_caught_up and self._view_writer == self.writer_id
+            )
         self._view_ready.set()
 
     def _read_view_loop(self) -> None:
