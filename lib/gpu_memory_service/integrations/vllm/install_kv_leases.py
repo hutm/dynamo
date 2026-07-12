@@ -31,6 +31,25 @@ class GMSKVLeaseUnavailable(ValueError):
     """Shared KV leases were temporarily unavailable for this allocation."""
 
 
+def _failover_directory_standby() -> bool | None:
+    """Derive the content-directory role before vLLM creates its BlockPool.
+
+    The engine-core process inherits the replica identity but does not run
+    WorkerFactory's post-init failover orchestration. In failover mode that
+    identity is authoritative: a non-primary replica must start its directory
+    reader as a standby so it can hydrate protected HBM after promotion.
+    """
+    enabled = any(
+        os.environ.get(name, "").lower() not in {"", "0", "false", "no", "off"}
+        for name in ("DYN_GMS_FAILOVER_SHADOW_MODE", "DYN_VLLM_GMS_SHADOW_MODE")
+    )
+    if not enabled:
+        return None
+    return os.environ.get("ENGINE_ID", "0") != os.environ.get(
+        "DYN_GMS_FAILOVER_PRIMARY_ENGINE_ID", "0"
+    )
+
+
 def _preferred_block_ids(free_block_queue, limit: int) -> list[int]:
     """Return a bounded prefix of local free block IDs without walking
     vLLM's entire free list. The real queue is a linked list; unit-test
@@ -233,7 +252,6 @@ def install(factory: Callable[[int], KVLeaseClient] | None = None) -> bool:
     orig_get_new_blocks = BlockPool.get_new_blocks
     orig_free_blocks = BlockPool.free_blocks
     orig_get_num_free_blocks = BlockPool.get_num_free_blocks
-    orig_cache_full_blocks = BlockPool.cache_full_blocks
     orig_get_cached_block = BlockPool.get_cached_block
 
     def _make_client(total_blocks: int) -> KVLeaseClient:
@@ -260,6 +278,7 @@ def install(factory: Callable[[int], KVLeaseClient] | None = None) -> bool:
             block_size=int(hash_block_size),
             mode=os.environ.get("GMS_KV_DIRECTORY_MODE"),
             keyspace="vllm-native-hbm-v1",
+            standby=_failover_directory_standby(),
         )
 
     def patched_init(self, *args, **kwargs):
@@ -298,10 +317,10 @@ def install(factory: Callable[[int], KVLeaseClient] | None = None) -> bool:
             or "0"
         )
 
-    def _publish_hbm_blocks(self, blocks) -> None:
+    def _publish_hbm_blocks(self, blocks, *, active: bool) -> None:
         directory = getattr(self, "_gms_kv_directory", None)
         client = getattr(self, "_gms_kv_lease_client", None)
-        if directory is None or not directory.enabled or client is None:
+        if client is None:
             return
         lease_map = self._gms_kv_leases_by_block
         pairs = [
@@ -313,10 +332,11 @@ def install(factory: Callable[[int], KVLeaseClient] | None = None) -> bool:
         if not pairs:
             return
         leases = [lease for _block, lease in pairs]
+        client.seal(leases)
+        if directory is None or not directory.enabled:
+            return
         try:
-            client.seal(leases)
-            publish = getattr(directory, "publish_deferred", directory.publish)
-            publish(
+            directory.publish(
                 [
                     {
                         "content_hash": bytes(block.block_hash),
@@ -324,7 +344,7 @@ def install(factory: Callable[[int], KVLeaseClient] | None = None) -> bool:
                         "slot_id": int(block.block_id),
                         "generation": int(lease.generation),
                         "tier": "hbm",
-                        "active": True,
+                        "active": active,
                     }
                     for block, lease in pairs
                 ]
@@ -336,35 +356,6 @@ def install(factory: Callable[[int], KVLeaseClient] | None = None) -> bool:
             )
             if directory.authoritative:
                 raise
-
-    def patched_cache_full_blocks(
-        self,
-        request,
-        blocks,
-        num_cached_blocks,
-        num_full_blocks,
-        block_size,
-        kv_cache_group_id,
-        block_mask=None,
-    ):
-        result = orig_cache_full_blocks(
-            self,
-            request,
-            blocks,
-            num_cached_blocks,
-            num_full_blocks,
-            block_size,
-            kv_cache_group_id,
-            block_mask=block_mask,
-        )
-        if num_cached_blocks < num_full_blocks:
-            candidates = blocks[num_cached_blocks:num_full_blocks]
-            if block_mask is not None:
-                candidates = [
-                    block for block, keep in zip(candidates, block_mask) if keep
-                ]
-            _publish_hbm_blocks(self, candidates)
-        return result
 
     def _drop_directory_hashes(directory, entries) -> None:
         try:
@@ -678,9 +669,32 @@ def install(factory: Callable[[int], KVLeaseClient] | None = None) -> bool:
                 lease = self._gms_kv_leases_by_block.pop(block_id, None)
                 leases.append(lease or KVLease(block_id, int(generation)))
         if restored:
-            _publish_hbm_blocks(self, restored)
+            _publish_hbm_blocks(self, restored, active=True)
         client.release(leases)
         return len(leases)
+
+    def _reserve_dormant_headroom(self, recent_blocks: int) -> int:
+        """Retire cold READY entries before the next allocation needs them.
+
+        vLLM treats cached blocks in its free queue as immediately reusable.
+        A sealed GMS block needs one extra ordered transition: remove directory
+        visibility, evict the native hash, then release the lease. Doing that
+        at request finalization preserves the same ordering while keeping the
+        following request's allocation on the local shared-memory fast path.
+        """
+        directory = getattr(self, "_gms_kv_directory", None)
+        client = getattr(self, "_gms_kv_lease_client", None)
+        if (
+            recent_blocks <= 0
+            or directory is None
+            or not directory.authoritative
+            or client is None
+        ):
+            return 0
+        shortage = int(recent_blocks) - int(client.free_count())
+        if shortage <= 0:
+            return 0
+        return _evict_dormant_directory_blocks(self, shortage)
 
     def patched_get_num_free_blocks(self) -> int:
         client = getattr(self, "_gms_kv_lease_client", None)
@@ -820,7 +834,7 @@ def install(factory: Callable[[int], KVLeaseClient] | None = None) -> bool:
         ]
         leases = []
         missing_lease_blocks = []
-        dormant_hashes = []
+        retained = []
         invalidated = []
         directory = getattr(self, "_gms_kv_directory", None)
         # Retaining a freed block's prefix hash (sealing its lease instead of
@@ -846,8 +860,7 @@ def install(factory: Callable[[int], KVLeaseClient] | None = None) -> bool:
                 )
             )
             if retain_dormant:
-                client.seal([lease])
-                dormant_hashes.append(bytes(block.block_hash))
+                retained.append(block)
                 continue
             content_hash = (
                 bytes(block.block_hash) if block.block_hash is not None else None
@@ -882,19 +895,15 @@ def install(factory: Callable[[int], KVLeaseClient] | None = None) -> bool:
                 first_missing_block=missing_lease_blocks[0],
                 active_leases=len(getattr(self, "_gms_kv_leases_by_block", {})),
             )
-        if dormant_hashes:
-            mark_dormant = getattr(
-                directory,
-                "mark_hbm_dormant_deferred",
-                directory.mark_hbm_dormant,
-            )
-            mark_dormant(dormant_hashes)
-            # Request-finalization is the durability boundary. Publications
-            # remain off TTFT/ITL, but a completed prefix is not considered
-            # recoverable until its ordered active -> dormant mutations commit.
-            flush = getattr(directory, "flush_deferred", None)
-            if flush is not None and not flush(timeout=2.0):
-                raise TimeoutError("GMS HBM directory commit timed out")
+        if retained:
+            # Request finalization is the only HBM durability boundary. Seal
+            # every completed slot as one lease-ring operation, then publish
+            # one READY batch. A crash before publication leaves safely
+            # undiscoverable sealed slots; a crash after it leaves an
+            # adoptable directory generation. Publishing ACTIVE earlier adds
+            # scheduler work but cannot make an incomplete block recoverable.
+            _publish_hbm_blocks(self, retained, active=False)
+            _reserve_dormant_headroom(self, len(retained))
         if invalidated:
             _drop_directory_hashes(directory, invalidated)
         client.release(leases)
@@ -940,7 +949,6 @@ def install(factory: Callable[[int], KVLeaseClient] | None = None) -> bool:
     BlockPool.get_new_blocks = patched_get_new_blocks  # type: ignore[method-assign]
     BlockPool.free_blocks = patched_free_blocks  # type: ignore[method-assign]
     BlockPool.get_num_free_blocks = patched_get_num_free_blocks  # type: ignore[method-assign]
-    BlockPool.cache_full_blocks = patched_cache_full_blocks  # type: ignore[method-assign]
     BlockPool.get_cached_block = patched_get_cached_block  # type: ignore[method-assign]
     _patched = True
     logger.info("[GMS-KVLease] patched vLLM BlockPool")
