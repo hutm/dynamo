@@ -224,6 +224,15 @@ def test_block_pool_hbm_directory_survives_engine_replacement(monkeypatch):
         assert stale_hash not in directory.entries
         assert shadow._gms_hydrate_hbm is False
 
+        from vllm.v1.core import kv_cache_utils
+
+        monkeypatch.setattr(
+            kv_cache_utils,
+            "make_block_hash_with_group_id",
+            lambda *_args: pytest.fail(
+                "current writer constructed directory keys after hydration"
+            ),
+        )
         lookup = directory.lookup_and_claim
         directory.lookup_and_claim = lambda _keys: pytest.fail(
             "current writer queried the recovery directory after hydration"
