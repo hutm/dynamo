@@ -913,6 +913,99 @@ def test_deferred_hbm_publish_and_dormancy_commit_in_order(
         directory.close()
 
 
+def test_direct_hbm_dormancy_drains_publication_and_commits_ready(
+    directory_daemon, monkeypatch
+):
+    _daemon, socket_path = directory_daemon
+    monkeypatch.setenv("GMS_KV_DIRECTORY_ASYNC_PUBLISH", "1")
+    monkeypatch.setenv("GMS_KV_DIRECTORY_MANIFEST", "manifest-a")
+    item = _item(b"direct-dormant-hbm", 100, generation=9)
+    item.update(tier="hbm", active=True)
+    directory = ContentDirectory(
+        socket_path,
+        engine="test",
+        block_size=16,
+        engine_id="test",
+        mode="authoritative",
+    )
+    try:
+        assert directory.publish_deferred([item]) == 1
+        assert directory.commit_hbm_dormant([item["content_hash"]], timeout=2.0)
+        with DaemonClient(socket_path) as client:
+            entries, _epoch, writer = client.directory_lookup(
+                "manifest-a", [item["content_hash"]]
+            )
+        assert writer == "engine-test"
+        assert entries[0]["state"] == "ready"
+        assert entries[0]["generations"] == [9]
+    finally:
+        directory.close()
+
+
+def test_direct_hbm_dormancy_serializes_concurrent_publication(
+    directory_daemon, monkeypatch
+):
+    _daemon, socket_path = directory_daemon
+    monkeypatch.setenv("GMS_KV_DIRECTORY_ASYNC_PUBLISH", "1")
+    monkeypatch.setenv("GMS_KV_DIRECTORY_MANIFEST", "manifest-a")
+    first = _item(b"ready-before-racing-publish", 101, generation=9)
+    first.update(tier="hbm", active=True)
+    second = _item(b"racing-active-publish", 102, generation=10)
+    second.update(tier="hbm", active=True)
+    directory = ContentDirectory(
+        socket_path,
+        engine="test",
+        block_size=16,
+        engine_id="test",
+        mode="authoritative",
+    )
+    dormant_started = threading.Event()
+    allow_dormant = threading.Event()
+    published = threading.Event()
+    original = directory.mark_hbm_dormant
+
+    def blocked_dormant(content_hashes):
+        dormant_started.set()
+        assert allow_dormant.wait(1.0)
+        return original(content_hashes)
+
+    try:
+        directory.publish_deferred([first])
+        monkeypatch.setattr(directory, "mark_hbm_dormant", blocked_dormant)
+        commit = threading.Thread(
+            target=directory.commit_hbm_dormant,
+            args=([first["content_hash"]], 2.0),
+        )
+        commit.start()
+        assert dormant_started.wait(1.0)
+        publish = threading.Thread(
+            target=lambda: (directory.publish_deferred([second]), published.set())
+        )
+        publish.start()
+        assert not published.wait(0.05)
+        allow_dormant.set()
+        commit.join(1.0)
+        publish.join(1.0)
+        assert not commit.is_alive()
+        assert not publish.is_alive()
+        assert directory.flush_deferred(2.0)
+        with DaemonClient(socket_path) as client:
+            entries, _epoch, _writer = client.directory_lookup(
+                "manifest-a", [first["content_hash"], second["content_hash"]]
+            )
+        # ACTIVE entries are intentionally hidden from readers until they are
+        # finalized, but the racing publication must still be present after
+        # the READY commit rather than overtaking it.
+        assert entries[0]["state"] == "ready"
+        assert entries[1] is None
+        assert _daemon._content_directory[
+            ("manifest-a", second["content_hash"])
+        ]["state"] == "active"
+    finally:
+        allow_dormant.set()
+        directory.close()
+
+
 def test_async_directory_defaults_on_and_publication_can_be_disabled(monkeypatch):
     monkeypatch.delenv("GMS_KV_DIRECTORY_ASYNC_READ", raising=False)
     monkeypatch.delenv("GMS_KV_DIRECTORY_ASYNC_PUBLISH", raising=False)

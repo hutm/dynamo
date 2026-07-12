@@ -140,6 +140,7 @@ class ContentDirectory:
             "off",
             "",
         )
+        self._mutation_submit_lock = threading.Lock()
         self._mutation_condition = threading.Condition()
         self._mutations = deque()
         self._mutation_thread: Optional[threading.Thread] = None
@@ -191,7 +192,8 @@ class ContentDirectory:
         self._mutation_thread.start()
 
     def _defer_mutation(self, kind: str, payload) -> int:
-        with self._mutation_condition:
+        # Keep direct durability commits ordered with concurrent producers.
+        with self._mutation_submit_lock, self._mutation_condition:
             if self._mutation_error is not None:
                 raise RuntimeError("GMS directory mutation worker failed") from (
                     self._mutation_error
@@ -243,6 +245,23 @@ class ContentDirectory:
                 if remaining is not None and remaining <= 0:
                     return False
                 self._mutation_condition.wait(remaining)
+            return True
+
+    def commit_hbm_dormant(
+        self, content_hashes: list[bytes], timeout: Optional[float] = None
+    ) -> bool:
+        """Commit completed HBM blocks without a queue-and-wake round trip.
+
+        Earlier active publications remain ordered through the mutation worker.
+        Once they drain, this scheduler-thread call writes the READY transition
+        directly to the daemon and returns only after its writer fence commits.
+        """
+        if not content_hashes:
+            return True
+        with self._mutation_submit_lock:
+            if self.async_publish_enabled and not self.flush_deferred(timeout):
+                return False
+            self.mark_hbm_dormant(content_hashes)
             return True
 
     def _mutation_loop(self) -> None:

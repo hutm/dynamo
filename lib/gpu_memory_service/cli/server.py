@@ -54,6 +54,15 @@ def _tags_from_env() -> tuple[str, ...]:
     return tags
 
 
+def _directory_command(socket_path: str) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "gms_kv_ring.daemon.directory_server",
+        socket_path,
+    ]
+
+
 def _terminate_all(processes: list[subprocess.Popen]) -> None:
     for process in processes:
         if process.poll() is None:
@@ -155,6 +164,16 @@ def main(argv: list[str] | None = None) -> None:
 
     servers: list[subprocess.Popen] = []
     loaders: list[subprocess.Popen] = []
+
+    directory_socket = os.environ.get("GMS_DIRECTORY_SOCKET")
+    if directory_socket:
+        process = subprocess.Popen(_directory_command(directory_socket))
+        logger.info(
+            "Started GMS content directory socket=%s pid=%d",
+            directory_socket,
+            process.pid,
+        )
+        servers.append(process)
 
     def terminate(*_args) -> None:
         _terminate_all([*servers, *loaders])

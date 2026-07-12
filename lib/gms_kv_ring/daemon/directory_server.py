@@ -10,6 +10,7 @@ full KV daemon composes the same RPC handlers when those tiers are enabled.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import os
@@ -123,3 +124,14 @@ async def _write_frame(writer, message: dict) -> None:
     body = json.dumps(message).encode("utf-8")
     writer.write(struct.pack("<I", len(body)) + body)
     await writer.drain()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("listen_socket", help="Unix socket used by directory clients")
+    args = parser.parse_args()
+    asyncio.run(DirectoryDaemon(args.listen_socket).serve())
+
+
+if __name__ == "__main__":
+    main()
