@@ -93,6 +93,22 @@ vLLM needed no code change for k8s (the pod template already sets
 TRT-LLM: deferred (engine not bumped — see TRTLLM-BUMP-DEFERRED.md); its k8s failover
 is out of scope for this rebase.
 
+## Switchover-latency benchmark (operator-shaped 5-container, TP=1)
+
+`run-failover-k8s.sh <engine>` runs the strict operator-shaped failover benchmark
+(frontend + primary + warm shadow + weights-GMS + kv-GMS in one pod, continuous
+traffic, SIGKILL the primary, canary must finish within `MAX_SWITCHOVER_MS`).
+
+Status: **blocked on shared-cluster DRA capacity**, not on GMS. The benchmark pins
+the pod to a single `FO_NODE` (needed so it can SIGKILL a specific engine); the HBM
+preflight passes but the scheduler reports `cannot allocate all claims` because DRA
+GPU device slots on the pinned node are held by other tenants (the documented
+DRA-vs-nvidia.com/gpu double-accounting caveat). Unlike this benchmark, the Layer 2
+authoritative failover tests auto-place via a ResourceClaimTemplate and DID schedule
++ pass, so failover **correctness** is proven; only the pinned-node **latency**
+measurement awaits a node with genuinely-free DRA slots. Re-run when capacity frees:
+`FO_NODE=<free-node> PREPARE=0 ENGINES='vllm sglang' bash k8s/repro/run-failover-matrix.sh`.
+
 ## Reconciliations applied during rebase
 - Daemon: all `cuMem*/cuda_*` ops routed through `self._vmm = get_vmm()`
   (upstream VMMDevice abstraction). Tests install a shared `FakeVMM`.
