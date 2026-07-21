@@ -12,9 +12,7 @@ import threading
 import uuid
 from dataclasses import dataclass
 
-from gpu_memory_service.integrations.sglang.gms_hicache_storage import (
-    GMSHiCacheStorage,
-)
+from gpu_memory_service.integrations.sglang.gms_hicache_storage import GMSHiCacheStorage
 
 logger = logging.getLogger(__name__)
 

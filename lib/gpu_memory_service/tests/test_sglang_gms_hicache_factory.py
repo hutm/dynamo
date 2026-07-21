@@ -1,12 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
-from sglang.srt.mem_cache.storage import StorageBackendFactory
-
 from gpu_memory_service.integrations.sglang.gms_hicache_storage_shm import (
     GMSSharedMemoryHiCacheStorage,
 )
+from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
+from sglang.srt.mem_cache.storage import StorageBackendFactory
 
 
 def test_latest_sglang_factory_loads_gms_without_registration(monkeypatch):

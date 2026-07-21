@@ -40,9 +40,9 @@ def install() -> bool:
     if _INSTALLED:
         return False
     directory_mode = os.environ.get("GMS_KV_DIRECTORY_MODE", "off").lower()
-    if (
-        os.environ.get("GMS_SGLANG_ENABLE_KV_RING") != "1"
-        and directory_mode not in ("shadow", "authoritative")
+    if os.environ.get("GMS_SGLANG_ENABLE_KV_RING") != "1" and directory_mode not in (
+        "shadow",
+        "authoritative",
     ):
         logger.debug(
             "SGLang GMS radix cache disabled; skipping install",
@@ -141,11 +141,7 @@ def _swap_tree_cache(scheduler) -> None:
         names = set(vars(owner)) if hasattr(owner, "__dict__") else set()
         if is_dataclass(owner):
             names.update(field.name for field in fields(owner))
-        return [
-            (name, getattr(owner, name))
-            for name in names
-            if hasattr(owner, name)
-        ]
+        return [(name, getattr(owner, name)) for name in names if hasattr(owner, name)]
 
     rebound = []
     owners = [

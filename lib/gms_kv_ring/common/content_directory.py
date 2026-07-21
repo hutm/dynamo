@@ -34,7 +34,9 @@ def resolve_directory_mode(value: Optional[str] = None) -> str:
     return mode
 
 
-def resolve_manifest_id(engine: str, block_size: int) -> str:
+def resolve_manifest_id(
+    engine: str, block_size: int, *, keyspace: Optional[str] = None
+) -> str:
     """Return the explicit compatibility manifest or a safe POC fallback.
 
     Production deployments should set ``GMS_KV_DIRECTORY_MANIFEST`` from the
@@ -44,6 +46,10 @@ def resolve_manifest_id(engine: str, block_size: int) -> str:
     explicit = os.environ.get("GMS_KV_DIRECTORY_MANIFEST", "").strip()
     if explicit:
         return explicit
+        # The explicit value is the complete compatibility identity shared by
+        # engine adapters and failover orchestration. Appending adapter-local
+        # fields here made those two clients silently address different
+        # manifests during promotion.
     model = (
         os.environ.get("DYN_MODEL_PATH")
         or os.environ.get("DYN_MODEL")
@@ -51,7 +57,10 @@ def resolve_manifest_id(engine: str, block_size: int) -> str:
         or "unknown-model"
     )
     salt = os.environ.get("GMS_KVR_CROSS_NODE_SALT", "")
-    return f"poc-v1|{engine}|{model}|block={int(block_size)}|salt={salt}"
+    manifest = f"poc-v1|{engine}|{model}|block={int(block_size)}|salt={salt}"
+    if keyspace:
+        manifest = f"{manifest}|keyspace={str(keyspace).strip()}"
+    return manifest
 
 
 def resolve_writer_id(engine_id: Optional[str] = None) -> str:
@@ -76,9 +85,7 @@ class ContentDirectory:
         self.mode = resolve_directory_mode(mode)
         self.engine = str(engine)
         self.socket_path = str(socket_path or "")
-        self.manifest_id = resolve_manifest_id(engine, block_size)
-        if keyspace:
-            self.manifest_id = f"{self.manifest_id}|keyspace={str(keyspace).strip()}"
+        self.manifest_id = resolve_manifest_id(engine, block_size, keyspace=keyspace)
         self.writer_id = resolve_writer_id(engine_id)
         if standby is None:
             standby = os.environ.get("GMS_KV_DIRECTORY_STANDBY", "0").lower() not in (
@@ -223,9 +230,7 @@ class ContentDirectory:
                     raise RuntimeError("GMS directory mutation worker failed") from (
                         self._mutation_error
                     )
-                remaining = (
-                    None if deadline is None else deadline - time.monotonic()
-                )
+                remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0:
                     return False
                 self._mutation_condition.wait(remaining)
@@ -261,7 +266,9 @@ class ContentDirectory:
         try:
             self.flush_deferred(timeout=2.0)
         except Exception:  # noqa: BLE001
-            logger.warning("GMS directory close could not flush mutations", exc_info=True)
+            logger.warning(
+                "GMS directory close could not flush mutations", exc_info=True
+            )
         with self._mutation_condition:
             self._mutation_stop = True
             self._mutation_condition.notify_all()
@@ -428,9 +435,7 @@ class ContentDirectory:
                     break
             return result
 
-    def _read_view_lookup(
-        self, content_hashes: list[bytes]
-    ) -> list[Optional[dict]]:
+    def _read_view_lookup(self, content_hashes: list[bytes]) -> list[Optional[dict]]:
         if not self._view_ready.is_set():
             return [None] * len(content_hashes)
         with self._view_lock:
@@ -570,8 +575,7 @@ class ContentDirectory:
             # Misses and host/storage hits are read-only. Only HBM adoption
             # needs the daemon claim that fences eviction and slot reuse.
             if not any(
-                entry is not None and entry.get("tier") == "hbm"
-                for entry in local
+                entry is not None and entry.get("tier") == "hbm" for entry in local
             ):
                 return local, None
 

@@ -9,9 +9,7 @@ import gpu_memory_service.integrations.sglang as sglang_gms
 import pytest
 from gpu_memory_service.common.locks import GrantedLockType
 from gpu_memory_service.integrations.sglang import patches
-from gpu_memory_service.integrations.sglang.memory_saver import (
-    GMSMemorySaverImpl,
-)
+from gpu_memory_service.integrations.sglang.memory_saver import GMSMemorySaverImpl
 
 pytestmark = pytest.mark.pre_merge
 
@@ -109,7 +107,6 @@ def test_pending_sglang_weight_publication_is_one_shot():
 
 def test_sglang_hbm_page_adoption_and_retention_are_exact():
     import torch
-
     from gpu_memory_service.integrations.common.kv_lease_client import KVLease
     from gpu_memory_service.integrations.sglang import install_kv_leases
 
