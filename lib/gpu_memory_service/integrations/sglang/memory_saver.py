@@ -113,7 +113,6 @@ class GMSMemorySaverImpl:
                 self._kv_engine_id,
                 tag=self._kv_tag,
                 shared=self._kv_shared,
-                defer_physical=False,
             ),
         }
 

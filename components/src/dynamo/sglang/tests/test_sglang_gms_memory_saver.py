@@ -81,7 +81,7 @@ def build_impl(monkeypatch, tmp_path):
         pool_calls: list[tuple[str, torch.device]] = []
         retarget_calls: list[tuple[str, str, bool]] = []
         release_calls: list[str] = []
-        persistent_allocator_calls: list[tuple[str, int, str, str, bool, bool]] = []
+        persistent_allocator_calls: list[tuple[str, int, str, str, bool]] = []
 
         @contextmanager
         def fake_use_mem_pool(tag: str, device: torch.device):
@@ -108,10 +108,10 @@ def build_impl(monkeypatch, tmp_path):
         )
 
         def fake_get_or_create_persistent_allocator(
-            socket_path, device, engine_id, tag, *, shared, defer_physical=False
+            socket_path, device, engine_id, tag, *, shared
         ):
             persistent_allocator_calls.append(
-                (socket_path, device, engine_id, tag, shared, defer_physical)
+                (socket_path, device, engine_id, tag, shared)
             )
             return kv_cache
 
