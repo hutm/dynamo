@@ -30,18 +30,7 @@ from typing import Iterable, Optional
 from uuid import uuid4
 
 from gpu_memory_service.common.utils import align_to_granularity
-from gpu_memory_service.common.vmm.cuda_utils import (
-    cuda_ensure_initialized,
-    cumem_address_free_checked,
-    cumem_address_reserve_checked,
-    cumem_create_tolerate_oom,
-    cumem_export_to_shareable_handle,
-    cumem_get_allocation_granularity,
-    cumem_map_checked,
-    cumem_release,
-    cumem_set_access_checked,
-    cumem_unmap_checked,
-)
+from gpu_memory_service.common.vmm import get_vmm
 from gpu_memory_service.common.locks import GrantedLockType
 
 logger = logging.getLogger(__name__)
@@ -86,9 +75,12 @@ class PersistentAllocationManager:
     """
 
     def __init__(self, device: int = 0):
-        cuda_ensure_initialized()
+        # Route all CUDA VMM ops through the upstream VMM abstraction (adopted
+        # during the rebase), matching GMSAllocationManager.
+        self._vmm = get_vmm()
+        self._vmm.ensure_initialized()
         self._device = device
-        self._granularity = cumem_get_allocation_granularity(device)
+        self._granularity = self._vmm.get_allocation_granularity(device)
         self._allocations: dict[tuple[str, str], PersistentAllocation] = {}
         self._exclusive_claimed: set[tuple[str, str]] = set()
         self._shared_claim_counts: dict[tuple[str, str], int] = {}
@@ -199,13 +191,13 @@ class PersistentAllocationManager:
             )
             return existing, True
 
-        allocated, handle = cumem_create_tolerate_oom(aligned_size, self._device)
+        allocated, handle = self._vmm.create_tolerate_oom(aligned_size, self._device)
         if not allocated:
             raise MemoryError(
                 f"cuMemCreate OOM for persistent ({engine_id!r}, {tag!r}) "
                 f"size={size} aligned_size={aligned_size}"
             )
-        export_fd = int(cumem_export_to_shareable_handle(int(handle)))
+        export_fd = int(self._vmm.export_to_shareable_handle(int(handle)))
         # Also map into the daemon's own VA so the daemon can read/write
         # the same physical pages the engine sees. Failure to map is
         # non-fatal — we still hand out the FD; va_daemon stays 0 and
@@ -214,11 +206,11 @@ class PersistentAllocationManager:
         mapped = False
         try:
             va_daemon = int(
-                cumem_address_reserve_checked(aligned_size, self._granularity)
+                self._vmm.address_reserve(aligned_size, self._granularity)
             )
-            cumem_map_checked(va_daemon, aligned_size, int(handle))
+            self._vmm.map(va_daemon, aligned_size, int(handle))
             mapped = True
-            cumem_set_access_checked(
+            self._vmm.set_access(
                 va_daemon,
                 aligned_size,
                 self._device,
@@ -241,11 +233,11 @@ class PersistentAllocationManager:
                 # still-mapped range, which would leak the VA and a physical ref.
                 if mapped:
                     try:
-                        cumem_unmap_checked(va_daemon, aligned_size)
+                        self._vmm.unmap(va_daemon, aligned_size)
                     except Exception:  # noqa: BLE001
                         pass
                 try:
-                    cumem_address_free_checked(va_daemon, aligned_size)
+                    self._vmm.address_free(va_daemon, aligned_size)
                 except Exception:  # noqa: BLE001
                     pass
                 va_daemon = 0
@@ -316,19 +308,19 @@ class PersistentAllocationManager:
         # Tear down daemon-side mapping (if it succeeded at claim time).
         if alloc.va_daemon:
             try:
-                cumem_unmap_checked(alloc.va_daemon, alloc.aligned_size)
+                self._vmm.unmap(alloc.va_daemon, alloc.aligned_size)
             except Exception:  # noqa: BLE001
                 logger.warning(
                     "cuMemUnmap failed for %s", alloc.allocation_id, exc_info=True
                 )
             try:
-                cumem_address_free_checked(alloc.va_daemon, alloc.aligned_size)
+                self._vmm.address_free(alloc.va_daemon, alloc.aligned_size)
             except Exception:  # noqa: BLE001
                 logger.warning(
                     "cuMemAddressFree failed for %s", alloc.allocation_id, exc_info=True
                 )
         os.close(alloc.export_fd)
-        cumem_release(alloc.handle)
+        self._vmm.release(alloc.handle)
         logger.info(
             "Released persistent allocation %s engine_id=%s tag=%s",
             alloc.allocation_id,
@@ -381,11 +373,11 @@ class PersistentAllocationManager:
         for alloc in list(self._allocations.values()):
             if alloc.va_daemon:
                 try:
-                    cumem_unmap_checked(alloc.va_daemon, alloc.aligned_size)
+                    self._vmm.unmap(alloc.va_daemon, alloc.aligned_size)
                 except Exception:  # noqa: BLE001
                     pass
                 try:
-                    cumem_address_free_checked(alloc.va_daemon, alloc.aligned_size)
+                    self._vmm.address_free(alloc.va_daemon, alloc.aligned_size)
                 except Exception:  # noqa: BLE001
                     pass
             try:
@@ -393,7 +385,7 @@ class PersistentAllocationManager:
             except OSError:
                 pass
             try:
-                cumem_release(alloc.handle)
+                self._vmm.release(alloc.handle)
             except Exception:  # noqa: BLE001
                 logger.warning(
                     "cumem_release failed during clear_all for %s",
