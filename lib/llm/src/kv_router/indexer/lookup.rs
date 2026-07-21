@@ -188,6 +188,7 @@ impl<'a> LookupPipeline<'a> {
                 let device = merge_side_or_warn(self.side, primary_device, sequence).await;
 
                 Ok(TieredMatchDetails {
+                    gms_placements: Default::default(),
                     device,
                     lower_tier: lt,
                 })
@@ -228,6 +229,7 @@ impl<'a> LookupPipeline<'a> {
                 let device = self.primary.find_match_details_retained(&sequence).await?;
                 let lt = query_lower_tiers(lower_tier, sequence.as_slice(), &device);
                 Ok(TieredMatchDetails {
+                    gms_placements: Default::default(),
                     device,
                     lower_tier: lt,
                 })

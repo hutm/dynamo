@@ -57,15 +57,15 @@ GMS follows a client-server architecture where the **server** owns GPU memory al
 
 ### Server
 
-The GMS server runs as an independent process that manages GPU memory without ever mapping it to its own address space. This design allows the server to:
+The GMS server runs independently from inference workers and owns the exported CUDA VMM handles. Normal weight allocations remain unmapped in the daemon; persistent KV allocations are also mapped into daemon virtual address space for direct-access and storage-tier operations. This design allows the server to:
 
-- **Survive GPU driver failures** - no CUDA context means no vulnerability to driver resets
 - **Outlive client processes** - memory persists across client crashes
 - **Arbitrate access** - enforce single-writer, multiple-reader semantics
+- **Limit daemon mappings** - only persistent allocations that need daemon-side access are mapped
 
 The server consists of three main components:
 
-1. **Memory Manager** - Allocates physical GPU memory via CUDA VMM (`cuMemCreate`) and eagerly exports one shareable file descriptor (`cuMemExportToShareableHandle`) per allocation. Later export RPCs `dup()` that cached FD instead of calling back into CUDA again. Critically, it never calls `cuMemMap` - clients handle all virtual address mapping. Allocation requests retry on OOM until they succeed or the optional retry timeout is reached.
+1. **Memory Manager** - Allocates physical GPU memory via CUDA VMM (`cuMemCreate`) and eagerly exports one shareable file descriptor (`cuMemExportToShareableHandle`) per allocation. Later export RPCs `dup()` that cached FD instead of calling back into CUDA again. Weight layouts are mapped only by clients. The persistent-allocation manager additionally maps persistent KV in the daemon for direct-access and storage-tier operations. Allocation requests retry on OOM until they succeed or the optional retry timeout is reached.
 
 2. **State Machine (FSM)** - Manages global lock state, waiter coordination, and disconnect cleanup.
 
@@ -529,9 +529,9 @@ class GMSClientMemoryManager:
 
 ---
 
-## Framework Integration (vLLM / SGLang)
+## Framework Integration (vLLM / SGLang / TensorRT-LLM)
 
-GMS provides pre-built integrations for vLLM and SGLang. Enable GMS by passing `--load-format gms` when launching an engine.
+GMS provides pre-built integrations for vLLM, SGLang, and TensorRT-LLM. Enable GMS by passing `--load-format gms` when launching an engine.
 
 ### How It Works
 
@@ -579,12 +579,89 @@ The integration patches `torch_memory_saver` to route both weight and KV-cache o
 - Other tags are not supported in GMS mode
 - The `--enable-memory-saver` flag is required to activate the memory saver pathway
 
+#### TensorRT-LLM
+
+```bash
+python -m dynamo.trtllm \
+  --model <model> \
+  --load-format gms
+```
+
+**KV management is KVCacheManager V2 only.** TensorRT-LLM + GMS is supported on
+the V2 KV path exclusively; the legacy V1 KV connector is **not** supported and
+is never used. When `--load-format gms` is set, the worker:
+
+- Loads model weights through GMS (the `weights` tag), identical to vLLM/SGLang.
+- **Forces `use_kv_cache_manager_v2=True`** and sets `event_buffer_max_size=0`
+  (`_configure_gms_v2_kv_cache`). The V1 connector manager and event-buffer
+  paths silently fall back to the V1 manager, so they are kept disabled.
+- **Rejects `--connector` / `kv_connector_config`** in GMS mode (V2 cannot use a
+  KV connector). Passing one is a hard error, not a silent V1 fallback.
+- Coordinates KV cache access through **V2 slot leases** (`install_kv_leases_v2`)
+  rather than a `kv_cache` daemon allocation. The TRT-LLM integration does not
+  connect to the `kv_cache` GMS socket; a generic operator deployment may still
+  render an idle `kv_cache` server container. Enable leases with
+  `GMS_KV_LEASES=1` (or `GMS_TRTLLM_KV_LEASES=1`).
+
+> For TensorRT-LLM, GMS KV management means KVCacheManager V2 plus slot leases;
+> the V1 connector is unsupported.
+
+##### Persistent-KV support boundary
+
+The current TensorRT-LLM integration proves that GMS-owned weights survive an
+engine crash, KVCacheManager V2 slots remain protected by crash-recoverable
+leases, and a promoted shadow can resume serving. The host connector can also
+save and restore complete logical KV blocks through GMS host or storage tiers.
+
+It does **not** yet prove that a promoted shadow adopts the primary's completed
+HBM prefix without recomputing it. In particular, the integration does not yet
+publish an authoritative `ACTIVE -> READY` transition for completed HBM blocks
+or reconstruct KVCacheManager V2's content-hash-to-slot index from the surviving
+GMS directory. The TensorRT-LLM shadow-failover test therefore establishes
+service recovery and lease coordination, not persistent-HBM cache-hit parity
+with the vLLM and SGLang integrations.
+
+This is an inference-engine integration gap, not a CUDA or GMS memory-lifetime
+limitation. GMS already preserves the allocation, bytes, lease generations, and
+directory metadata. Closing the gap requires stable KVCacheManager V2 lifecycle
+hooks for finalizing a reusable block and adopting an exact persisted slot into
+the engine's native cache index. Until those hooks are available, patching V2
+internals is possible but version-sensitive.
+
+Follow-up work:
+
+- [ ] Detect the persistent `allocate_kv_caches` capability from the installed
+  TensorRT-LLM build and fail closed instead of assuming the engine patch exists.
+- [ ] Publish allocated HBM slots as `ACTIVE`, then atomically seal their lease
+  generation and publish them as `READY` only after TensorRT-LLM declares the KV
+  block complete and reusable.
+- [ ] On promotion, validate the model/layout manifest and lease generation,
+  claim sealed slots, and adopt them into KVCacheManager V2 without placing the
+  physical slots on its free list.
+- [ ] Hydrate TensorRT-LLM's native content-hash-to-slot index from the claimed
+  directory entries so normal scheduler lookups become local cache hits.
+- [ ] Resolve the source owner from each authoritative directory entry rather
+  than relying on a configured primary engine ID after ownership changes.
+- [ ] Implement cross-node staging discovery; the current staging scan is a
+  placeholder and cannot discover remote TensorRT-LLM KV sources.
+- [ ] Overlap block movement with execution where KVCacheManager V2 exposes a
+  stable layer or block readiness hook. The current connector restores complete
+  logical blocks before the forward pass and saves them at a later barrier.
+- [ ] Extend real-GPU validation to assert output equality, matched-token reuse,
+  no prefill recomputation for a sealed prefix, near-full-HBM behavior, TP=1 and
+  TP=2, CUDA graphs, and crashes during both incomplete and completed blocks.
+
+All adoption and lookup paths must fail closed on partial blocks, incompatible
+manifests, stale generations, mixed owners, or an unavailable engine hook. In
+those cases, recomputation is correct; reporting a cache hit is not.
+
 ### Shadow Engine Failover (Pause / Resume)
 
-Both integrations support releasing and reclaiming GPU memory for shadow engine patterns. The API names differ by framework:
+All integrations support releasing and reclaiming GPU memory for shadow engine patterns. The API names differ by framework:
 
 - **vLLM**: `sleep` / `wake_up` (via `/engine/control/sleep` and `/engine/control/wake_up` HTTP endpoints)
 - **SGLang**: `release_memory_occupation` / `resume_memory_occupation` (via the corresponding HTTP endpoints)
+- **TensorRT-LLM**: `release_memory_occupation` / `resume_memory_occupation` (weights via GMS; KV via V2 slot leases — see above)
 
 Under the hood, pausing calls `unmap_all_vas()` + `abort()` to release GPU memory while preserving VA reservations. Resuming is tag-specific:
 
@@ -593,7 +670,39 @@ Under the hood, pausing calls `unmap_all_vas()` + `abort()` to release GPU memor
 
 Tensor pointers remain valid because the original virtual addresses are preserved.
 
-This enables a shadow engine to release its GPU memory, let a primary engine use the GPU, and then reclaim the memory after the primary is killed. The mutable KV cache always moves through a fresh RW layout in its own GMS tag before it is reallocated.
+This enables a shadow engine to release its GPU memory, let a primary engine use the GPU, and then reclaim the memory after the primary is killed. The legacy pause/resume path rebuilds mutable KV state. The experimental persistent-KV path instead combines shared leases with an authoritative content directory so sealed HBM blocks can be fenced, adopted, and reused by the promoted engine.
+
+#### Persistent-KV failover contract
+
+Persistent-KV failover is a single-node, single-tenant feature. Every engine and
+the failover process must use the same lease namespace and the exact same
+`GMS_KV_DIRECTORY_MANIFEST`. The manifest is a complete compatibility identity
+for the model, attention layout, KV dtype, block geometry, and hash/keyspace
+version. Authoritative promotion fails closed when it is absent.
+
+The directory Unix socket is mode `0600`. This prevents access from other Unix
+users, but it is not authentication between tenants running as the same UID.
+Deploy separate tenants under separate UIDs and isolated socket directories; do
+not expose a directory socket across a same-UID multi-tenant boundary.
+
+Relevant experimental controls:
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `GMS_KV_DIRECTORY_MODE` | `off` | `shadow` compares directory results; `authoritative` enables recovery decisions. |
+| `GMS_KV_DIRECTORY_MANIFEST` | none | Required complete compatibility identity for authoritative failover. |
+| `GMS_KV_DIRECTORY_ASYNC_READ` | `1` | Maintain a fail-closed background metadata view for request-path misses and host/storage hits; HBM adoption remains a transactional daemon claim. Set to `0` for synchronous diagnostics. |
+| `GMS_KV_DIRECTORY_ASYNC_PUBLISH` | `1` | Commit ordered directory mutations off the request hot path; request finalization and clean shutdown flush accepted mutations. A crash before commit produces a safe cache miss. Set to `0` for synchronous diagnostics. |
+| `GMS_KV_LEASES_RETAIN_PREFIX_CACHE` | `0` | Retain dormant prefixes without an authoritative directory. Enable only for an isolated single-writer lease namespace. |
+| `DYN_GMS_FAILOVER_POST_LOCK_FENCE_MS` | backend-specific | Delay after lock acquisition before promotion/reclaim. |
+| `DYN_GMS_FAILOVER_WAKEUP_TIMEOUT_SECS` | `120` | Bound promoted-shadow memory remapping. |
+| `DYN_GMS_FAILOVER_UNREGISTER_TIMEOUT_SECS` | `5` | Bound graceful router unregister during shutdown. |
+
+Prefix retention defaults on only with an authoritative directory. Enabling
+`GMS_KV_LEASES_RETAIN_PREFIX_CACHE` without that directory avoids the legacy
+prefix-cache performance loss, but shifts correctness and capacity isolation to
+the operator; it is intentionally opt-in until the real vLLM hit path is covered
+by the GPU failover matrix.
 
 ### Configuration via `model_loader_extra_config`
 

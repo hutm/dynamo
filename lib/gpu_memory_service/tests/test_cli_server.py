@@ -30,15 +30,55 @@ pytestmark = [
 
 
 def test_child_command_launches_default_multi_tag_runner():
-    assert server._child_command(3, "cuda") == [
+    assert server._child_command(3, "kv_cache") == [
         sys.executable,
         "-m",
         "gpu_memory_service",
         "--device",
         "3",
-        "--device-type",
-        "cuda",
+        "--tag",
+        "kv_cache",
     ]
+
+
+def test_directory_command_uses_distinct_protocol_server():
+    assert server._directory_command("/run/gms/directory.sock") == [
+        sys.executable,
+        "-m",
+        "gms_kv_ring.daemon.directory_server",
+        "/run/gms/directory.sock",
+    ]
+
+
+def test_main_supervises_optional_directory_with_cuda_servers(monkeypatch):
+    commands = []
+    processes = []
+
+    class Process:
+        pid = 123
+
+    monkeypatch.setenv("GMS_DIRECTORY_SOCKET", "/run/gms/directory.sock")
+    monkeypatch.setenv("GMS_SERVER_TAGS", "kv_cache")
+    monkeypatch.setattr(server, "list_devices", lambda: [3])
+    monkeypatch.setattr(
+        server.subprocess,
+        "Popen",
+        lambda command: (commands.append(command), Process())[1],
+    )
+    monkeypatch.setattr(server.signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(
+        server, "_supervise", lambda children: (processes.extend(children), 0)[1]
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        server.main()
+
+    assert exc.value.code == 0
+    assert commands == [
+        server._directory_command("/run/gms/directory.sock"),
+        server._child_command(3, "kv_cache"),
+    ]
+    assert len(processes) == 2
 
 
 class _Process:

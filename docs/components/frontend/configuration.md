@@ -104,6 +104,7 @@ For MoE models, AIC requires `aic_tp_size * aic_attention_dp_size == aic_moe_tp_
 | CLI Argument | Env Var | Default | Description |
 |-------------|---------|---------|-------------|
 | `--migration-limit` | `DYN_MIGRATION_LIMIT` | `0` | Max request migrations per worker disconnect. 0 = disabled |
+| — | `DYN_MIGRATION_RETRY_CONCURRENCY` | `0` | Optional process-wide cap for concurrent migrated retry streams. 0 = unlimited |
 | `--active-decode-blocks-threshold` | `DYN_ACTIVE_DECODE_BLOCKS_THRESHOLD` | — | KV cache utilization fraction (0.0–1.0) for busy detection. Setting a value independently enables this rejection check |
 | `--active-prefill-tokens-threshold` | `DYN_ACTIVE_PREFILL_TOKENS_THRESHOLD` | — | Absolute token count for prefill busy detection. Setting a value independently enables this rejection check |
 | `--active-prefill-tokens-threshold-frac` | `DYN_ACTIVE_PREFILL_TOKENS_THRESHOLD_FRAC` | — | Fraction of `max_num_batched_tokens` for prefill busy detection. Setting a value independently enables this rejection check and uses OR logic with the absolute threshold |

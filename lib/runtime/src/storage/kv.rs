@@ -374,11 +374,22 @@ impl Manager {
                             }
                         }
                     }
-                    event => {
-                        if let Err(err) = tx.send_timeout(event, WATCH_SEND_TIMEOUT).await {
-                            tracing::error!(bucket_name, %err, "KeyValueStoreManager.watch failed adding new key to channel");
+                    event => match tx.send_timeout(event, WATCH_SEND_TIMEOUT).await {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::SendTimeoutError::Closed(_)) => {
+                            tracing::debug!(
+                                bucket_name,
+                                "KeyValueStoreManager.watch receiver closed while adding new key; stopping watch task"
+                            );
+                            break;
                         }
-                    }
+                        Err(tokio::sync::mpsc::error::SendTimeoutError::Timeout(_)) => {
+                            tracing::error!(
+                                bucket_name,
+                                "KeyValueStoreManager.watch timed out adding new key to channel"
+                            );
+                        }
+                    },
                 }
             }
 

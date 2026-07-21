@@ -3,22 +3,22 @@
 
 """GMS server entry point.
 
-Launches one GMS server process per GPU serving every production GMS tag,
-then supervises them: terminates the rest if any child exits, and propagates
-the first non-zero exit code. Runs until SIGTERM (pod termination kills it)
+Launches one GMS server process per configured tag and GPU, then supervises
+them: terminates the rest if any child exits, and propagates the first non-zero
+exit code. Runs until SIGTERM (pod termination kills it)
 or until a child exits.
 """
 
 from __future__ import annotations
 
-import argparse
 import logging
+import os
 import signal
 import subprocess
 import sys
 import time
 
-from gpu_memory_service.common.vmm import VMMDeviceType, get_vmm, init_vmm
+from gpu_memory_service.common.vmm.cuda_utils import list_devices
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,16 +27,32 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def _child_command(device: int, device_type: str) -> list[str]:
-    """Command for one child process serving every production tag on one GPU."""
+_DEFAULT_TAGS = ("weights", "kv_cache")
+
+
+def _tags_from_env() -> tuple[str, ...]:
+    raw = os.environ.get("GMS_SERVER_TAGS")
+    if not raw:
+        return _DEFAULT_TAGS
+    tags = tuple(tag.strip() for tag in raw.split(",") if tag.strip())
+    if not tags:
+        raise RuntimeError("GMS_SERVER_TAGS must contain at least one tag")
+    return tags
+
+
+def _child_command(device: int, tag: str | None = None) -> list[str]:
+    command = [sys.executable, "-m", "gpu_memory_service", "--device", str(device)]
+    if tag is not None:
+        command.extend(("--tag", tag))
+    return command
+
+
+def _directory_command(socket_path: str) -> list[str]:
     return [
         sys.executable,
         "-m",
-        "gpu_memory_service",
-        "--device",
-        str(device),
-        "--device-type",
-        device_type,
+        "gms_kv_ring.daemon.directory_server",
+        socket_path,
     ]
 
 
@@ -59,32 +75,22 @@ def _supervise(processes: list[subprocess.Popen]) -> int:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="GPU Memory Service supervisor (one server per (device, tag))."
-    )
-    parser.add_argument(
-        "--device-type",
-        type=str,
-        default=VMMDeviceType.CUDA.value,
-        choices=[d.value for d in VMMDeviceType],
-        help="VMM device type forwarded to server (default: cuda).",
-    )
-    args = parser.parse_args()
-
-    init_vmm(VMMDeviceType.from_str(args.device_type))
-    vmm = get_vmm()
-    vmm.ensure_initialized()
-    devices = vmm.list_devices()
     processes = []
-    for device in devices:
-        proc = subprocess.Popen(_child_command(device, args.device_type))
+    directory_socket = os.environ.get("GMS_DIRECTORY_SOCKET")
+    if directory_socket:
+        proc = subprocess.Popen(_directory_command(directory_socket))
         logger.info(
-            "Started GMS device=%d device_type=%s pid=%d",
-            device,
-            args.device_type,
+            "Started GMS content directory socket=%s pid=%d",
+            directory_socket,
             proc.pid,
         )
         processes.append(proc)
+
+    for device in list_devices():
+        for tag in _tags_from_env():
+            proc = subprocess.Popen(_child_command(device, tag))
+            logger.info("Started GMS device=%d tag=%s pid=%d", device, tag, proc.pid)
+            processes.append(proc)
 
     def terminate(*_args) -> None:
         _terminate_all(processes)

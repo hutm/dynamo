@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 from contextlib import contextmanager
 from typing import Optional
 
@@ -27,6 +28,7 @@ logger = logging.getLogger(__name__)
 _torch_memory_saver_patched = False
 _model_runner_patched = False
 _static_state_patched = False
+_kv_pool_geometry_patched = False
 
 
 def patch_torch_memory_saver() -> None:
@@ -163,97 +165,352 @@ def patch_model_runner() -> None:
     if hasattr(ModelRunner, "_gms_patched"):
         return
 
-    original_init_memory_pool = ModelRunner.init_memory_pool
-    memory_arg_name = next(
-        (
-            name
-            for name in inspect.signature(original_init_memory_pool).parameters
-            if name != "self"
-        ),
-        None,
-    )
+    original_load_model = ModelRunner.load_model
 
-    def patched_init_memory_pool(self, *args, **kwargs):
-        """Patch memory baseline for SGLang old/new init_memory_pool signatures."""
+    def _gms_preloaded_weights_gib():
         impl = get_gms_memory_saver_impl()
-        preloaded_weights_gib = 0.0
-        if impl is not None:
-            preloaded_weights_gib = impl.preloaded_weights_bytes / (1 << 30)
+        if impl is None:
+            return 0.0, None
+        return impl.preloaded_weights_bytes / (1 << 30), impl
 
-        if preloaded_weights_gib > 0 and memory_arg_name in (
-            "pre_model_load_memory",
-            "total_gpu_memory",
-        ):
-            if args:
-                old_value = args[0]
-                new_value = (
-                    old_value + preloaded_weights_gib
-                    if isinstance(old_value, (int, float))
-                    else old_value
-                )
-                args = (new_value,) + args[1:]
-            elif memory_arg_name in kwargs:
-                old_value = kwargs[memory_arg_name]
-                new_value = (
-                    old_value + preloaded_weights_gib
-                    if isinstance(old_value, (int, float))
-                    else old_value
-                )
-                kwargs = dict(kwargs)
-                kwargs[memory_arg_name] = new_value
-            else:
-                old_value = None
-                new_value = None
+    # SGLang moved the pre-model-load memory baseline used for KV pool sizing.
+    #  * Newer SGLang: ModelRunner.alloc_memory_pool() reads it from the instance
+    #    attribute self.pre_model_load_memory (no scalar arg).
+    #  * Older SGLang: ModelRunner.init_memory_pool(pre_model_load_memory=...) took
+    #    it as a positional/keyword arg.
+    # In both cases GMS must inflate that baseline by the size of the weights it
+    # preloaded out-of-band, so the KV configurator doesn't over-provision KV over
+    # memory that GMS-held weights already occupy.
+    if hasattr(ModelRunner, "alloc_memory_pool"):
+        original_alloc_memory_pool = ModelRunner.alloc_memory_pool
 
-            if isinstance(old_value, (int, float)) and isinstance(
-                new_value, (int, float)
-            ):
+        def patched_alloc_memory_pool(self, *args, **kwargs):
+            """Inflate self.pre_model_load_memory by GMS-preloaded weights before the
+            KV configurator reads it (newer SGLang alloc_memory_pool API)."""
+            preloaded_weights_gib, impl = _gms_preloaded_weights_gib()
+            baseline = getattr(self, "pre_model_load_memory", None)
+            if preloaded_weights_gib > 0 and isinstance(baseline, (int, float)):
+                self.pre_model_load_memory = baseline + preloaded_weights_gib
                 logger.info(
-                    "[GMS] Adjusted %s for preloaded weights: "
+                    "[GMS] Adjusted pre_model_load_memory for preloaded weights: "
                     "%.2f GiB + %.2f GiB = %.2f GiB",
-                    memory_arg_name,
-                    old_value,
+                    baseline,
                     preloaded_weights_gib,
-                    new_value,
+                    self.pre_model_load_memory,
                 )
-            else:
+            elif impl is not None and impl.imported_weights_bytes > 0:
                 logger.info(
-                    "[GMS] Could not adjust %s for preloaded weights; value=%r",
-                    memory_arg_name,
-                    old_value,
+                    "[GMS] Leaving pre_model_load_memory unchanged; weights were "
+                    "loaded by this process"
                 )
-        elif impl is not None and impl.imported_weights_bytes > 0:
-            if preloaded_weights_gib > 0:
-                logger.info(
-                    "[GMS] Leaving %s unchanged; unsupported SGLang "
-                    "init_memory_pool signature for preloaded weights",
-                    memory_arg_name,
-                )
-            else:
+            return original_alloc_memory_pool(self, *args, **kwargs)
+
+        ModelRunner.alloc_memory_pool = patched_alloc_memory_pool
+        _pool_method = "alloc_memory_pool"
+    else:
+        original_init_memory_pool = ModelRunner.init_memory_pool
+        memory_arg_name = next(
+            (
+                name
+                for name in inspect.signature(original_init_memory_pool).parameters
+                if name != "self"
+            ),
+            None,
+        )
+
+        def patched_init_memory_pool(self, *args, **kwargs):
+            """Patch memory baseline for older SGLang init_memory_pool signatures."""
+            preloaded_weights_gib, impl = _gms_preloaded_weights_gib()
+
+            if preloaded_weights_gib > 0 and memory_arg_name in (
+                "pre_model_load_memory",
+                "total_gpu_memory",
+            ):
+                if args:
+                    old_value = args[0]
+                    new_value = (
+                        old_value + preloaded_weights_gib
+                        if isinstance(old_value, (int, float))
+                        else old_value
+                    )
+                    args = (new_value,) + args[1:]
+                elif memory_arg_name in kwargs:
+                    old_value = kwargs[memory_arg_name]
+                    new_value = (
+                        old_value + preloaded_weights_gib
+                        if isinstance(old_value, (int, float))
+                        else old_value
+                    )
+                    kwargs = dict(kwargs)
+                    kwargs[memory_arg_name] = new_value
+                else:
+                    old_value = None
+                    new_value = None
+
+                if isinstance(old_value, (int, float)) and isinstance(
+                    new_value, (int, float)
+                ):
+                    logger.info(
+                        "[GMS] Adjusted %s for preloaded weights: "
+                        "%.2f GiB + %.2f GiB = %.2f GiB",
+                        memory_arg_name,
+                        old_value,
+                        preloaded_weights_gib,
+                        new_value,
+                    )
+                else:
+                    logger.info(
+                        "[GMS] Could not adjust %s for preloaded weights; value=%r",
+                        memory_arg_name,
+                        old_value,
+                    )
+            elif impl is not None and impl.imported_weights_bytes > 0:
                 logger.info(
                     "[GMS] Leaving %s unchanged; weights were loaded by this process",
                     memory_arg_name,
                 )
 
-        return original_init_memory_pool(self, *args, **kwargs)
+            return original_init_memory_pool(self, *args, **kwargs)
 
-    ModelRunner.init_memory_pool = patched_init_memory_pool
+        ModelRunner.init_memory_pool = patched_init_memory_pool
+        _pool_method = "init_memory_pool"
+
+    def patched_load_model(self, *args, **kwargs):
+        result = original_load_model(self, *args, **kwargs)
+        impl = get_gms_memory_saver_impl()
+        if impl is not None:
+            impl.finalize_pending_write_mode()
+        return result
+
+    ModelRunner.load_model = patched_load_model
     ModelRunner._gms_patched = True
     _model_runner_patched = True
-    logger.info("[GMS] Patched ModelRunner.init_memory_pool")
+    logger.info(
+        "[GMS] Patched ModelRunner load finalization and KV sizing (%s)", _pool_method
+    )
+
+
+def patch_shared_kv_pool_geometry() -> None:
+    """Make shared-GMS SGLang workers agree on KV page geometry.
+
+    SGLang sizes KV from a local free-memory profile. With GMS shared KV,
+    the first worker owns the persistent physical pool and later workers
+    reattach to it. Later workers must therefore use the first worker's page
+    count instead of their smaller post-attach free-memory profile.
+    """
+    global _kv_pool_geometry_patched
+    if _kv_pool_geometry_patched:
+        return
+
+    try:
+        from gpu_memory_service.integrations.common.kv_lease_client import (
+            kv_leases_enabled,
+            resolve_kv_lease_namespace_total_blocks,
+            resolve_lease_device,
+        )
+        from gpu_memory_service.integrations.sglang.kv_identity import shared_kv_enabled
+    except ImportError:
+        logger.warning("[GMS] Could not import SGLang KV geometry hooks", exc_info=True)
+        return
+
+    # SGLang relocated _resolve_memory_pool_config: newer builds define it on
+    # KVCacheConfigurator (sglang.srt.mem_cache.kv_cache_configurator); older
+    # builds had it on ModelRunnerKVCacheMixin (sglang.srt.model_executor).
+    # Patch whichever exists so shadow reattach geometry is pinned either way.
+    target_cls = None
+    try:
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        if hasattr(KVCacheConfigurator, "_resolve_memory_pool_config"):
+            target_cls = KVCacheConfigurator
+    except ImportError:
+        pass
+    if target_cls is None:
+        try:
+            from sglang.srt.model_executor import model_runner_kv_cache_mixin as mixin
+
+            if hasattr(mixin.ModelRunnerKVCacheMixin, "_resolve_memory_pool_config"):
+                target_cls = mixin.ModelRunnerKVCacheMixin
+        except ImportError:
+            pass
+    if target_cls is None:
+        logger.warning(
+            "[GMS] Could not locate SGLang _resolve_memory_pool_config; shadow "
+            "reattach KV geometry will NOT be pinned"
+        )
+        return
+
+    if hasattr(target_cls, "_gms_shared_kv_pool_geometry_patched"):
+        _kv_pool_geometry_patched = True
+        return
+
+    original_resolve = target_cls._resolve_memory_pool_config
+
+    def patched_resolve_memory_pool_config(self, pre_model_load_memory):
+        config = original_resolve(self, pre_model_load_memory)
+
+        if not shared_kv_enabled() or not kv_leases_enabled("sglang"):
+            return config
+
+        page_size = int(self.server_args.page_size)
+        proposed_pages = int(config.max_total_num_tokens) // page_size
+        if proposed_pages <= 0:
+            return config
+
+        device_idx = _resolve_shared_kv_geometry_device(self, resolve_lease_device)
+        model_id = (
+            getattr(self.server_args, "served_model_name", None)
+            or getattr(self.server_args, "model_path", None)
+            or "model"
+        )
+        dynamo_namespace = (
+            os.environ.get("DYN_NAMESPACE")
+            or os.environ.get("DYN_PARENT_DGD_K8S_NAME")
+            or "default"
+        )
+        suffix = (
+            f"shared:{dynamo_namespace}:"
+            f"model{model_id}:page{page_size}"
+        )
+        namespace, total_blocks = resolve_kv_lease_namespace_total_blocks(
+            "sglang",
+            device_idx,
+            total_blocks=proposed_pages + 1,
+            namespace_suffix=suffix,
+            reserved_blocks=[0],
+        )
+        target_pages = int(total_blocks) - 1
+        if target_pages == proposed_pages:
+            return config
+
+        # Clamp the KV pool to the shared page count and re-derive every dependent
+        # pool size deterministically from the pinned token count. This is
+        # critical: the persistent GMS allocation covers both the token_to_kv_pool
+        # (sized by max_total_num_tokens) AND the req_to_token_pool (sized by
+        # max_running_requests). Both must therefore be pure functions of the
+        # shared token count so the primary and every shadow build byte-identical
+        # persistent allocations (else claim_persistent fails on a size mismatch).
+        # Mirror SGLang's own _resolve_memory_pool_config finalize sequence.
+        target_tokens = target_pages * page_size
+        config.max_total_num_tokens = target_tokens
+        resolve_reqs = getattr(self, "resolve_max_num_reqs", None) or getattr(
+            self, "_resolve_max_num_reqs", None
+        )
+        if resolve_reqs is not None:
+            config.max_running_requests = resolve_reqs(target_tokens)
+        try:
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            configurator = create_memory_pool_configurator(self)
+            finalize = getattr(
+                configurator, "finalize_with_max_running_requests", None
+            )
+            if finalize is not None:
+                config = finalize(config)
+        except Exception:
+            logger.debug(
+                "[GMS] pool finalize after geometry clamp skipped", exc_info=True
+            )
+        if hasattr(config, "mem_fraction_static"):
+            config.mem_fraction_static = self.server_args.mem_fraction_static
+        logger.info(
+            "[GMS] Adjusted SGLang shared KV geometry from %d pages to %d "
+            "pages (namespace=%s)",
+            proposed_pages,
+            target_pages,
+            namespace,
+        )
+        return config
+
+    target_cls._resolve_memory_pool_config = patched_resolve_memory_pool_config
+    target_cls._gms_shared_kv_pool_geometry_patched = True
+    _kv_pool_geometry_patched = True
+    logger.info(
+        "[GMS] Patched SGLang shared KV pool geometry (%s)", target_cls.__name__
+    )
+
+
+def _resolve_shared_kv_geometry_device(runner, resolve_lease_device_fn) -> int:
+    explicit = os.environ.get("GMS_SGLANG_KV_LEASE_DEVICE")
+    if explicit is not None:
+        try:
+            return int(explicit)
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid GMS_SGLANG_KV_LEASE_DEVICE=%r for SGLang KV geometry",
+                explicit,
+            )
+
+    gpu_id = getattr(runner, "gpu_id", None)
+    if gpu_id is not None:
+        try:
+            return int(gpu_id)
+        except (TypeError, ValueError):
+            logger.debug("Unable to parse SGLang runner.gpu_id=%r", gpu_id)
+
+    return int(resolve_lease_device_fn("GMS_SGLANG_KV_LEASE_DEVICE"))
+
+
+_serving_timeout_patched = False
+
+
+def patch_serving_collective_timeout_for_gms() -> None:
+    """Tighten the NCCL collective watchdog to the serving timeout once SGLang is past
+    warmup. Model load + CUDA-graph capture (the heavy/slow collectives) happen in
+    ``Scheduler.__init__``, BEFORE ``run_event_loop``; wrapping ``run_event_loop`` entry
+    therefore applies the low serving timeout only after warmup, in every rank's
+    scheduler process — the precise post-warmup hook for SGLang, analogous to vLLM's
+    ``GMSWorker.compile_or_warm_up_model``. No grace-delay heuristic, so a tight 2-3s
+    serving timeout can never fire during warmup. No-op unless
+    DYN_GMS_SERVING_NCCL_TIMEOUT_S>0 (checked inside ``tighten_now``).
+    """
+    global _serving_timeout_patched
+    if _serving_timeout_patched:
+        return
+    try:
+        from sglang.srt.managers.scheduler import Scheduler
+    except ImportError:
+        logger.debug(
+            "[GMS] Could not import SGLang Scheduler, skipping serving-timeout patch"
+        )
+        return
+    if getattr(Scheduler, "_gms_serving_timeout_patched", False):
+        _serving_timeout_patched = True
+        return
+
+    original_run_event_loop = Scheduler.run_event_loop
+
+    def patched_run_event_loop(self, *args, **kwargs):
+        # First (and only) entry == post-warmup, pre-traffic: tighten now.
+        try:
+            from gpu_memory_service.common.serving_timeout import tighten_now
+
+            tighten_now()
+        except Exception:
+            logger.debug("[GMS serving-timeout] sglang tighten failed", exc_info=True)
+        return original_run_event_loop(self, *args, **kwargs)
+
+    Scheduler.run_event_loop = patched_run_event_loop
+    Scheduler._gms_serving_timeout_patched = True
+    _serving_timeout_patched = True
+    logger.info(
+        "[GMS serving-timeout] patched SGLang Scheduler.run_event_loop "
+        "(post-warmup collective-timeout tighten)"
+    )
 
 
 def patch_static_state_for_gms() -> None:
     """No-op SGLang's _export/_import_static_state when using GMS.
 
-    SGLang's release_memory_occupation clones every named buffer via
-    buffer.detach().clone() through the default CUDA allocator, then restores
-    them during resume_memory_occupation.
-    This patch must run inside the scheduler child process (which uses
-    multiprocessing spawn).  It is triggered by the GMSModelLoader import
-    in model_loader.py, which executes at module level in the child.
+    SGLang's release_memory_occupation clones every named buffer through the
+    default CUDA allocator, then restores them during resume_memory_occupation.
+    GMS preserves the same VAs across unmap/remap, so this static-state backup
+    is unnecessary and can fail after VMM remap. This patch must run inside the
+    scheduler child process, where the weight updater module is imported.
     """
-    import os
+    import importlib
 
     global _static_state_patched
     logger.info(
@@ -264,26 +521,48 @@ def patch_static_state_for_gms() -> None:
     if _static_state_patched:
         return
 
-    try:
-        from sglang.srt.managers import scheduler_update_weights_mixin as _mixin
+    def _export_noop(model):
+        """NO-OP: GMS preserves buffers via VA-stable unmap/remap."""
+        return dict(buffers=[])
 
-        def _export_noop(model):
-            """NO-OP: GMS preserves buffers via VA-stable unmap/remap."""
-            return dict(buffers=[])
+    def _import_noop(model, static_params):
+        """NO-OP: GMS preserves buffers via VA-stable unmap/remap."""
+        pass
 
-        def _import_noop(model, static_params):
-            """NO-OP: GMS preserves buffers via VA-stable unmap/remap."""
-            pass
+    module_names = (
+        "sglang.srt.managers.scheduler_components.weight_updater",
+        "sglang.srt.managers.scheduler_update_weights_mixin",
+    )
+    patched_modules: list[str] = []
+    for module_name in module_names:
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            logger.debug(
+                "[GMS] %s unavailable; static-state patch skipped", module_name
+            )
+            continue
 
-        _mixin._export_static_state = _export_noop
-        _mixin._import_static_state = _import_noop
+        if not hasattr(module, "_export_static_state") or not hasattr(
+            module, "_import_static_state"
+        ):
+            logger.debug(
+                "[GMS] %s has no static-state helpers; patch skipped",
+                module_name,
+            )
+            continue
+
+        module._export_static_state = _export_noop
+        module._import_static_state = _import_noop
+        patched_modules.append(module_name)
+
+    if patched_modules:
         _static_state_patched = True
         logger.info(
-            "[GMS] Patched _export/_import_static_state -> no-op (pid=%d)",
+            "[GMS] Patched SGLang static-state helpers -> no-op modules=%s pid=%d",
+            patched_modules,
             os.getpid(),
         )
-    except Exception:
-        logger.warning(
-            "[GMS] Could not patch scheduler_update_weights_mixin: ",
-            exc_info=True,
-        )
+        return
+
+    logger.info("[GMS] no SGLang static-state helper module available to patch")

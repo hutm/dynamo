@@ -23,11 +23,17 @@ from gpu_memory_service.integrations.common.utils import (
     setup_meta_tensor_workaround,
     strip_gms_model_loader_config,
 )
+from gpu_memory_service.integrations.sglang import (
+    install_gms_radix_cache,
+    install_kv_leases,
+)
 from gpu_memory_service.integrations.sglang.memory_saver import (
     get_gms_memory_saver_impl,
 )
 from gpu_memory_service.integrations.sglang.patches import (
     patch_model_runner,
+    patch_serving_collective_timeout_for_gms,
+    patch_shared_kv_pool_geometry,
     patch_static_state_for_gms,
     patch_torch_memory_saver,
 )
@@ -42,7 +48,11 @@ logger = logging.getLogger(__name__)
 patch_empty_cache()
 patch_torch_memory_saver()
 patch_model_runner()
+patch_shared_kv_pool_geometry()
 patch_static_state_for_gms()
+patch_serving_collective_timeout_for_gms()
+install_kv_leases.install()
+install_gms_radix_cache.install()
 logger.info("[GMS] Applied patches")
 
 
@@ -94,7 +104,12 @@ class GMSModelLoader:
             device_config=device_config,
         )
 
-        impl.finalize_write_mode(model)
+        # ModelRunner owns the outer torch_memory_saver weights region. A
+        # finalization here would reconnect the GMS allocator read-only while
+        # that region is still active, routing private buffer clones through a
+        # read-only GMS pool and surfacing as a false CUDA OOM. The ModelRunner
+        # patch publishes immediately after the region exits.
+        impl.defer_finalize_write_mode(model)
         return model
 
     def _load_import_only(self, model_config, device_config, impl) -> torch.nn.Module:

@@ -898,6 +898,18 @@ class ModelRuntimeConfig:
         """Set structural tag schema mode ("auto" or "strict")."""
         ...
 
+    def set_gms_daemon_socket(self, daemon_socket: str) -> None:
+        """Advertise this worker's GMS KV daemon socket for router orchestration."""
+        ...
+
+    def set_gms_placement_enabled(self) -> None:
+        """Advertise that this worker publishes GMS placements."""
+        ...
+
+    def set_gms_control_enabled(self) -> None:
+        """Deprecated alias for set_gms_placement_enabled."""
+        ...
+
     def set_disaggregated_endpoint(
             self,
             bootstrap_host: str | None = None,
@@ -1209,6 +1221,26 @@ class KvEventPublisher:
         Args:
             block_hashes: List of block hashes to remove (signed 64-bit integers)
         """
+        ...
+
+    def publish_gms_placement_stored(
+        self,
+        source_nixl_agent_name: str,
+        source_nixl_agent_metadata_hex: str,
+        blocks: List[Dict[str, Any]],
+        source_nixl_ip: Optional[str] = None,
+        source_nixl_listen_port: Optional[int] = None,
+        dp_rank: Optional[int] = None,
+    ) -> None:
+        """Publish GMS placement descriptors through the KV event plane."""
+        ...
+
+    def publish_gms_placement_removed(
+        self,
+        content_hashes_hex: List[str],
+        dp_rank: Optional[int] = None,
+    ) -> None:
+        """Remove GMS placement descriptors from the router's event-plane index."""
         ...
 
     def shutdown(self) -> None:
@@ -1870,6 +1902,7 @@ class KvRouterConfig:
         overlap_score_credit_decay: float = 0.0,
         prefill_load_scale: float = 1.0,
         router_policy_config: Optional[str] = None,
+        router_gms_decode_transfer: bool = False,
     ) -> None:
         """
         Create a KV router configuration.
@@ -1891,6 +1924,7 @@ class KvRouterConfig:
             router_assume_kv_reuse: Assume KV cache reuse when tracking active blocks (default: True).
                 When True, computes actual block hashes. When False, generates random hashes.
             router_track_prefill_tokens: Include prompt-side prefill tokens in active load accounting (default: True).
+            router_gms_decode_transfer: Enable experimental GMS decode-to-decode transfer orchestration (default: False).
             router_prefill_load_model: Prompt-side prefill load model (default: "none").
                 "none" keeps static prompt load accounting.
                 "aic" decays the oldest active prefill request using AIC-predicted duration.
