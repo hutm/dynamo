@@ -5,7 +5,7 @@ import pytest
 
 from dynamo import gms_router_policy
 from dynamo.gms_router_policy import (
-    DynamoGmsPlacementPublisher,
+
     maybe_fetch_gms_placement,
 )
 
@@ -56,83 +56,7 @@ def test_router_gms_decode_transfer_arg_can_opt_in():
     assert config.kv_router_kwargs()["router_gms_decode_transfer"] is True
 
 
-class _FakeKvPublisher:
-    def __init__(self):
-        self.stored = []
-        self.removed = []
-
-    def publish_gms_placement_stored(self, *args, **kwargs):
-        self.stored.append((args, kwargs))
-
-    def publish_gms_placement_removed(self, *args, **kwargs):
-        self.removed.append((args, kwargs))
-
-
-def test_dynamo_gms_placement_publisher_normalizes_descriptor():
-    fake = _FakeKvPublisher()
-    publisher = DynamoGmsPlacementPublisher(fake, dp_rank=2)
-
-    publisher.publish_stored(
-        bytes.fromhex("aa" * 32),
-        "host_pinned",
-        64,
-        metadata={
-            "source_nixl_agent_name": "agent-a",
-            "source_nixl_agent_metadata_hex": "abcd",
-            "source_nixl_ip": "10.0.0.1",
-            "source_nixl_listen_port": "5555",
-            "gms_descriptor": {
-                "ptr": "1234",
-                "size": "64",
-                "tier": "host",
-                "generation": "7",
-                "ranges": [
-                    {
-                        "ptr": "1234",
-                        "size": "64",
-                        "tier": "host",
-                        "layer": "3",
-                        "offset": "8",
-                    }
-                ],
-            },
-        },
-    )
-
-    assert len(fake.stored) == 1
-    args, kwargs = fake.stored[0]
-    assert args[0] == "agent-a"
-    assert args[1] == "abcd"
-    assert args[2][0]["content_hash_hex"] == "aa" * 32
-    descriptor = args[2][0]["descriptor"]
-    assert descriptor["remote_ptr"] == 1234
-    assert descriptor["generation"] == 7
-    assert descriptor["ranges"][0]["layer"] == 3
-    assert kwargs == {
-        "source_nixl_ip": "10.0.0.1",
-        "source_nixl_listen_port": 5555,
-        "dp_rank": 2,
-    }
-
-
-def test_dynamo_gms_placement_publisher_drops_missing_metadata():
-    fake = _FakeKvPublisher()
-    publisher = DynamoGmsPlacementPublisher(fake)
-
-    publisher.publish_stored(
-        bytes.fromhex("bb" * 32),
-        "host_pinned",
-        64,
-        metadata={"gms_descriptor": {"remote_ptr": 1, "size": 64}},
-    )
-
-    assert fake.stored == []
-
-
-def test_dynamo_gms_placement_publisher_removes_hash():
-    fake = _FakeKvPublisher()
-    publisher = DynamoGmsPlacementPublisher(fake, dp_rank=1)
-
-    publisher.publish_removed(bytes.fromhex("cc" * 32), "host_pinned")
-
-    assert fake.removed == [((["cc" * 32],), {"dp_rank": 1})]
+# NOTE: GMS placement-router publishing was dropped when rebasing onto upstream
+# main (its indexer refactor is incompatible with our gms_placement threading).
+# DynamoGmsPlacementPublisher is retained as an inert no-op, so the descriptor-
+# normalization / publish tests that asserted event emission were removed.
