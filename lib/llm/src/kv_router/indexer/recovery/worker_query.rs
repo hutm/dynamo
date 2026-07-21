@@ -1008,13 +1008,13 @@ fn recovery_events_match_source(key: RecoveryKey, events: &[RouterEvent]) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kv_router::{Indexer, indexer::LowerTierIndexers};
-    use dynamo_kv_router::indexer::{
-        GmsPlacementIndex, KvIndexer, KvIndexerInterface, KvIndexerMetrics,
-    };
-    use dynamo_kv_router::protocols::{
-        ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData, KvCacheStoreData,
-        KvCacheStoredBlockData, LocalBlockHash, RouterEvent,
+    use async_trait::async_trait;
+    use dynamo_kv_router::{
+        indexer::{KvIndexer, KvIndexerInterface, KvIndexerMetrics, WorkerKvQueryRequest},
+        protocols::{
+            DpRank, ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData, KvCacheStoreData,
+            KvCacheStoredBlockData, LocalBlockHash, WorkerId, WorkerWithDpRank,
+        },
     };
     use dynamo_runtime::{
         DistributedRuntime, Runtime,
@@ -1219,7 +1219,6 @@ mod tests {
             Indexer::KvIndexer {
                 primary: indexer,
                 lower_tier: LowerTierIndexers::new(1, 4),
-                gms_placement: Arc::new(GmsPlacementIndex::new()),
                 approx: None,
                 primary_records_routing_decisions: false,
             },

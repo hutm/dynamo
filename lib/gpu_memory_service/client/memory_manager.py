@@ -664,7 +664,7 @@ class GMSClientMemoryManager:
         """Synchronize + unmap all VAs (real mappings AND scratch mappings).
         Preserves VA reservations for remap.
         """
-        cuda_synchronize()
+        self._vmm.synchronize()
 
         unmapped_count = 0
         total_bytes = 0

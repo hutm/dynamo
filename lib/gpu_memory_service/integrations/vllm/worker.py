@@ -35,7 +35,6 @@ from gpu_memory_service.integrations.common.utils import (
     get_gms_lock_mode,
     get_gms_persistent_kv_socket,
     get_gms_ro_connect_timeout_ms,
-    torch_device,
 )
 from gpu_memory_service.integrations.vllm.gds_connector_v1 import (
     register_gms_gds_connector,
@@ -345,7 +344,7 @@ class GMSWorker(Worker):
         on unmapped GMS memory). We unmap weights plus the persistent KV pool;
         GMS keeps the underlying physical KV pages alive for reconnect.
         """
-        free_bytes_before = torch_device().mem_get_info()[0]
+        free_bytes_before = torch.cuda.mem_get_info()[0]
 
         # Pause MX serving before GMS unmap
         mx_ctx = get_mx_load_context()
@@ -360,9 +359,9 @@ class GMSWorker(Worker):
             manager.abort()
 
         gc.collect()
-        torch_device().empty_cache()
+        torch.cuda.empty_cache()
 
-        free_bytes_after, total = torch_device().mem_get_info()
+        free_bytes_after, total = torch.cuda.mem_get_info()
         freed_bytes = free_bytes_after - free_bytes_before
         used_bytes = total - free_bytes_after
         logger.info(

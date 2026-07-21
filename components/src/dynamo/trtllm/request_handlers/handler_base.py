@@ -36,6 +36,8 @@ from tensorrt_llm.scheduling_params import SchedulingParams
 from dynamo._core import Client, Context
 from dynamo.common.backend import logprobs as _shared_logprobs
 from dynamo.common.gms_failover import release_attached_gms_failover_lock
+from dynamo.common.backend.engine import is_generation_stage
+from dynamo.common.constants import DisaggregationMode as CommonDisaggregationMode
 from dynamo.common.utils.structural_tag import serialize_structural_tag
 from dynamo.gms_router_policy import (
     maybe_fetch_gms_placement,

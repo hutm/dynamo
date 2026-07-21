@@ -74,41 +74,83 @@ impl<P: RouterEventSink + Send + Sync> RouterEventBatchSink for P {
     }
 }
 
-pub(super) async fn emit_router_event<P: RouterEventSink>(
-    publisher: &P,
-    local_indexer: &Option<Arc<LocalKvIndexer>>,
-    router_event: RouterEvent,
-) {
-    if let Some(indexer) = local_indexer
-        && let Err(e) = indexer.apply_event_with_buffer(router_event.clone()).await
-    {
-        tracing::warn!(
-            worker_id = router_event.worker_id,
-            error = %e,
-            "Failed to apply event to local indexer"
-        );
-    }
-    if let Err(e) = publisher.publish_event(&router_event).await {
-        tracing::error!(
-            worker_id = router_event.worker_id,
-            error = %e,
-            "Failed to publish event"
-        );
+impl RouterEventBatchSink for EventPlanePublisher {
+    async fn publish_events(&self, events: &[RouterEvent]) -> Result<()> {
+        let mut failures = PublishFailures::default();
+        for batch in event_plane_event_batches(
+            events,
+            MAX_EVENT_PLANE_KV_EVENTS_PER_BATCH,
+            MAX_EVENT_PLANE_KV_EVENT_BATCH_BLOCKS,
+        ) {
+            if let Err(error) = self.0.publish(&batch).await {
+                let first_event_id = batch.first().map(|event| event.event.event_id);
+                let last_event_id = batch.last().map(|event| event.event.event_id);
+                tracing::error!(
+                    transport = ?self.0.transport_kind(),
+                    event_count = batch.len(),
+                    ?first_event_id,
+                    ?last_event_id,
+                    error = %error,
+                    "Failed to publish KV event batch"
+                );
+                failures.record(batch.len(), error);
+            }
+        }
+        failures.into_result()
     }
 }
 
-pub(super) async fn emit<P: RouterEventSink>(
-    publisher: &P,
+/// Partition ordered events at event boundaries without exceeding either cap.
+/// A single event larger than the block cap is always emitted intact.
+pub(super) fn event_plane_event_batches(
+    events: &[RouterEvent],
+    max_events: usize,
+    max_blocks: usize,
+) -> impl Iterator<Item = &[RouterEvent]> {
+    let mut batch_start = 0;
+
+    std::iter::from_fn(move || {
+        if batch_start == events.len() {
+            return None;
+        }
+
+        let mut batch_end = batch_start;
+        let mut batch_blocks = 0usize;
+        while let Some(event) = events.get(batch_end) {
+            let batch_events = batch_end - batch_start;
+            let event_blocks = match &event.event.data {
+                KvCacheEventData::Stored(data) => data.blocks.len(),
+                KvCacheEventData::Removed(data) => data.block_hashes.len(),
+                KvCacheEventData::Cleared => 0,
+            };
+            if batch_events > 0
+                && (batch_events >= max_events
+                    || batch_blocks.saturating_add(event_blocks) > max_blocks)
+            {
+                break;
+            }
+            batch_blocks = batch_blocks.saturating_add(event_blocks);
+            batch_end += 1;
+        }
+
+        let batch = &events[batch_start..batch_end];
+        batch_start = batch_end;
+        Some(batch)
+    })
+}
+
+pub(super) async fn emit(
     local_indexer: &Option<Arc<LocalKvIndexer>>,
     worker_id: u64,
     storage_tier: StorageTier,
     event: KvCacheEvent,
     output: &mut Vec<RouterEvent>,
 ) {
-    emit_router_event(
-        publisher,
-        local_indexer,
-        RouterEvent::with_storage_tier(worker_id, event, storage_tier),
-    )
-    .await;
+    let router_event = RouterEvent::with_storage_tier(worker_id, event, storage_tier);
+    if let Some(indexer) = local_indexer
+        && let Err(e) = indexer.apply_event_with_buffer(router_event.clone()).await
+    {
+        tracing::warn!(worker_id, error = %e, "Failed to apply event to local indexer");
+    }
+    output.push(router_event);
 }
