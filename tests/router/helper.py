@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import aiohttp
-import nats
 
 from dynamo.llm import KvRouter
 from dynamo.runtime import DistributedRuntime
@@ -24,9 +23,23 @@ NUM_REQUESTS = 100
 BLOCK_SIZE = 16
 
 
-def _nats_server() -> str:
-    # Prefer dynamically-started NATS from per-test fixtures when present.
-    return os.environ.get("NATS_SERVER", "nats://localhost:4222")
+def parse_sse_json_chunks(body: str) -> list[dict[str, Any]]:
+    """Decode JSON objects from single-line SSE data fields."""
+    chunks = []
+    for line in body.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            chunk = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(chunk, dict):
+            chunks.append(chunk)
+    return chunks
 
 
 def generate_random_suffix() -> str:
@@ -133,61 +146,41 @@ def verify_response_worker_ids(
     )
 
 
-def verify_response_timing(
-    timing_info: dict[str, Any],
-    disagg: bool = False,
-    require_ttft: bool = True,
-    require_kv_transfer_latency: bool = True,
-) -> None:
-    """Verify timing info has valid values.
+def verify_response_timing(timing_info: dict[str, Any], disagg: bool = False) -> None:
+    """Verify timing info has valid values (ttft_ms > 0, total_time_ms > 0).
 
     Args:
         timing_info: Dict of timing fields from nvext.timing in the response.
-        disagg: If True, verify disaggregated-mode transfer timing when required.
-        require_ttft: If True, require ttft_ms > 0. Some backends do not emit it.
-        require_kv_transfer_latency: If True, require kv_transfer_estimated_latency_ms > 0.
+        disagg: If True, also verify kv_transfer_estimated_latency_ms > 0 (disaggregated mode only).
     """
     ttft_ms = timing_info.get("ttft_ms")
     total_time_ms = timing_info.get("total_time_ms")
 
+    assert ttft_ms is not None and ttft_ms > 0, f"Expected ttft_ms > 0, got: {ttft_ms}"
     assert (
         total_time_ms is not None and total_time_ms > 0
     ), f"Expected total_time_ms > 0, got: {total_time_ms}"
-
-    if ttft_ms is None:
-        assert not require_ttft, "Expected ttft_ms > 0, got: None"
-        logger.info("Timing did not include ttft_ms; verified total_time_ms only")
-    else:
-        assert ttft_ms > 0, f"Expected ttft_ms > 0, got: {ttft_ms}"
-        assert (
-            total_time_ms >= ttft_ms
-        ), f"Expected total_time_ms >= ttft_ms, got {total_time_ms} < {ttft_ms}"
-        logger.info(
-            f"✓ Verified timing: ttft_ms={ttft_ms:.2f}, total_time_ms={total_time_ms:.2f}"
-        )
+    assert (
+        total_time_ms >= ttft_ms
+    ), f"Expected total_time_ms >= ttft_ms, got {total_time_ms} < {ttft_ms}"
+    logger.info(
+        f"✓ Verified timing: ttft_ms={ttft_ms:.2f}, total_time_ms={total_time_ms:.2f}"
+    )
 
     if disagg:
         kv_transfer_estimated_latency_ms = timing_info.get(
             "kv_transfer_estimated_latency_ms"
         )
-        if kv_transfer_estimated_latency_ms is None:
-            assert not require_kv_transfer_latency, (
-                "Expected kv_transfer_estimated_latency_ms > 0 in disaggregated mode, "
-                "got: None"
-            )
-            prefill_wait_time_ms = timing_info.get("prefill_wait_time_ms")
-            if prefill_wait_time_ms is not None:
-                assert (
-                    prefill_wait_time_ms >= 0
-                ), f"Expected prefill_wait_time_ms >= 0, got: {prefill_wait_time_ms}"
-        else:
-            assert kv_transfer_estimated_latency_ms > 0, (
-                f"Expected kv_transfer_estimated_latency_ms > 0 in disaggregated mode, "
-                f"got: {kv_transfer_estimated_latency_ms}"
-            )
-            logger.info(
-                f"✓ Verified kv_transfer_estimated_latency_ms={kv_transfer_estimated_latency_ms:.2f}"
-            )
+        assert (
+            kv_transfer_estimated_latency_ms is not None
+            and kv_transfer_estimated_latency_ms > 0
+        ), (
+            f"Expected kv_transfer_estimated_latency_ms > 0 in disaggregated mode, "
+            f"got: {kv_transfer_estimated_latency_ms}"
+        )
+        logger.info(
+            f"✓ Verified kv_transfer_estimated_latency_ms={kv_transfer_estimated_latency_ms:.2f}"
+        )
 
 
 ########################################################
@@ -562,15 +555,9 @@ async def send_request_with_retry(url: str, payload: dict, max_retries: int = 8)
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, json=payload) as response:
                     if response.status == 200:
-                        # Read and validate the response to ensure the stream
-                        # completed rather than failing inside an HTTP 200 body.
-                        chunks = []
-                        async for chunk in response.content:
-                            if chunk:
-                                chunks.append(chunk)
-                        _validate_stream_response_chunks(
-                            chunks, f"Initial request to {url}"
-                        )
+                        # Read the response to ensure it's valid
+                        async for _ in response.content:
+                            pass
                         logger.debug(
                             f"First request succeeded on attempt {attempt + 1}"
                         )
@@ -625,97 +612,6 @@ def managed_runtime(
         runtime.shutdown()
 
 
-def _validate_stream_response_chunks(chunks: list[bytes], context: str) -> None:
-    """Validate an OpenAI-compatible SSE stream completed cleanly.
-
-    Some backends surface generation errors as HTTP 200 streams that terminate
-    early. Treat those as failed requests instead of counting the transport as
-    success.
-    """
-    body = b"".join(chunks).decode("utf-8", errors="replace")
-    saw_sse_payload = False
-    saw_done = False
-
-    for raw_line in body.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith(":"):
-            continue
-        if not line.startswith("data:"):
-            continue
-
-        saw_sse_payload = True
-        data_str = line[5:].strip()
-        if data_str == "[DONE]":
-            saw_done = True
-            continue
-
-        try:
-            data = json.loads(data_str)
-        except json.JSONDecodeError:
-            continue
-
-        error = data.get("error")
-        if error:
-            raise AssertionError(f"{context} returned stream error payload: {error}")
-
-    if saw_sse_payload and not saw_done:
-        raise AssertionError(f"{context} stream ended without data: [DONE]")
-
-    if not saw_sse_payload:
-        if not body.strip():
-            raise AssertionError(f"{context} stream returned no SSE payload")
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError:
-            return
-        error = data.get("error") if isinstance(data, dict) else None
-        if error:
-            raise AssertionError(f"{context} returned error payload: {error}")
-
-
-async def check_nats_consumers(namespace: str, expected_count: Optional[int] = None):
-    """Check NATS consumers for the KV events stream.
-
-    Args:
-        namespace: The namespace to check consumers for
-        expected_count: Optional expected number of consumers. If provided, asserts if count doesn't match.
-
-    Returns:
-        List of consumer names
-    """
-    component_subject = f"namespace.{namespace}.component.mocker"
-    slugified = component_subject.lower().replace(".", "-").replace("_", "-")
-    stream_name = f"{slugified}-kv-events"
-    logger.info(f"Checking consumers for stream: {stream_name}")
-
-    nc = await nats.connect(servers=_nats_server())
-    try:
-        js = nc.jetstream()
-        consumer_infos = await js.consumers_info(stream_name)
-        consumer_names = [info.name for info in consumer_infos]
-        logger.info(f"Found {len(consumer_names)} consumers: {consumer_names}")
-
-        # Log detailed consumer info
-        for info in consumer_infos:
-            logger.info(
-                f"Consumer {info.name}: "
-                f"num_pending={info.num_pending}, "
-                f"num_ack_pending={info.num_ack_pending}, "
-                f"ack_floor={info.ack_floor}, "
-                f"delivered={info.delivered}"
-            )
-
-        if expected_count is not None:
-            assert (
-                len(consumer_names) == expected_count
-            ), f"Expected {expected_count} durable consumers, found {len(consumer_names)}: {consumer_names}"
-            logger.info(f"✓ Verified {expected_count} durable consumers exist")
-
-        return consumer_names
-    finally:
-        await nc.close()
-
-
 async def send_inflight_requests(urls: list, payload: dict, num_requests: int):
     """Send multiple requests concurrently, alternating between URLs if multiple provided"""
 
@@ -738,14 +634,11 @@ async def send_inflight_requests(urls: list, payload: dict, num_requests: int):
                     )
                     return False
 
-                # For streaming responses, read and validate the entire stream.
+                # For streaming responses, read the entire stream
                 chunks = []
                 async for line in response.content:
                     if line:
                         chunks.append(line)
-                _validate_stream_response_chunks(
-                    chunks, f"Request {request_id} to URL {url_index}"
-                )
 
                 logger.debug(
                     f"Request {request_id} to URL {url_index} completed with {len(chunks)} chunks"

@@ -11,6 +11,7 @@ or until a child exits.
 
 from __future__ import annotations
 
+import argparse
 import logging
 import os
 import signal
@@ -18,7 +19,7 @@ import subprocess
 import sys
 import time
 
-from gpu_memory_service.common.cuda_utils import list_devices
+from gpu_memory_service.common.vmm import VMMDeviceType, get_vmm, init_vmm
 
 logging.basicConfig(
     level=logging.INFO,
@@ -75,6 +76,22 @@ def _supervise(processes: list[subprocess.Popen]) -> int:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="GPU Memory Service supervisor (one server per (device, tag))."
+    )
+    parser.add_argument(
+        "--device-type",
+        type=str,
+        default=VMMDeviceType.CUDA.value,
+        choices=[d.value for d in VMMDeviceType],
+        help="VMM device type forwarded to server (default: cuda).",
+    )
+    args = parser.parse_args()
+
+    init_vmm(VMMDeviceType.from_str(args.device_type))
+    vmm = get_vmm()
+    vmm.ensure_initialized()
+    devices = vmm.list_devices()
     processes = []
     directory_socket = os.environ.get("GMS_DIRECTORY_SOCKET")
     if directory_socket:

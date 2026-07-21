@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterator, Optional
 
 from gpu_memory_service.common.locks import GrantedLockType, RequestedLockType
+from gpu_memory_service.common.vmm import VMMDeviceType, get_vmm_device_type
 
 if TYPE_CHECKING:
     import torch
@@ -181,6 +182,11 @@ def _gms_free(ptr: int, size: int, device: int, stream: int) -> None:
 def _ensure_callbacks_initialized() -> None:
     global _callbacks_initialized, _pluggable_alloc
 
+    if get_vmm_device_type() != VMMDeviceType.CUDA:
+        raise NotImplementedError(
+            f"GMS torch mempool integration is CUDA-only; device_type={get_vmm_device_type().value} "
+        )
+
     from gpu_memory_service.client.torch.extensions import _allocator_ext as cumem
     from torch.cuda import CUDAPluggableAllocator
 
@@ -193,6 +199,11 @@ def _ensure_callbacks_initialized() -> None:
 
 
 def _create_mem_pool() -> "MemPool":
+    if get_vmm_device_type() != VMMDeviceType.CUDA:
+        raise NotImplementedError(
+            f"GMS torch mempool integration is CUDA-only; device_type={get_vmm_device_type().value} "
+        )
+
     from torch.cuda.memory import MemPool
 
     assert _pluggable_alloc is not None
@@ -333,9 +344,9 @@ def prune_allocations(
         return
 
     if synchronize:
-        import torch
+        from gpu_memory_service.integrations.common.utils import torch_device
 
-        torch.cuda.synchronize(manager.device)
+        torch_device().synchronize(manager.device)
 
     keep = {str(allocation_id) for allocation_id in referenced_allocation_ids}
 

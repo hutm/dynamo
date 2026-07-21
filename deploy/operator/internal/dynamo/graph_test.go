@@ -33,6 +33,7 @@ import (
 	commonconsts "github.com/ai-dynamo/dynamo/deploy/operator/internal/consts"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/controller_common"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/dra"
+	"github.com/ai-dynamo/dynamo/deploy/operator/internal/features"
 	gmsruntime "github.com/ai-dynamo/dynamo/deploy/operator/internal/gms"
 	snapshotprotocol "github.com/ai-dynamo/dynamo/deploy/snapshot/protocol"
 	grovev1alpha1 "github.com/ai-dynamo/grove/operator/api/core/v1alpha1"
@@ -5081,7 +5082,7 @@ func TestDetectBackendFrameworkFromArgs(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := detectBackendFrameworkFromArgs(tt.command, tt.args)
+			result, err := DetectBackendFrameworkFromArgs(tt.command, tt.args)
 
 			if tt.expectError {
 				if err == nil {
@@ -8226,7 +8227,7 @@ func TestGenerateGrovePodCliqueSet_GMSPodsDoNotCarryDiscoveryLabels(t *testing.T
 		},
 	}
 
-	got, err := GenerateGrovePodCliqueSet(context.Background(), betaDGD(t, dgd), controllerConfig, &controller_common.RuntimeConfig{DRAEnabled: true}, nil, nil, nil, nil, nil)
+	got, err := GenerateGrovePodCliqueSet(context.Background(), betaDGD(t, dgd), controllerConfig, &controller_common.RuntimeConfig{Gate: features.Gates{DRA: true}}, nil, nil, nil, nil, nil)
 	require.NoError(t, err)
 	require.NotNil(t, got)
 
@@ -8337,7 +8338,7 @@ func TestGenerateGrovePodCliqueSet_GMSPodsAreNotCheckpointTargets(t *testing.T) 
 		},
 	}
 
-	got, err := GenerateGrovePodCliqueSet(context.Background(), betaDGD(t, dgd), controllerConfig, &controller_common.RuntimeConfig{DRAEnabled: true}, kubeClient, nil, nil, nil, infoByService)
+	got, err := GenerateGrovePodCliqueSet(context.Background(), betaDGD(t, dgd), controllerConfig, &controller_common.RuntimeConfig{Gate: features.Gates{Checkpoint: true, DRA: true}}, kubeClient, nil, nil, nil, infoByService)
 	require.NoError(t, err)
 	require.NotNil(t, got)
 
@@ -8466,7 +8467,7 @@ func TestGenerateGrovePodCliqueSet_IntraPodFailoverCheckpointTargets(t *testing.
 		},
 	}
 
-	got, err := GenerateGrovePodCliqueSet(context.Background(), betaDGD(t, dgd), controllerConfig, &controller_common.RuntimeConfig{DRAEnabled: true}, kubeClient, nil, nil, nil, infoByService)
+	got, err := GenerateGrovePodCliqueSet(context.Background(), betaDGD(t, dgd), controllerConfig, &controller_common.RuntimeConfig{Gate: features.Gates{Checkpoint: true, DRA: true}}, kubeClient, nil, nil, nil, infoByService)
 	require.NoError(t, err)
 	require.NotNil(t, got)
 
@@ -8523,7 +8524,7 @@ func TestGenerateGrovePodCliqueSet_WaitForCheckpointGatesPodCliqueScalingGroup(t
 		context.Background(),
 		betaDGD(t, dgd),
 		&configv1alpha1.OperatorConfiguration{Checkpoint: configv1alpha1.CheckpointConfiguration{Enabled: true}},
-		&controller_common.RuntimeConfig{DRAEnabled: true},
+		&controller_common.RuntimeConfig{Gate: features.Gates{Checkpoint: true, DRA: true}},
 		nil,
 		nil,
 		nil,
@@ -8690,7 +8691,7 @@ func TestGenerateGrovePodCliqueSet_MinAvailable_FailoverShadowsAreRedundant(t *t
 			Discovery:      configv1alpha1.DiscoveryConfiguration{Backend: "kubernetes"},
 			Infrastructure: configv1alpha1.InfrastructureConfiguration{ETCDAddress: "etcd-address", NATSAddress: "nats-address"},
 		},
-		&controller_common.RuntimeConfig{DRAEnabled: true},
+		&controller_common.RuntimeConfig{Gate: features.Gates{DRA: true}},
 		nil, nil, nil, nil, nil,
 	)
 	require.NoError(t, err)
@@ -9681,8 +9682,7 @@ func TestGenerateGrovePodCliqueSet_MetadataVolcanoQueuePropagation(t *testing.T)
 				commonconsts.KubeAnnotationVolcanoQueue: "qa-volcano-e2e",
 			},
 			runtimeConfig: &controller_common.RuntimeConfig{
-				GroveEnabled:            true,
-				VolcanoSchedulerEnabled: true,
+				Gate: features.Gates{Grove: true, VolcanoScheduler: true},
 			},
 			expectedQueue: "qa-volcano-e2e",
 			expectQueue:   true,
@@ -9696,8 +9696,7 @@ func TestGenerateGrovePodCliqueSet_MetadataVolcanoQueuePropagation(t *testing.T)
 				commonconsts.GroveAnnotationVolcanoQueue: "spec-queue",
 			},
 			runtimeConfig: &controller_common.RuntimeConfig{
-				GroveEnabled:            true,
-				VolcanoSchedulerEnabled: true,
+				Gate: features.Gates{Grove: true, VolcanoScheduler: true},
 			},
 			expectedQueue: "metadata-queue",
 			expectQueue:   true,
@@ -9711,8 +9710,7 @@ func TestGenerateGrovePodCliqueSet_MetadataVolcanoQueuePropagation(t *testing.T)
 				commonconsts.GroveAnnotationVolcanoQueue: "spec-queue",
 			},
 			runtimeConfig: &controller_common.RuntimeConfig{
-				GroveEnabled:            true,
-				VolcanoSchedulerEnabled: true,
+				Gate: features.Gates{Grove: true, VolcanoScheduler: true},
 			},
 			expectedQueue: "spec-queue",
 			expectQueue:   true,
@@ -9723,8 +9721,7 @@ func TestGenerateGrovePodCliqueSet_MetadataVolcanoQueuePropagation(t *testing.T)
 				commonconsts.KubeAnnotationVolcanoQueue: " \t ",
 			},
 			runtimeConfig: &controller_common.RuntimeConfig{
-				GroveEnabled:            true,
-				VolcanoSchedulerEnabled: true,
+				Gate: features.Gates{Grove: true, VolcanoScheduler: true},
 			},
 			expectQueue: false,
 		},
@@ -9734,8 +9731,7 @@ func TestGenerateGrovePodCliqueSet_MetadataVolcanoQueuePropagation(t *testing.T)
 				commonconsts.GroveAnnotationVolcanoQueue: "spec-queue",
 			},
 			runtimeConfig: &controller_common.RuntimeConfig{
-				GroveEnabled:            true,
-				VolcanoSchedulerEnabled: true,
+				Gate: features.Gates{Grove: true, VolcanoScheduler: true},
 			},
 			expectedQueue: "spec-queue",
 			expectQueue:   true,
@@ -9746,8 +9742,7 @@ func TestGenerateGrovePodCliqueSet_MetadataVolcanoQueuePropagation(t *testing.T)
 				commonconsts.KubeAnnotationVolcanoQueue: "qa-volcano-e2e",
 			},
 			runtimeConfig: &controller_common.RuntimeConfig{
-				GroveEnabled:            true,
-				VolcanoSchedulerEnabled: false,
+				Gate: features.Gates{Grove: true},
 			},
 			expectQueue: false,
 		},
@@ -9808,7 +9803,7 @@ func TestGenerateGrovePodCliqueSet_VolcanoSchedulerInjection(t *testing.T) {
 		context.Background(),
 		betaDGD(t, dgd),
 		&configv1alpha1.OperatorConfiguration{},
-		&controller_common.RuntimeConfig{GroveEnabled: true, VolcanoSchedulerEnabled: true},
+		&controller_common.RuntimeConfig{Gate: features.Gates{Grove: true, VolcanoScheduler: true}},
 		nil,
 		nil,
 		nil,
@@ -9841,7 +9836,7 @@ func TestGenerateGrovePodCliqueSet_SchedulerIntegrationMutualExclusion(t *testin
 		context.Background(),
 		betaDGD(t, dgd),
 		&configv1alpha1.OperatorConfiguration{},
-		&controller_common.RuntimeConfig{GroveEnabled: true, KaiSchedulerEnabled: true, VolcanoSchedulerEnabled: true},
+		&controller_common.RuntimeConfig{Gate: features.Gates{Grove: true, KaiScheduler: true, VolcanoScheduler: true}},
 		nil,
 		nil,
 		nil,
