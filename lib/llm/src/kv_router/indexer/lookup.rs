@@ -1,15 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashSet;
-
 use dynamo_kv_router::{
     ConcurrentRadixTreeCompressed,
     indexer::{
-        GmsPlacementIndex, KvIndexer, KvRouterError, LowerTierIndexers, MatchDetails,
-        ThreadPoolIndexer, TieredMatchProvider, query_lower_tiers,
+        KvIndexer, KvRouterError, LowerTierIndexers, MatchDetails, ThreadPoolIndexer,
+        TieredMatchProvider, query_lower_tiers,
     },
-    protocols::{LocalBlockHash, OverlapScores, WorkerWithDpRank},
+    protocols::{LocalBlockHash, OverlapScores},
 };
 use dynamo_runtime::pipeline::async_trait;
 
@@ -53,7 +51,6 @@ pub(super) struct LookupPipeline<'a> {
     primary: PrimaryLookup<'a>,
     lower_tier: Option<&'a LowerTierIndexers>,
     side: Option<&'a SideIndexer>,
-    gms_placement: Option<&'a GmsPlacementIndex>,
 }
 
 impl Indexer {
@@ -63,25 +60,21 @@ impl Indexer {
                 primary,
                 lower_tier,
                 approx,
-                gms_placement,
                 ..
             } => LookupPipeline {
                 primary: PrimaryLookup::KvIndexer(primary),
                 lower_tier: Some(lower_tier),
                 side: approx.as_ref(),
-                gms_placement: Some(gms_placement),
             },
             Self::Concurrent {
                 primary,
                 lower_tier,
                 approx,
-                gms_placement,
                 ..
             } => LookupPipeline {
                 primary: PrimaryLookup::Concurrent(primary.as_ref()),
                 lower_tier: Some(lower_tier),
                 side: approx.as_ref(),
-                gms_placement: Some(gms_placement),
             },
             Self::Remote {
                 primary, approx, ..
@@ -89,13 +82,11 @@ impl Indexer {
                 primary: PrimaryLookup::Remote(primary.as_ref()),
                 lower_tier: None,
                 side: approx.as_ref(),
-                gms_placement: None,
             },
             Self::None => LookupPipeline {
                 primary: PrimaryLookup::None,
                 lower_tier: None,
                 side: None,
-                gms_placement: None,
             },
         }
     }
@@ -124,7 +115,7 @@ impl Indexer {
         sequence: Vec<LocalBlockHash>,
     ) -> Result<TieredMatchDetails, KvRouterError> {
         self.lookup_pipeline()
-            .find_matches_by_tier(HashInput::Owned(sequence), None)
+            .find_matches_by_tier(HashInput::Owned(sequence))
             .await
     }
 
@@ -133,27 +124,16 @@ impl Indexer {
         sequence: &[LocalBlockHash],
     ) -> Result<TieredMatchDetails, KvRouterError> {
         self.lookup_pipeline()
-            .find_matches_by_tier(HashInput::Borrowed(sequence), None)
+            .find_matches_by_tier(HashInput::Borrowed(sequence))
             .await
     }
 
-    pub(crate) async fn find_matches_by_tier_with_gms_placements(
+    pub(crate) async fn find_primary_matches_by_tier(
         &self,
         sequence: Vec<LocalBlockHash>,
-        gms_content_hashes_hex: Option<&[String]>,
     ) -> Result<TieredMatchDetails, KvRouterError> {
         self.lookup_pipeline()
-            .find_matches_by_tier(HashInput::Owned(sequence), gms_content_hashes_hex)
-            .await
-    }
-
-    pub(crate) async fn find_primary_matches_by_tier_with_gms_placements(
-        &self,
-        sequence: Vec<LocalBlockHash>,
-        gms_content_hashes_hex: Option<&[String]>,
-    ) -> Result<TieredMatchDetails, KvRouterError> {
-        self.lookup_pipeline()
-            .find_primary_matches_by_tier(HashInput::Owned(sequence), gms_content_hashes_hex)
+            .find_primary_matches_by_tier(HashInput::Owned(sequence))
             .await
     }
 }
@@ -189,42 +169,9 @@ impl<'a> LookupPipeline<'a> {
         self.primary.find_match_details(sequence).await
     }
 
-    fn attach_gms_placements(
-        &self,
-        tiered: &mut TieredMatchDetails,
-        content_hashes_hex: Option<&[String]>,
-    ) {
-        let (Some(gms_placement), Some(content_hashes_hex)) =
-            (self.gms_placement, content_hashes_hex)
-        else {
-            return;
-        };
-        if content_hashes_hex.is_empty() {
-            return;
-        }
-
-        let mut workers: HashSet<WorkerWithDpRank> = tiered
-            .device
-            .overlap_scores
-            .scores
-            .keys()
-            .copied()
-            .collect();
-        for details in tiered.lower_tier.values() {
-            workers.extend(details.hits.keys().copied());
-        }
-
-        for worker in workers {
-            if let Some(placement) = gms_placement.lookup(worker, content_hashes_hex) {
-                tiered.gms_placements.insert(worker, placement);
-            }
-        }
-    }
-
     async fn find_matches_by_tier(
         &self,
         sequence: HashInput<'_>,
-        gms_content_hashes_hex: Option<&[String]>,
     ) -> Result<TieredMatchDetails, KvRouterError> {
         match self.primary {
             PrimaryLookup::KvIndexer(_) | PrimaryLookup::Concurrent(_) => {
@@ -240,22 +187,15 @@ impl<'a> LookupPipeline<'a> {
                 let lt = query_lower_tiers(lower_tier, sequence.as_slice(), &primary_device);
                 let device = merge_side_or_warn(self.side, primary_device, sequence).await;
 
-                let mut tiered = TieredMatchDetails {
+                Ok(TieredMatchDetails {
                     device,
                     lower_tier: lt,
-                    gms_placements: Default::default(),
-                };
-                self.attach_gms_placements(&mut tiered, gms_content_hashes_hex);
-                Ok(tiered)
+                })
             }
             PrimaryLookup::Remote(primary) => {
                 let Some(side) = self.side else {
                     return primary
-                        .find_matches_by_tier(
-                            sequence.into_owned_at_boundary(),
-                            false,
-                            gms_content_hashes_hex,
-                        )
+                        .find_matches_by_tier(sequence.into_owned_at_boundary(), false)
                         .await
                         .map_err(|e| {
                             tracing::warn!(error = %e, "Remote indexer tiered query failed");
@@ -263,11 +203,7 @@ impl<'a> LookupPipeline<'a> {
                         });
                 };
                 let mut tiered = primary
-                    .find_matches_by_tier(
-                        sequence.clone_for_boundary(),
-                        false,
-                        gms_content_hashes_hex,
-                    )
+                    .find_matches_by_tier(sequence.clone_for_boundary(), false)
                     .await
                     .map_err(|e| {
                         tracing::warn!(error = %e, "Remote indexer tiered query failed");
@@ -283,7 +219,6 @@ impl<'a> LookupPipeline<'a> {
     async fn find_primary_matches_by_tier(
         &self,
         sequence: HashInput<'_>,
-        gms_content_hashes_hex: Option<&[String]>,
     ) -> Result<TieredMatchDetails, KvRouterError> {
         match self.primary {
             PrimaryLookup::KvIndexer(_) | PrimaryLookup::Concurrent(_) => {
@@ -292,20 +227,13 @@ impl<'a> LookupPipeline<'a> {
                 };
                 let device = self.primary.find_match_details_retained(&sequence).await?;
                 let lt = query_lower_tiers(lower_tier, sequence.as_slice(), &device);
-                let mut tiered = TieredMatchDetails {
+                Ok(TieredMatchDetails {
                     device,
                     lower_tier: lt,
-                    gms_placements: Default::default(),
-                };
-                self.attach_gms_placements(&mut tiered, gms_content_hashes_hex);
-                Ok(tiered)
+                })
             }
             PrimaryLookup::Remote(primary) => primary
-                .find_matches_by_tier(
-                    sequence.into_owned_at_boundary(),
-                    false,
-                    gms_content_hashes_hex,
-                )
+                .find_matches_by_tier(sequence.into_owned_at_boundary(), false)
                 .await
                 .map_err(|e| {
                     tracing::warn!(error = %e, "Remote indexer tiered query failed");
@@ -332,7 +260,7 @@ impl<'a> PrimaryLookup<'a> {
                 .find_match_details_impl(sequence.as_slice(), false),
             Self::Remote(primary) => {
                 let tiered = primary
-                    .find_matches_by_tier(sequence.into_owned_at_boundary(), true, None)
+                    .find_matches_by_tier(sequence.into_owned_at_boundary(), true)
                     .await
                     .map_err(|e| {
                         tracing::warn!(error = %e, "Remote indexer query failed");
@@ -361,7 +289,7 @@ impl<'a> PrimaryLookup<'a> {
                 .find_match_details_impl(sequence.as_slice(), false),
             Self::Remote(primary) => {
                 let tiered = primary
-                    .find_matches_by_tier(sequence.clone_for_boundary(), true, None)
+                    .find_matches_by_tier(sequence.clone_for_boundary(), true)
                     .await
                     .map_err(|e| {
                         tracing::warn!(error = %e, "Remote indexer query failed");
