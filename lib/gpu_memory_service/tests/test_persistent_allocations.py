@@ -14,11 +14,14 @@ Two flavors:
 from __future__ import annotations
 
 import asyncio
-import itertools
 import os
 from types import SimpleNamespace
 
 import pytest
+
+import gpu_memory_service.common.vmm as _vmm_module
+from _fake_vmm import FakeVMM
+from gpu_memory_service.common.vmm import VMMDeviceType
 from gpu_memory_service.client.memory_manager import GMSClientMemoryManager
 from gpu_memory_service.common.locks import GrantedLockType
 from gpu_memory_service.common.protocol.messages import (
@@ -32,8 +35,6 @@ from gpu_memory_service.common.protocol.messages import (
     ReleasePersistentAllocationRequest,
     ReleasePersistentAllocationResponse,
 )
-from gpu_memory_service.server import allocations as server_allocations
-from gpu_memory_service.server import persistent_allocations as server_persistent
 from gpu_memory_service.server.fsm import Connection
 from gpu_memory_service.server.gms import GMS
 from gpu_memory_service.server.persistent_allocations import (
@@ -57,64 +58,16 @@ pytestmark = [
 
 @pytest.fixture
 def fake_cuda(monkeypatch):
-    """Stub the CUDA driver calls used by both managers so tests can
-    run on hosts without CUDA + don't allocate real GPU memory."""
-    handles = itertools.count(2000)
-    vas = itertools.count(0x80000000, 0x10000)
+    """Install a FakeVMM so both allocation managers run without real CUDA.
 
-    def export_fd(handle: int) -> int:
-        # Use a real pipe so the FD is valid (we close + dup it in code
-        # under test).
-        read_fd, write_fd = os.pipe()
-        os.close(write_fd)
-        return read_fd
-
-    for mod in (server_allocations, server_persistent):
-        monkeypatch.setattr(mod, "cuda_ensure_initialized", lambda: None)
-        monkeypatch.setattr(
-            mod,
-            "cumem_get_allocation_granularity",
-            lambda device: 4096,
-        )
-        monkeypatch.setattr(
-            mod,
-            "cumem_create_tolerate_oom",
-            lambda size, device: (True, next(handles)),
-        )
-        monkeypatch.setattr(mod, "cumem_release", lambda handle: None)
-        monkeypatch.setattr(
-            mod,
-            "cumem_export_to_shareable_handle",
-            export_fd,
-        )
-    # Daemon-side VA mapping helpers — only used by persistent_allocations.
-    # These are the raising (*_checked) variants so a driver failure rolls back
-    # instead of os._exit()-ing the daemon.
-    monkeypatch.setattr(
-        server_persistent,
-        "cumem_address_reserve_checked",
-        lambda size, gran: next(vas),
-    )
-    monkeypatch.setattr(
-        server_persistent,
-        "cumem_address_free_checked",
-        lambda va, size: None,
-    )
-    monkeypatch.setattr(
-        server_persistent,
-        "cumem_map_checked",
-        lambda va, size, handle: None,
-    )
-    monkeypatch.setattr(
-        server_persistent,
-        "cumem_set_access_checked",
-        lambda va, size, device, access: None,
-    )
-    monkeypatch.setattr(
-        server_persistent,
-        "cumem_unmap_checked",
-        lambda va, size: None,
-    )
+    GMSAllocationManager and PersistentAllocationManager both route CUDA VMM
+    ops through the shared abstraction (self._vmm = get_vmm()), so one FakeVMM
+    install covers them.
+    """
+    fake = FakeVMM()
+    monkeypatch.setattr(_vmm_module, "_vmm_instance", fake)
+    monkeypatch.setattr(_vmm_module, "_vmm_device_type", VMMDeviceType.CUDA)
+    return fake
 
 
 # ---------------------------------------------------------------------
@@ -853,7 +806,7 @@ def test_read_block_unmapped_raises(monkeypatch, fake_cuda):
     def fail_map(va, size, handle):
         raise RuntimeError("simulated cuMemMap failure")
 
-    monkeypatch.setattr(server_persistent, "cumem_map_checked", fail_map)
+    monkeypatch.setattr(fake_cuda, "map", fail_map)
 
     m = PersistentAllocationManager(device=0)
     alloc, _ = m.claim("eng-X", "kv_pool", 4096)
@@ -873,13 +826,13 @@ def test_release_tears_down_daemon_va(fake_cuda, monkeypatch):
     unmap_calls = []
     free_calls = []
     monkeypatch.setattr(
-        server_persistent,
-        "cumem_unmap_checked",
+        fake_cuda,
+        "unmap",
         lambda va, size: unmap_calls.append((va, size)),
     )
     monkeypatch.setattr(
-        server_persistent,
-        "cumem_address_free_checked",
+        fake_cuda,
+        "address_free",
         lambda va, size: free_calls.append((va, size)),
     )
     m = PersistentAllocationManager(device=0)
