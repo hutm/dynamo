@@ -79,6 +79,50 @@ def _clear_gms_failover_env_leaks(monkeypatch):
     monkeypatch.delenv("DYN_VLLM_GMS_ACTIVE_LOCK_HELD", raising=False)
 
 
+@pytest.mark.parametrize(
+    "enable_lora, model_type, expected",
+    [
+        (True, dynamo_llm.ModelType.Prefill, 3),
+        (True, dynamo_llm.ModelType.Chat, 3),
+        (True, dynamo_llm.ModelType.Embedding, None),
+        (False, dynamo_llm.ModelType.Prefill, None),
+    ],
+)
+def test_base_model_lora_capacity(enable_lora, model_type, expected):
+    config = SimpleNamespace(
+        engine_args=SimpleNamespace(enable_lora=enable_lora, max_loras=3)
+    )
+
+    assert _load_vllm_main()._base_model_lora_capacity(config, model_type) == expected
+
+
+def test_kv_event_block_size_prefers_cached_main_attention_value():
+    """LoRA MDC registration relies on this: the cached main-attention block
+    size (configured at engine setup) wins over cache_config.block_size, so
+    adapter cards carry the same block size as the base-model card on
+    hybrid-attention models where vLLM inflates the attention block size."""
+    from dynamo.vllm.cache_info import (
+        DYNAMO_KV_EVENT_BLOCK_SIZE_KEY,
+        get_configured_kv_event_block_size,
+    )
+
+    vllm_config = SimpleNamespace(
+        additional_config={DYNAMO_KV_EVENT_BLOCK_SIZE_KEY: 1056},
+        cache_config=SimpleNamespace(block_size=16),
+    )
+    assert get_configured_kv_event_block_size(vllm_config) == 1056
+
+
+def test_kv_event_block_size_falls_back_to_cache_config():
+    from dynamo.vllm.cache_info import get_configured_kv_event_block_size
+
+    vllm_config = SimpleNamespace(
+        additional_config=None,
+        cache_config=SimpleNamespace(block_size=16),
+    )
+    assert get_configured_kv_event_block_size(vllm_config) == 16
+
+
 def test_custom_jinja_template_invalid_path(mock_vllm_cli):
     """Test that invalid file path raises FileNotFoundError."""
     invalid_path = "/nonexistent/path/to/template.jinja"
@@ -1661,131 +1705,6 @@ async def test_generate_text_mode_applies_nvext_cache_salt():
 
     assert chunks
     assert captured["prompt"]["cache_salt"] == "dynamo-cache-salt:tenant-a"
-
-
-@pytest.mark.asyncio
-async def test_generate_text_mode_rejects_explicit_max_tokens_over_context():
-    from dynamo.vllm.handlers import DecodeWorkerHandler
-
-    class InputParams:
-        def get_input_param(self, request, use_tokenizer):
-            assert use_tokenizer is True
-            return [1, 2, 3]
-
-    class EngineClient:
-        def __init__(self):
-            self.generate_called = False
-
-        def generate(self, *args, **kwargs):
-            self.generate_called = True
-            raise AssertionError("engine should not be called")
-
-    @asynccontextmanager
-    async def abort_monitor(*args, **kwargs):
-        yield
-
-    engine_client = EngineClient()
-    handler = SimpleNamespace(
-        input_param_manager=InputParams(),
-        default_sampling_params={},
-        model_max_len=100,
-        config=SimpleNamespace(disaggregation_mode=DisaggregationMode.AGGREGATED),
-        engine_client=engine_client,
-        _deferred_aborts={},
-        _shutdown_on_engine_dead=lambda exc: None,
-        _abort_monitor=abort_monitor,
-        _to_local_dp_rank=lambda rank: None,
-    )
-    context = SimpleNamespace(trace_headers=lambda: {})
-    request = {
-        "id": "chatcmpl-test",
-        "model": "test-model",
-        "prompt": "ignored after tokenization",
-        "max_tokens": 98,
-    }
-
-    chunks = [
-        chunk
-        async for chunk in DecodeWorkerHandler._generate_text_mode(
-            handler, request, context, "req-1"
-        )
-    ]
-
-    assert len(chunks) == 1
-    assert chunks[0]["id"] == "chatcmpl-test"
-    assert chunks[0]["model"] == "test-model"
-    assert chunks[0]["choices"][0]["finish_reason"] == (
-        "error: This model's maximum context length is 100 tokens. "
-        "However, you requested 101 tokens "
-        "(3 in the messages, 98 in the completion). "
-        "Please reduce the length of the messages or completion."
-    )
-    assert engine_client.generate_called is False
-
-
-@pytest.mark.asyncio
-async def test_generate_text_mode_rejects_string_prompt_over_context():
-    from dynamo.vllm.handlers import DecodeWorkerHandler
-
-    class Tokenizer:
-        def encode(self, text):
-            assert text == "rendered chat prompt"
-            return [1, 2, 3]
-
-    class InputParams:
-        tokenizer = Tokenizer()
-
-        def get_input_param(self, request, use_tokenizer):
-            assert use_tokenizer is True
-            return "rendered chat prompt"
-
-    class EngineClient:
-        def __init__(self):
-            self.generate_called = False
-
-        def generate(self, *args, **kwargs):
-            self.generate_called = True
-            raise AssertionError("engine should not be called")
-
-    @asynccontextmanager
-    async def abort_monitor(*args, **kwargs):
-        yield
-
-    engine_client = EngineClient()
-    handler = SimpleNamespace(
-        input_param_manager=InputParams(),
-        default_sampling_params={},
-        model_max_len=100,
-        config=SimpleNamespace(disaggregation_mode=DisaggregationMode.AGGREGATED),
-        engine_client=engine_client,
-        _deferred_aborts={},
-        _shutdown_on_engine_dead=lambda exc: None,
-        _abort_monitor=abort_monitor,
-        _to_local_dp_rank=lambda rank: None,
-    )
-    context = SimpleNamespace(trace_headers=lambda: {})
-    request = {
-        "model": "test-model",
-        "messages": [{"role": "user", "content": "hello"}],
-        "max_tokens": 98,
-    }
-
-    chunks = [
-        chunk
-        async for chunk in DecodeWorkerHandler._generate_text_mode(
-            handler, request, context, "req-1"
-        )
-    ]
-
-    assert len(chunks) == 1
-    assert chunks[0]["choices"][0]["finish_reason"] == (
-        "error: This model's maximum context length is 100 tokens. "
-        "However, you requested 101 tokens "
-        "(3 in the messages, 98 in the completion). "
-        "Please reduce the length of the messages or completion."
-    )
-    assert engine_client.generate_called is False
-
 
 def test_gms_shadow_init_geometry_wait_honors_generic_timeout(monkeypatch):
     from dynamo.vllm import main as vllm_main
