@@ -15,10 +15,17 @@ To launch the Dynamo frontend with the KV Router:
 python -m dynamo.frontend --router-mode kv --http-port 8000
 ```
 
-The [Frontend Configuration Reference](../frontend/configuration.md#router) is the
-canonical reference for embedded-router flags, environment variables, defaults, and
-boolean forms. See [Configuration and Tuning](router-configuration.md) for behavioral
-guidance.
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--router-mode kv` | `round-robin` | Enable KV cache-aware routing |
+| `--load-aware` | disabled | Use KV active-load routing without cache-reuse signals; implies `--router-mode kv` on the frontend |
+| `--router-kv-overlap-score-credit` | `1.0` | Credit multiplier for device-local prefix overlap, from 0.0 to 1.0 |
+| `--router-prefill-load-scale` | `1.0` | Scale adjusted prompt-side prefill load before adding decode blocks |
+| `--router-kv-events` / `--no-router-kv-events` | `--router-kv-events` | Consume worker KV events, or explicitly disable them to use approximate routing |
+| `--router-queue-threshold` | `16.0` | Backpressure queue threshold; priority hints only reorder requests while this queue is non-empty |
+| `--router-queue-policy` | `fcfs` | Queue scheduling policy: `fcfs` (tail TTFT), `wspt` (avg TTFT), or `lcfs` (comparison-only reverse ordering) |
+| `--no-router-track-prefill-tokens` | disabled | Ignore prompt-side prefill tokens in router load accounting; useful for decode-only routing paths |
+| `--router-gms-decode-transfer` | disabled | Experimental GMS decode-to-decode transfer orchestration for GMS-capable aggregated decode workers |
 
 > [!IMPORTANT]
 > `--router-mode kv` (or `DYN_ROUTER_MODE=kv`) enables KV routing on the
