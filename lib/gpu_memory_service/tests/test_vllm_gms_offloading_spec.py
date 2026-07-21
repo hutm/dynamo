@@ -14,18 +14,16 @@ from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
 
 
 def test_custom_spec_import_registers_gms_in_current_process():
-    config = SimpleNamespace(
-        kv_transfer_config=SimpleNamespace(
-            kv_connector_extra_config={
-                "spec_name": "GMSTieringOffloadingSpec",
-                "spec_module_path": (
-                    "gpu_memory_service.integrations.vllm.gms_offloading_spec"
-                ),
-            }
-        )
-    )
+    # vLLM's OffloadingSpecFactory.get_spec_cls takes the kv_connector_extra_config
+    # mapping directly (create_spec passes config.extra_config).
+    extra_config = {
+        "spec_name": "GMSTieringOffloadingSpec",
+        "spec_module_path": (
+            "gpu_memory_service.integrations.vllm.gms_offloading_spec"
+        ),
+    }
 
-    assert OffloadingSpecFactory.get_spec_cls(config) is GMSTieringOffloadingSpec
+    assert OffloadingSpecFactory.get_spec_cls(extra_config) is GMSTieringOffloadingSpec
     assert (
         SecondaryTierFactory.get_tier_class({"type": "gms"}) is GMSSecondaryTierManager
     )

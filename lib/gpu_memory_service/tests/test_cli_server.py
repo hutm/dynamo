@@ -30,14 +30,14 @@ pytestmark = [
 
 
 def test_child_command_launches_default_multi_tag_runner():
-    assert server._child_command(3, "cuda") == [
+    assert server._child_command(3, "kv_cache") == [
         sys.executable,
         "-m",
         "gpu_memory_service",
         "--device",
         "3",
-        "--device-type",
-        "cuda",
+        "--tag",
+        "kv_cache",
     ]
 
 
