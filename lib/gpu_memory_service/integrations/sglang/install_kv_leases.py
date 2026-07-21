@@ -105,6 +105,20 @@ def rollback_adopted_hbm_pages(allocator, leases: list[KVLease]) -> None:
     allocator.free_pages = torch.cat((page_tensor, allocator.free_pages))
 
 
+def _append_free_pages(allocator, pages: list[int]) -> None:
+    """Return rejected local pages at lowest allocation priority."""
+    if not pages:
+        return
+    import torch
+
+    page_tensor = torch.tensor(
+        pages,
+        dtype=allocator.free_pages.dtype,
+        device=allocator.free_pages.device,
+    )
+    allocator.free_pages = torch.cat((allocator.free_pages, page_tensor))
+
+
 def install(factory: Callable[[object, int], KVLeaseClient] | None = None) -> bool:
     global _patched, _factory
     if factory is not None:
@@ -209,59 +223,51 @@ def install(factory: Callable[[object, int], KVLeaseClient] | None = None) -> bo
             return []
         return [int(x) for x in pages.detach().cpu().tolist()]
 
-    def _page_tensor(self, pages: list[int]):
-        return torch.tensor(
-            pages,
-            dtype=self.free_pages.dtype,
-            device=self.free_pages.device,
-        )
-
-    def _prepend_pages(self, pages: list[int]) -> None:
-        if not pages:
-            return
-        self.free_pages = torch.cat((_page_tensor(self, pages), self.free_pages))
-
-    def _deprioritize_pages(self, pages: list[int]) -> None:
-        if not pages:
-            return
-        page_tensor = _page_tensor(self, pages)
-        move_mask = torch.isin(self.free_pages, page_tensor)
-        moved = self.free_pages[move_mask]
-        if moved.numel() == 0:
-            return
-        self.free_pages = torch.cat((self.free_pages[~move_mask], moved))
-
-    def _max_lease_attempts(num_pages: int, local_free: int) -> int:
-        if num_pages <= 0:
-            return 1
-        return max(1, min(8, (int(local_free) + int(num_pages) - 1) // int(num_pages)))
-
     def _record_leases(st: dict[str, object], leases: list[KVLease]) -> None:
         lease_map = st["leases_by_page"]
         assert isinstance(lease_map, dict)
         for lease in leases:
             lease_map[int(lease.block_id)] = lease
 
-    def _lease_pages(
+    def _rollback_reserved_pages(
+        st: dict[str, object], leases: list[KVLease]
+    ) -> None:
+        if not leases:
+            return
+        lease_map = st["leases_by_page"]
+        client = st["client"]
+        assert isinstance(lease_map, dict)
+        for lease in leases:
+            lease_map.pop(int(lease.block_id), None)
+        client.release(leases)
+
+    def _reserve_pages(
         self,
         pages: list[int],
         *,
         local_free: int,
         operation: str,
-    ) -> bool:
+    ) -> list[KVLease] | None:
+        """Lease pages before mutating SGLang's allocator.
+
+        The ring prefers SGLang's next pages but may return another shared-free
+        page when a preserved directory entry occupies that slot. Only that rare
+        fallback reorders ``free_pages``; the normal path remains one local CAS.
+        """
+
         st = _state(self)
         if st is None:
-            return False
+            return None
         client = st["client"]
         assert isinstance(client, GMSKVLeaseClient) or hasattr(client, "acquire")
         if not pages:
-            return True
+            return []
         _ensure_directory_capacity(self, len(pages))
         try:
             leases = client.acquire(
                 len(pages),
                 preferred_blocks=pages,
-                strict_preferred=True,
+                strict_preferred=False,
             )
         except Exception as exc:  # noqa: BLE001
             log_lease_pressure(
@@ -278,24 +284,36 @@ def install(factory: Callable[[object, int], KVLeaseClient] | None = None) -> bo
                 error=type(exc).__name__,
             )
             logger.debug("[GMS-KVLease] SGLang lease acquire failed", exc_info=True)
-            return False
+            return None
         if len(leases) != len(pages):
-            log_lease_pressure(
-                logger,
-                f"sglang:{getattr(client, 'namespace', '?')}:acquire-short",
-                "[GMS-KVLease] SGLang lease acquire returned fewer pages than requested",
-                namespace=getattr(client, "namespace", "?"),
-                owner_id=getattr(client, "owner_id", "?"),
-                operation=operation,
-                requested=len(pages),
-                returned=len(leases),
-                shared_free=_safe_free_count(client),
-                preferred_count=len(pages),
-            )
             client.release(leases)
-            return False
+            return None
+
+        leased_pages = [int(lease.block_id) for lease in leases]
+        if leased_pages != pages:
+            page_tensor = torch.tensor(
+                leased_pages,
+                dtype=self.free_pages.dtype,
+                device=self.free_pages.device,
+            )
+            selected = torch.isin(self.free_pages, page_tensor)
+            if int(selected.sum().item()) != len(leased_pages):
+                log_lease_pressure(
+                    logger,
+                    f"sglang:{getattr(client, 'namespace', '?')}:native-mismatch",
+                    "[GMS-KVLease] shared-free page absent from SGLang free list",
+                    namespace=getattr(client, "namespace", "?"),
+                    owner_id=getattr(client, "owner_id", "?"),
+                    operation=operation,
+                    requested=len(pages),
+                    leased=len(leased_pages),
+                )
+                client.release(leases)
+                return None
+            self.free_pages = torch.cat((page_tensor, self.free_pages[~selected]))
+
         _record_leases(st, leases)
-        return True
+        return leases
 
     def _release_indices(self, free_index) -> None:
         st = _state(self)
@@ -358,22 +376,25 @@ def install(factory: Callable[[object, int], KVLeaseClient] | None = None) -> bo
         st = _state(self)
         if st is None:
             return orig_token_alloc(self, need_size)
+        if self.need_sort and int(need_size) > len(self.free_pages):
+            self.merge_and_sort_free()
         local_free = len(self.free_pages)
-        for _attempt in range(_max_lease_attempts(int(need_size), local_free)):
+        if int(need_size) > local_free:
+            return None
+        pages = _pages_to_list(self.free_pages[: int(need_size)])
+        leases = _reserve_pages(
+            self, pages, local_free=local_free, operation="token_alloc"
+        )
+        if leases is None:
+            return None
+        try:
             out = orig_token_alloc(self, need_size)
-            if out is None:
-                return None
-            pages = _pages_to_list(out)
-            if _lease_pages(
-                self,
-                pages,
-                local_free=local_free,
-                operation="token_alloc",
-            ):
-                return out
-            _prepend_pages(self, pages)
-            _deprioritize_pages(self, pages)
-        return None
+        except Exception:
+            _rollback_reserved_pages(st, leases)
+            raise
+        if out is None:
+            _rollback_reserved_pages(st, leases)
+        return out
 
     def patched_token_free(self, free_index):
         _release_indices(self, free_index)
@@ -402,22 +423,25 @@ def install(factory: Callable[[object, int], KVLeaseClient] | None = None) -> bo
         if st is None:
             return orig_paged_alloc(self, need_size)
         num_pages = int(need_size) // int(self.page_size)
+        if self.need_sort and num_pages > len(self.free_pages):
+            self.merge_and_sort_free()
         local_free = len(self.free_pages)
-        for _attempt in range(_max_lease_attempts(num_pages, local_free)):
+        if num_pages > local_free:
+            return None
+        pages = _pages_to_list(self.free_pages[:num_pages])
+        leases = _reserve_pages(
+            self, pages, local_free=local_free, operation="paged_alloc"
+        )
+        if leases is None:
+            return None
+        try:
             out = orig_paged_alloc(self, need_size)
-            if out is None:
-                return None
-            pages = _pages_to_list(torch.unique(out // int(self.page_size)))
-            if _lease_pages(
-                self,
-                pages,
-                local_free=local_free,
-                operation="paged_alloc",
-            ):
-                return out
-            _prepend_pages(self, pages)
-            _deprioritize_pages(self, pages)
-        return None
+        except Exception:
+            _rollback_reserved_pages(st, leases)
+            raise
+        if out is None:
+            _rollback_reserved_pages(st, leases)
+        return out
 
     def patched_paged_alloc_extend(
         self,
@@ -450,9 +474,17 @@ def install(factory: Callable[[object, int], KVLeaseClient] | None = None) -> bo
                 page_size=int(self.page_size),
                 prefix_lens=prefix_lens_cpu,
             )
+        num_new_pages = int(num_new_pages)
         local_free = len(self.free_pages)
-        for _attempt in range(_max_lease_attempts(int(num_new_pages), local_free)):
-            new_pages = self.free_pages[: int(num_new_pages)].clone()
+        if num_new_pages > local_free:
+            return None
+        pages = _pages_to_list(self.free_pages[:num_new_pages])
+        leases = _reserve_pages(
+            self, pages, local_free=local_free, operation="paged_alloc_extend"
+        )
+        if leases is None:
+            return None
+        try:
             out = orig_paged_alloc_extend(
                 self,
                 prefix_lens,
@@ -461,21 +493,14 @@ def install(factory: Callable[[object, int], KVLeaseClient] | None = None) -> bo
                 seq_lens_cpu,
                 last_loc,
                 extend_num_tokens,
-                num_new_pages=int(num_new_pages),
+                num_new_pages=num_new_pages,
             )
-            if out is None:
-                return None
-            pages = _pages_to_list(new_pages)
-            if _lease_pages(
-                self,
-                pages,
-                local_free=local_free,
-                operation="paged_alloc_extend",
-            ):
-                return out
-            _prepend_pages(self, pages)
-            _deprioritize_pages(self, pages)
-        return None
+        except Exception:
+            _rollback_reserved_pages(st, leases)
+            raise
+        if out is None:
+            _rollback_reserved_pages(st, leases)
+        return out
 
     def patched_paged_alloc_decode(self, seq_lens, seq_lens_cpu, last_loc):
         st = _state(self)
@@ -483,28 +508,30 @@ def install(factory: Callable[[object, int], KVLeaseClient] | None = None) -> bo
             return orig_paged_alloc_decode(self, seq_lens, seq_lens_cpu, last_loc)
         if self.need_sort and len(seq_lens) > len(self.free_pages):
             self.merge_and_sort_free()
-        num_new_pages = get_num_new_pages(
-            seq_lens=seq_lens_cpu,
-            page_size=int(self.page_size),
-            decode=True,
+        num_new_pages = int(
+            get_num_new_pages(
+                seq_lens=seq_lens_cpu,
+                page_size=int(self.page_size),
+                decode=True,
+            )
         )
         local_free = len(self.free_pages)
-        for _attempt in range(_max_lease_attempts(int(num_new_pages), local_free)):
-            new_pages = self.free_pages[: int(num_new_pages)].clone()
+        if num_new_pages > local_free:
+            return None
+        pages = _pages_to_list(self.free_pages[:num_new_pages])
+        leases = _reserve_pages(
+            self, pages, local_free=local_free, operation="paged_alloc_decode"
+        )
+        if leases is None:
+            return None
+        try:
             out = orig_paged_alloc_decode(self, seq_lens, seq_lens_cpu, last_loc)
-            if out is None:
-                return None
-            pages = _pages_to_list(new_pages)
-            if _lease_pages(
-                self,
-                pages,
-                local_free=local_free,
-                operation="paged_alloc_decode",
-            ):
-                return out
-            _prepend_pages(self, pages)
-            _deprioritize_pages(self, pages)
-        return None
+        except Exception:
+            _rollback_reserved_pages(st, leases)
+            raise
+        if out is None:
+            _rollback_reserved_pages(st, leases)
+        return out
 
     def patched_paged_free(self, free_index):
         _release_indices(self, free_index)
