@@ -59,6 +59,8 @@ def list_devices() -> list[int]:
     if visible_tokens:
         return list(range(len(visible_tokens)))
 
+def list_cuda_devices() -> list[int]:
+    """Return list of CUDA device indices visible to this process via NVML."""
     import pynvml
 
     pynvml.nvmlInit()
