@@ -33,6 +33,32 @@ engines:
 Harness note: upstream async tests need `-o asyncio_mode=auto` (the repro
 runner uses `-c /dev/null`, stripping the pyproject setting).
 
+## Local shadow-failover e2e (2×B200, repro-bulwark-failover.sh)
+
+`test_gms_shadow_engine_failover_<engine>`: start primary + shadow GMS engines,
+SIGKILL the primary, assert a shadow adopts the GMS-owned KV across the crash and
+serves real post-failover tokens.
+
+| Engine | Result |
+|---|---|
+| sglang | **1 passed** (118s) — shadow takeover, KV stays RW (alloc=57) across crash |
+| vllm   | **1 passed** (135s) — geometry pin `num_gpu_blocks_override=19967`, shadow serves after failover |
+
+Two engine-bump items surfaced and were resolved:
+- **sglang (code fix):** the bump renamed `ModelRunner.init_memory_pool` ->
+  `alloc_memory_pool` and moved the pre-model-load memory baseline to the instance
+  attribute `self.pre_model_load_memory`. The GMS memory-saver patch died at import
+  with AttributeError, killing every worker. Fixed in
+  `integrations/sglang/patches.py` (patch `alloc_memory_pool`, inflate
+  `self.pre_model_load_memory`; keep the old path as fallback).
+- **vllm (test-harness config, NOT a product regression):** the bump changed vLLM's
+  memory profiling so cohort peers compute different KV block counts (20656 vs
+  19967). The geometry pin (`num_gpu_blocks_override`) resolves this, but only when
+  `GMS_VLLM_SHARED_KV=1`/`GMS_VLLM_KV_LEASES=1` are set. Production k8s manifests
+  (`bulwark-failover-pod.yaml.tmpl`, `pytest-failover-pod.yaml.tmpl`) already set
+  these; only the local repro script omitted the vLLM-specific envs (it set the
+  sglang ones). Passing them makes the local vllm e2e green.
+
 ## Reconciliations applied during rebase
 - Daemon: all `cuMem*/cuda_*` ops routed through `self._vmm = get_vmm()`
   (upstream VMMDevice abstraction). Tests install a shared `FakeVMM`.
