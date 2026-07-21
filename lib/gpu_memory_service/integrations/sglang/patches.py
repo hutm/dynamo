@@ -225,22 +225,42 @@ def patch_shared_kv_pool_geometry() -> None:
             resolve_lease_device,
         )
         from gpu_memory_service.integrations.sglang.kv_identity import shared_kv_enabled
-        from sglang.srt.model_executor import model_runner_kv_cache_mixin as mixin
-        from sglang.srt.model_executor.pool_configurator import (
-            create_memory_pool_configurator,
-        )
     except ImportError:
         logger.warning("[GMS] Could not import SGLang KV geometry hooks", exc_info=True)
         return
 
-    if hasattr(
-        mixin.ModelRunnerKVCacheMixin,
-        "_gms_shared_kv_pool_geometry_patched",
-    ):
+    # SGLang relocated _resolve_memory_pool_config: newer builds define it on
+    # KVCacheConfigurator (sglang.srt.mem_cache.kv_cache_configurator); older
+    # builds had it on ModelRunnerKVCacheMixin (sglang.srt.model_executor).
+    # Patch whichever exists so shadow reattach geometry is pinned either way.
+    target_cls = None
+    try:
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        if hasattr(KVCacheConfigurator, "_resolve_memory_pool_config"):
+            target_cls = KVCacheConfigurator
+    except ImportError:
+        pass
+    if target_cls is None:
+        try:
+            from sglang.srt.model_executor import model_runner_kv_cache_mixin as mixin
+
+            if hasattr(mixin.ModelRunnerKVCacheMixin, "_resolve_memory_pool_config"):
+                target_cls = mixin.ModelRunnerKVCacheMixin
+        except ImportError:
+            pass
+    if target_cls is None:
+        logger.warning(
+            "[GMS] Could not locate SGLang _resolve_memory_pool_config; shadow "
+            "reattach KV geometry will NOT be pinned"
+        )
+        return
+
+    if hasattr(target_cls, "_gms_shared_kv_pool_geometry_patched"):
         _kv_pool_geometry_patched = True
         return
 
-    original_resolve = mixin.ModelRunnerKVCacheMixin._resolve_memory_pool_config
+    original_resolve = target_cls._resolve_memory_pool_config
 
     def patched_resolve_memory_pool_config(self, pre_model_load_memory):
         config = original_resolve(self, pre_model_load_memory)
@@ -265,7 +285,7 @@ def patch_shared_kv_pool_geometry() -> None:
             or "default"
         )
         suffix = (
-            f"shared:{dynamo_namespace}:{self.__class__.__name__}:"
+            f"shared:{dynamo_namespace}:"
             f"model{model_id}:page{page_size}"
         )
         namespace, total_blocks = resolve_kv_lease_namespace_total_blocks(
@@ -279,16 +299,38 @@ def patch_shared_kv_pool_geometry() -> None:
         if target_pages == proposed_pages:
             return config
 
+        # Clamp the KV pool to the shared page count and re-derive every dependent
+        # pool size deterministically from the pinned token count. This is
+        # critical: the persistent GMS allocation covers both the token_to_kv_pool
+        # (sized by max_total_num_tokens) AND the req_to_token_pool (sized by
+        # max_running_requests). Both must therefore be pure functions of the
+        # shared token count so the primary and every shadow build byte-identical
+        # persistent allocations (else claim_persistent fails on a size mismatch).
+        # Mirror SGLang's own _resolve_memory_pool_config finalize sequence.
         target_tokens = target_pages * page_size
-        configurator = create_memory_pool_configurator(self)
-        adjusted = configurator.calculate_pool_sizes_from_max_tokens(
-            target_tokens,
-            page_size,
+        config.max_total_num_tokens = target_tokens
+        resolve_reqs = getattr(self, "resolve_max_num_reqs", None) or getattr(
+            self, "_resolve_max_num_reqs", None
         )
-        adjusted.max_running_requests = self._resolve_max_num_reqs(
-            adjusted.max_total_num_tokens
-        )
-        adjusted.mem_fraction_static = self.server_args.mem_fraction_static
+        if resolve_reqs is not None:
+            config.max_running_requests = resolve_reqs(target_tokens)
+        try:
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            configurator = create_memory_pool_configurator(self)
+            finalize = getattr(
+                configurator, "finalize_with_max_running_requests", None
+            )
+            if finalize is not None:
+                config = finalize(config)
+        except Exception:
+            logger.debug(
+                "[GMS] pool finalize after geometry clamp skipped", exc_info=True
+            )
+        if hasattr(config, "mem_fraction_static"):
+            config.mem_fraction_static = self.server_args.mem_fraction_static
         logger.info(
             "[GMS] Adjusted SGLang shared KV geometry from %d pages to %d "
             "pages (namespace=%s)",
@@ -296,14 +338,14 @@ def patch_shared_kv_pool_geometry() -> None:
             target_pages,
             namespace,
         )
-        return adjusted
+        return config
 
-    mixin.ModelRunnerKVCacheMixin._resolve_memory_pool_config = (
-        patched_resolve_memory_pool_config
-    )
-    mixin.ModelRunnerKVCacheMixin._gms_shared_kv_pool_geometry_patched = True
+    target_cls._resolve_memory_pool_config = patched_resolve_memory_pool_config
+    target_cls._gms_shared_kv_pool_geometry_patched = True
     _kv_pool_geometry_patched = True
-    logger.info("[GMS] Patched SGLang shared KV pool geometry")
+    logger.info(
+        "[GMS] Patched SGLang shared KV pool geometry (%s)", target_cls.__name__
+    )
 
 
 def _resolve_shared_kv_geometry_device(runner, resolve_lease_device_fn) -> int:
