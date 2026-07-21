@@ -18,7 +18,7 @@ import ctypes
 import os
 
 import pytest
-from gpu_memory_service.common.cuda_utils import (
+from gpu_memory_service.common.vmm.cuda_utils import (
     cumem_address_free,
     cumem_address_reserve,
     cumem_import_from_shareable_handle_close_fd,
