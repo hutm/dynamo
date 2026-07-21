@@ -27,7 +27,6 @@ from gpu_memory_service.client.torch.allocator import (
     get_or_create_persistent_allocator,
     gms_use_mem_pool,
     gms_use_persistent_pool,
-    retarget_persistent_allocator,
 )
 from gpu_memory_service.common.locks import GrantedLockType, RequestedLockType
 from gpu_memory_service.common.utils import get_socket_path
@@ -39,10 +38,6 @@ from gpu_memory_service.integrations.sglang.kv_identity import (
     allocation_engine_id,
     allocation_shared,
     allocator_tag,
-    private_bootstrap_kv_enabled,
-    promotion_engine_id,
-    release_private_bootstrap_kv_pool,
-    shared_kv_enabled,
 )
 
 logger = logging.getLogger(__name__)
@@ -99,8 +94,6 @@ class GMSMemorySaverImpl:
         self._device_index = device_index
         self._kv_engine_id = allocation_engine_id(device_index)
         self._kv_tag = allocator_tag(device_index)
-        self._kv_promote_engine_id = promotion_engine_id(device_index)
-        self._kv_private_bootstrap = private_bootstrap_kv_enabled()
         self._kv_shared = allocation_shared()
         self.imported_weights_bytes = 0
         self.preloaded_weights_bytes = 0
@@ -120,7 +113,7 @@ class GMSMemorySaverImpl:
                 self._kv_engine_id,
                 tag=self._kv_tag,
                 shared=self._kv_shared,
-                defer_physical=self._kv_private_bootstrap,
+                defer_physical=False,
             ),
         }
 
@@ -218,34 +211,10 @@ class GMSMemorySaverImpl:
                 _TAG_LOCK_TYPES[target_tag], timeout_ms=timeout_ms
             )
             if target_tag == "kv_pool":
-                target_engine_id = self._kv_engine_id
-                target_shared = self._kv_shared
-                if self._kv_private_bootstrap:
-                    target_engine_id = self._kv_promote_engine_id
-                    target_shared = shared_kv_enabled()
-
-                if self._kv_private_bootstrap:
-                    self.allocators[target_tag].prepare_scratch_for_reallocation()
-
                 self.allocators[target_tag].remap_persistent_vas(
-                    target_engine_id,
-                    shared=target_shared,
+                    self._kv_engine_id,
+                    shared=self._kv_shared,
                 )
-                if target_engine_id != self._kv_engine_id:
-                    retarget_persistent_allocator(
-                        self._kv_tag, target_engine_id, shared=target_shared
-                    )
-                    release_private_bootstrap_kv_pool(
-                        self.allocators[target_tag], self._kv_engine_id, logger=logger
-                    )
-                    logger.info(
-                        "[GMS] Promoted SGLang KV namespace %s -> %s",
-                        self._kv_engine_id,
-                        target_engine_id,
-                    )
-                    self._kv_engine_id = target_engine_id
-                    self._kv_shared = target_shared
-                    self._kv_private_bootstrap = False
             else:
                 self.allocators[target_tag].remap_all_vas()
 
