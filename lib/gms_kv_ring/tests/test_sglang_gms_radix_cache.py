@@ -307,6 +307,62 @@ def test_match_prefix_after_evict_restores_via_daemon():
     assert len(cache._spilled) == 0
 
 
+def test_authoritative_directory_publishes_and_restores_prefix():
+    conn = _FakeBlockConnector(available=True)
+    alloc = _FakeAllocator()
+    cache = _build_cache(conn, alloc)
+
+    class Directory:
+        enabled = True
+        authoritative = True
+        mode = "authoritative"
+
+        def __init__(self):
+            self.entries = {}
+
+        def publish(self, items):
+            for item in items:
+                entry = dict(item)
+                entry["state"] = "ready"
+                self.entries[item["content_hash"]] = entry
+            return len(items)
+
+        def lookup(self, hashes):
+            return [self.entries.get(content_hash) for content_hash in hashes]
+
+        def close(self):
+            pass
+
+    directory = Directory()
+    cache._content_directory = directory
+    original = _insert(cache, [10, 20, 30, 40])
+    original_slots = [int(slot) for slot in original.tolist()]
+
+    _evict(cache, num_tokens=4)
+    assert len(directory.entries) == 4
+    assert [entry["slot_ids"] for entry in directory.entries.values()] == [
+        [slot] for slot in original_slots
+    ]
+    assert all(entry["tier"] == "storage" for entry in directory.entries.values())
+
+    matched = _match(cache, [10, 20, 30, 40])
+    assert matched.device_indices.numel() == 4
+    assert len(conn.restore_calls) == 1
+    assert [triple[0] for triple in conn.restore_calls[0]] == original_slots
+
+
+def test_directory_hashes_preserve_sglang_extra_key_scope():
+    cache = _build_cache(_FakeBlockConnector(available=True), _FakeAllocator())
+    tokens = [10, 20, 30, 40]
+
+    plain = cache._gms_prefix_hashes(tokens)
+    lora_a = cache._gms_prefix_hashes(tokens, extra_key="lora-a")
+    lora_b = cache._gms_prefix_hashes(tokens, extra_key="lora-b")
+
+    assert plain != lora_a
+    assert lora_a != lora_b
+
+
 def test_restore_handles_partial_failure_by_truncation():
     """If the daemon fails to restore some blocks, the match
     must truncate at that point. The caller sees a SHORTER
@@ -415,9 +471,9 @@ def test_phase_b_drop_on_restore_failure(monkeypatch):
 
     # First match: restore is attempted and fails.
     _match(cache, [1, 2, 3, 4])
-    assert (
-        fail_seen["n"] == 1
-    ), f"expected exactly one restore attempt; got {fail_seen['n']}"
+    assert fail_seen["n"] == 1, (
+        f"expected exactly one restore attempt; got {fail_seen['n']}"
+    )
     assert len(cache._spilled) == 0, "Phase B: spill record must be dropped on failure"
 
     # Second match: must NOT retry the daemon. The tree node
@@ -692,7 +748,7 @@ def test_install_idempotent_when_env_set(monkeypatch):
             ), "expected patched init after first install()"
         second = inst.install()
         assert second is False, (
-            "install() must be idempotent — second call " "should be a no-op"
+            "install() must be idempotent — second call should be a no-op"
         )
     finally:
         # Best-effort restore; subsequent tests reset
