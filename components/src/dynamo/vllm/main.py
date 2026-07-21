@@ -941,10 +941,6 @@ async def register_vllm_model(
         )
         logging.info("Published vLLM spec decode runtime metadata: %s", spec_decode)
 
-    if resolve_vllm_gms_daemon_socket(vllm_config):
-        runtime_config.set_gms_placement_enabled()
-        logging.info("Publishing GMS placement capability to discovery")
-
     runtime_config.data_parallel_start_rank = dp_range[0]
     runtime_config.data_parallel_size = dp_range[1]
 
