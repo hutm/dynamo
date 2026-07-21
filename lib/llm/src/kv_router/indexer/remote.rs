@@ -95,6 +95,7 @@ impl RemoteIndexer {
         })?;
 
         let request = IndexerQueryRequest {
+            gms_content_hashes_hex: None,
             model_name: self.model_name.clone(),
             block_hashes,
             device_only,
@@ -447,6 +448,7 @@ impl AsyncEngine<SingleIn<IndexerQueryRequest>, ManyOut<IndexerQueryResponse>, a
                         .find_primary_match_details(request.block_hashes)
                         .await
                         .map(|device| TieredMatchDetails {
+                            gms_placements: Default::default(),
                             device,
                             lower_tier: HashMap::new(),
                         })
@@ -546,6 +548,7 @@ mod tests {
         ])));
         let engine = ServedIndexerQueryEngine { bindings };
         let request = SingleIn::new(IndexerQueryRequest {
+            gms_content_hashes_hex: None,
             model_name: "model-b".to_string(),
             block_hashes: vec![LocalBlockHash(1)],
             device_only: false,
@@ -605,6 +608,7 @@ mod tests {
         let engine = ServedIndexerQueryEngine { bindings };
         let mut stream = engine
             .generate(SingleIn::new(IndexerQueryRequest {
+                gms_content_hashes_hex: None,
                 model_name: "m".to_string(),
                 block_hashes,
                 device_only: false,
@@ -672,6 +676,7 @@ mod tests {
         let engine = ServedIndexerQueryEngine { bindings };
         let mut stream = engine
             .generate(SingleIn::new(IndexerQueryRequest {
+                gms_content_hashes_hex: None,
                 model_name: "m".to_string(),
                 block_hashes: vec![LocalBlockHash(11), LocalBlockHash(12), LocalBlockHash(13)],
                 device_only: false,
@@ -770,6 +775,7 @@ mod tests {
         let engine = ServedIndexerQueryEngine { bindings };
         let mut stream = engine
             .generate(SingleIn::new(IndexerQueryRequest {
+                gms_content_hashes_hex: None,
                 model_name: "m".to_string(),
                 block_hashes: vec![LocalBlockHash(11), LocalBlockHash(12), LocalBlockHash(13)],
                 device_only: true,
