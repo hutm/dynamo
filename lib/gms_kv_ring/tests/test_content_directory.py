@@ -709,6 +709,23 @@ def test_async_read_view_serves_host_lookup_without_hot_path_rpc(
         directory.close()
 
 
+def test_current_writer_status_does_not_take_view_lock():
+    directory = ContentDirectory(
+        None, engine="test", block_size=16, engine_id="test", mode="off"
+    )
+    directory._install_snapshot({}, 0, 1, directory.writer_id)
+
+    class ExplodingLock:
+        def __enter__(self):
+            pytest.fail("hot-path writer status acquired the view lock")
+
+        def __exit__(self, *_args):
+            return False
+
+    directory._view_lock = ExplodingLock()
+    assert directory.read_view_is_current_writer
+
+
 def test_async_read_view_applies_upsert_and_delete_deltas(
     directory_daemon, monkeypatch
 ):
