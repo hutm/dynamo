@@ -30,12 +30,12 @@ def test_aborted_persistent_kv_manager_refreshes_to_kv_cache_socket(monkeypatch)
         def get_memory_layout_hash(self):
             return ""
 
-    monkeypatch.setattr(memory_manager, "cuda_ensure_initialized", lambda: None)
-    monkeypatch.setattr(
-        memory_manager,
-        "cumem_get_allocation_granularity",
-        lambda device: 2 * 1024 * 1024,
-    )
+    import gpu_memory_service.common.vmm as _vmm_module
+    from _fake_vmm import FakeVMM
+    from gpu_memory_service.common.vmm import VMMDeviceType
+
+    monkeypatch.setattr(_vmm_module, "_vmm_instance", FakeVMM())
+    monkeypatch.setattr(_vmm_module, "_vmm_device_type", VMMDeviceType.CUDA)
     monkeypatch.setattr(memory_manager, "_GMSClientSession", FakeSession)
     monkeypatch.setattr(common_utils, "invalidate_uuid_cache", lambda: None)
     monkeypatch.setattr(
@@ -72,12 +72,12 @@ def test_aborted_weight_manager_refreshes_to_its_own_socket_tag(monkeypatch):
         def get_memory_layout_hash(self):
             return ""
 
-    monkeypatch.setattr(memory_manager, "cuda_ensure_initialized", lambda: None)
-    monkeypatch.setattr(
-        memory_manager,
-        "cumem_get_allocation_granularity",
-        lambda device: 2 * 1024 * 1024,
-    )
+    import gpu_memory_service.common.vmm as _vmm_module
+    from _fake_vmm import FakeVMM
+    from gpu_memory_service.common.vmm import VMMDeviceType
+
+    monkeypatch.setattr(_vmm_module, "_vmm_instance", FakeVMM())
+    monkeypatch.setattr(_vmm_module, "_vmm_device_type", VMMDeviceType.CUDA)
     monkeypatch.setattr(memory_manager, "_GMSClientSession", FakeSession)
     monkeypatch.setattr(common_utils, "invalidate_uuid_cache", lambda: None)
     monkeypatch.setattr(
@@ -108,12 +108,12 @@ def test_aborted_manager_preserves_explicit_socket_path(monkeypatch):
             self.committed = False
             self.is_connected = True
 
-    monkeypatch.setattr(memory_manager, "cuda_ensure_initialized", lambda: None)
-    monkeypatch.setattr(
-        memory_manager,
-        "cumem_get_allocation_granularity",
-        lambda device: 2 * 1024 * 1024,
-    )
+    import gpu_memory_service.common.vmm as _vmm_module
+    from _fake_vmm import FakeVMM
+    from gpu_memory_service.common.vmm import VMMDeviceType
+
+    monkeypatch.setattr(_vmm_module, "_vmm_instance", FakeVMM())
+    monkeypatch.setattr(_vmm_module, "_vmm_device_type", VMMDeviceType.CUDA)
     monkeypatch.setattr(memory_manager, "_GMSClientSession", FakeSession)
 
     manager = memory_manager.GMSClientMemoryManager(
