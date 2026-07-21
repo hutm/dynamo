@@ -1043,13 +1043,13 @@ mod tests_startup_helpers {
             dp_rank: 0,
         };
 
-        let (tx, rx) = mpsc::unbounded_channel::<PlacementEvent>();
+        let (tx, rx) = mpsc::unbounded_channel::<Vec<PlacementEvent>>();
         tx.send(local_gpu_event(1, store_event)).unwrap();
-        tx.send(PlacementEvent::with_gms_placement(
+        tx.send(vec![PlacementEvent::with_gms_placement(
             Placement::local_worker(1, 0, StorageTier::External),
             gms_clear_event,
             GmsPlacementEventData::Cleared,
-        ))
+        )])
         .unwrap();
         drop(tx);
 
@@ -2506,7 +2506,7 @@ mod event_processor_tests {
 
     #[tokio::test]
     async fn test_run_event_processor_loop_preserves_gms_placement() {
-        let (tx, rx) = mpsc::unbounded_channel::<PlacementEvent>();
+        let (tx, rx) = mpsc::unbounded_channel::<Vec<PlacementEvent>>();
         let publisher = MockPublisher::new();
         let publisher_clone = publisher.clone();
         let cancellation_token = CancellationToken::new();
@@ -2534,7 +2534,7 @@ mod event_processor_tests {
         .unwrap();
 
         let gms_placement = gms_store_event("abc123");
-        tx.send(PlacementEvent::with_gms_placement(
+        tx.send(vec![PlacementEvent::with_gms_placement(
             Placement::local_worker(1, 0, StorageTier::External),
             KvCacheEvent {
                 event_id: 2,
@@ -2546,7 +2546,7 @@ mod event_processor_tests {
                 dp_rank: 0,
             },
             gms_placement.clone(),
-        ))
+        )])
         .unwrap();
 
         drop(tx);
