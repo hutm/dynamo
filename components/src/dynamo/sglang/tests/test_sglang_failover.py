@@ -4,8 +4,11 @@
 
 import asyncio
 import sys
+import threading
+import time
 import types
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -323,3 +326,129 @@ def test_sglang_failover_watchdog_routes_sigquit_to_controlled_handoff(monkeypat
     watchdog._restore_sigquit_hook()
     restored = loop._signal_handlers[failover_watchdog.signal.SIGQUIT]._callback
     assert restored is loop.previous
+
+
+def test_gms_multinode_shadow_enables_nccl_prewarm(monkeypatch):
+    monkeypatch.setenv("DYN_GMS_FAILOVER_SHADOW_MODE", "1")
+    server_args = SimpleNamespace(nnodes=2, pre_warm_nccl=False)
+
+    init_llm._enable_gms_nccl_prewarm(server_args)
+
+    assert server_args.pre_warm_nccl is True
+
+
+def test_nccl_prewarm_is_scoped_to_multinode_shadow(monkeypatch):
+    monkeypatch.delenv("DYN_GMS_FAILOVER_SHADOW_MODE", raising=False)
+    vanilla = SimpleNamespace(nnodes=2, pre_warm_nccl=False)
+    init_llm._enable_gms_nccl_prewarm(vanilla)
+    assert vanilla.pre_warm_nccl is False
+
+    monkeypatch.setenv("DYN_GMS_FAILOVER_SHADOW_MODE", "1")
+    single_node = SimpleNamespace(nnodes=1, pre_warm_nccl=False)
+    init_llm._enable_gms_nccl_prewarm(single_node)
+    assert single_node.pre_warm_nccl is False
+
+
+def test_sglang_failure_trigger_is_exactly_once(monkeypatch):
+    class Result:
+        def result(self, timeout=None):
+            return None
+
+    def schedule(coro, _loop):
+        coro.close()
+        return Result()
+
+    fences = []
+    releases = []
+
+    def fence(_engine):
+        fences.append(1)
+        time.sleep(0.02)
+
+    monkeypatch.setattr(failover_watchdog, "_fence_children", fence)
+    monkeypatch.setattr(
+        failover_watchdog,
+        "release_attached_gms_failover_lock_nowait",
+        lambda *_args, **_kwargs: releases.append(1) or True,
+    )
+    monkeypatch.setattr(failover_watchdog.asyncio, "run_coroutine_threadsafe", schedule)
+
+    target = SimpleNamespace(_gms_failover_lock=object())
+    watchdog = failover_watchdog.SGLangGmsFailoverChildWatchdog(
+        target, SimpleNamespace(), object()
+    )
+    threads = [
+        threading.Thread(target=watchdog._trigger_failure, args=(f"source-{i}",))
+        for i in range(4)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert fences == [1]
+    assert releases == [1]
+
+
+@pytest.mark.asyncio
+async def test_sleeping_standby_quiesces_without_unmapping_kv(monkeypatch):
+    monkeypatch.setenv("DYN_SGLANG_GMS_LOCK_BEFORE_INIT", "0")
+    manager = SimpleNamespace(
+        pause_generation=AsyncMock(),
+        release_memory_occupation=AsyncMock(),
+        resume_memory_occupation=AsyncMock(),
+        continue_generation=AsyncMock(),
+    )
+    controller = init_llm._NonLeaderFailoverController(
+        SimpleNamespace(tokenizer_manager=manager)
+    )
+
+    assert await controller.quiesce(["kv_cache"]) is True
+    manager.pause_generation.assert_not_awaited()
+    manager.release_memory_occupation.assert_not_awaited()
+
+    assert await controller.resume(["kv_cache"]) is True
+    manager.resume_memory_occupation.assert_not_awaited()
+    manager.continue_generation.assert_not_awaited()
+
+
+def test_lock_before_init_keeps_release_and_remap_path(monkeypatch):
+    monkeypatch.setenv("DYN_SGLANG_GMS_LOCK_BEFORE_INIT", "1")
+    assert init_llm._uses_mapped_sleeping_standby() is False
+
+    monkeypatch.setenv("DYN_SGLANG_GMS_LOCK_BEFORE_INIT", "0")
+    assert init_llm._uses_mapped_sleeping_standby() is True
+    assert init_llm._can_prewarm_mapped_standby() is False
+
+    monkeypatch.setenv("GMS_KV_LEASES", "1")
+    assert init_llm._can_prewarm_mapped_standby() is True
+
+
+def test_sglang_worker_fences_when_leader_acknowledgements_stop(monkeypatch):
+    from dynamo.common import rank_liveness
+
+    captured = {}
+
+    class Client:
+        def __init__(self, leader_host, rank, **kwargs):
+            captured.update(leader_host=leader_host, rank=rank, **kwargs)
+
+        def start(self):
+            captured["started"] = True
+
+    monkeypatch.setenv("DYN_GMS_RANK_LIVENESS", "1")
+    monkeypatch.setenv("DYN_GMS_FAILOVER_SHADOW_MODE", "1")
+    monkeypatch.setattr(rank_liveness, "RankLivenessClient", Client)
+    reasons = []
+    target = SimpleNamespace(
+        _gms_failover_child_watchdog=SimpleNamespace(_trigger_failure=reasons.append)
+    )
+
+    client = failover_watchdog.maybe_start_rank_liveness(
+        target, object(), node_rank=1, leader_host="leader.example"
+    )
+
+    assert client is not None
+    assert captured["started"] is True
+    captured["on_leader_lost"](0, "liveness-timeout")
+    assert reasons == ["cross-node leader rank 0 liveness lost (liveness-timeout)"]

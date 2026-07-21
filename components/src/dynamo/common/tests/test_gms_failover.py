@@ -7,6 +7,7 @@ from dynamo.common.gms_failover import (
     acquire_gms_failover_lock_before_init,
     prepare_gms_failover,
     release_attached_gms_failover_lock,
+    release_attached_gms_failover_lock_nowait,
     run_gms_failover_post_lock_fence,
     run_gms_failover_promotion_warmup,
 )
@@ -115,6 +116,30 @@ async def test_gms_failover_primary_acquires_without_quiesce(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_activation_barrier_runs_before_shadow_resume(monkeypatch):
+    monkeypatch.setenv("DYN_GMS_FAILOVER_SHADOW_MODE", "true")
+    monkeypatch.setenv("ENGINE_ID", "1")
+    owner = _Owner()
+    events = []
+
+    async def barrier():
+        assert owner._quiesce_controller.resume_calls == []
+        events.append("all-ranks-fenced")
+
+    await prepare_gms_failover(
+        owner,
+        _Runtime(),
+        backend_name="test",
+        tags=["kv_cache"],
+        lock_factory=_BusyOnTryLock,
+        activation_barrier=barrier,
+    )
+
+    assert events == ["all-ranks-fenced"]
+    assert owner._quiesce_controller.resume_calls == [["kv_cache"]]
+
+
+@pytest.mark.asyncio
 async def test_gms_failover_shadow_waits_quiesced_then_resumes(monkeypatch):
     monkeypatch.setenv("DYN_GMS_FAILOVER_SHADOW_MODE", "true")
     monkeypatch.setenv("ENGINE_ID", "1")
@@ -142,6 +167,53 @@ async def test_gms_failover_shadow_waits_quiesced_then_resumes(monkeypatch):
     handler = _Handler()
     activation.attach_to(handler)
     assert getattr(handler, "_gms_failover_lock") is activation.lock
+
+
+@pytest.mark.asyncio
+async def test_gms_failover_can_warm_shadow_before_quiesce(monkeypatch):
+    monkeypatch.setenv("DYN_GMS_FAILOVER_SHADOW_MODE", "true")
+    events = []
+
+    class Controller(_Controller):
+        async def quiesce(self, tags):
+            events.append("quiesce")
+            return await super().quiesce(tags)
+
+        async def resume(self, tags):
+            events.append("resume")
+            return await super().resume(tags)
+
+    owner = _Owner()
+    owner._quiesce_controller = Controller()
+
+    async def warmup():
+        events.append("warmup")
+
+    activation = await prepare_gms_failover(
+        owner,
+        _Runtime(),
+        backend_name="test",
+        tags=["kv_cache"],
+        lock_factory=_BusyOnTryLock,
+        promotion_warmup=warmup,
+        warm_standby_before_quiesce=True,
+    )
+
+    assert activation.enabled is True
+    assert events == ["warmup", "quiesce", "resume"]
+
+
+@pytest.mark.asyncio
+async def test_prequiesce_warmup_requires_callback(monkeypatch):
+    monkeypatch.setenv("DYN_GMS_FAILOVER_SHADOW_MODE", "true")
+    with pytest.raises(RuntimeError, match="requires promotion_warmup"):
+        await prepare_gms_failover(
+            _Owner(),
+            _Runtime(),
+            backend_name="test",
+            lock_factory=_BusyOnTryLock,
+            warm_standby_before_quiesce=True,
+        )
 
 
 @pytest.mark.asyncio
@@ -450,3 +522,21 @@ async def test_release_attached_gms_failover_lock_without_lock_is_noop():
     released = await release_attached_gms_failover_lock(handler, backend_name="test")
 
     assert released is False
+
+
+def test_release_attached_gms_failover_lock_nowait_releases_and_detaches():
+    class _NowaitLock:
+        def __init__(self):
+            self.released = 0
+
+        def release_nowait(self):
+            self.released += 1
+            return True
+
+    handler = _Owner()
+    lock = _NowaitLock()
+    handler._gms_failover_lock = lock
+
+    assert release_attached_gms_failover_lock_nowait(handler, backend_name="test")
+    assert lock.released == 1
+    assert handler._gms_failover_lock is None
