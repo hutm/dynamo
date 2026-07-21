@@ -398,6 +398,7 @@ struct KvRouterConfigSerde {
     router_track_output_blocks: bool,
     router_assume_kv_reuse: bool,
     router_track_prefill_tokens: bool,
+    router_gms_decode_transfer: bool,
     router_prefill_load_model: RouterPrefillLoadModel,
     router_ttl_secs: f64,
     router_queue_threshold: Option<f64>,
@@ -430,6 +431,7 @@ impl Default for KvRouterConfigSerde {
             router_track_output_blocks: config.router_track_output_blocks,
             router_assume_kv_reuse: config.router_assume_kv_reuse,
             router_track_prefill_tokens: config.router_track_prefill_tokens,
+            router_gms_decode_transfer: config.router_gms_decode_transfer,
             router_prefill_load_model: config.router_prefill_load_model,
             router_ttl_secs: config.router_ttl_secs,
             router_queue_threshold: config.router_queue_threshold,
@@ -494,6 +496,12 @@ pub struct KvRouterConfig {
     /// and potential prefill-token load calculations.
     #[serde(default = "default_track_prefill_tokens")]
     pub router_track_prefill_tokens: bool,
+
+    /// Whether the router may orchestrate GMS decode-to-decode KV transfer.
+    /// Default is false so GMS transfer policy remains an explicit opt-in and
+    /// vanilla Dynamo routing behavior is unchanged.
+    #[serde(default)]
+    pub router_gms_decode_transfer: bool,
 
     /// Optional model for estimating effective prompt-side prefill load over time.
     pub router_prefill_load_model: RouterPrefillLoadModel,
@@ -578,6 +586,7 @@ impl Default for KvRouterConfig {
             router_track_output_blocks: false,
             router_assume_kv_reuse: true,
             router_track_prefill_tokens: default_track_prefill_tokens(),
+            router_gms_decode_transfer: false,
             router_prefill_load_model: RouterPrefillLoadModel::default(),
             router_ttl_secs: 120.0,
             router_queue_threshold: None,
@@ -624,6 +633,7 @@ impl TryFrom<KvRouterConfigSerde> for KvRouterConfig {
             router_track_output_blocks: compat.router_track_output_blocks,
             router_assume_kv_reuse: compat.router_assume_kv_reuse,
             router_track_prefill_tokens: compat.router_track_prefill_tokens,
+            router_gms_decode_transfer: compat.router_gms_decode_transfer,
             router_prefill_load_model: compat.router_prefill_load_model,
             router_ttl_secs: compat.router_ttl_secs,
             router_queue_threshold: compat.router_queue_threshold,
@@ -925,6 +935,13 @@ mod tests {
                 config_from_values(&[("DYN_ROUTER_KV_OVERLAP_SCORE_CREDIT", value)]);
             assert!(invalid_credit.validate_config().is_err());
         }
+    }
+
+    #[test]
+    fn router_gms_decode_transfer_is_disabled_by_default() {
+        let cfg = KvRouterConfig::default();
+
+        assert!(!cfg.router_gms_decode_transfer);
     }
 
     #[test]
