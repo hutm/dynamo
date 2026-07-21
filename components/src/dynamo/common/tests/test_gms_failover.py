@@ -321,6 +321,41 @@ async def test_gms_failover_post_lock_fence_honors_backend_override(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_gms_failover_promotes_directory_before_lease_reclaim(monkeypatch):
+    monkeypatch.setenv("GMS_KV_DIRECTORY_MODE", "shadow")
+    monkeypatch.setenv("DYN_GMS_FAILOVER_POST_LOCK_FENCE_MS", "0")
+    order = []
+
+    def promote(backend_name, role):
+        order.append(("promote", backend_name, role))
+
+        return {7, 9}
+
+    async def to_thread(fn, *args):
+        return fn(*args)
+
+    def reclaim(backend_name, role, protected_blocks=None):
+        order.append(("reclaim", backend_name, role, protected_blocks))
+
+    monkeypatch.setattr(
+        "dynamo.common.gms_failover._promote_content_directory_after_fence",
+        promote,
+    )
+    monkeypatch.setattr("dynamo.common.gms_failover.asyncio.to_thread", to_thread)
+    monkeypatch.setattr(
+        "dynamo.common.gms_failover._reclaim_foreign_kv_leases_after_fence",
+        reclaim,
+    )
+
+    await run_gms_failover_post_lock_fence(backend_name="vllm", role="shadow")
+
+    assert order == [
+        ("promote", "vllm", "shadow"),
+        ("reclaim", "vllm", "shadow", {7, 9}),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_gms_failover_shadow_runs_warmup_before_ready(monkeypatch):
     monkeypatch.setenv("DYN_GMS_FAILOVER_SHADOW_MODE", "true")
     monkeypatch.setenv("DYN_GMS_FAILOVER_KEEP_SHADOW_READY", "false")

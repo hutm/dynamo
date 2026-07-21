@@ -290,6 +290,15 @@ def _promote_content_directory_after_fence(backend_name: str, role: str) -> "set
     mode = resolve_directory_mode()
     if mode == "off":
         return set()
+    if not os.environ.get("GMS_KV_DIRECTORY_MANIFEST", "").strip():
+        message = (
+            "GMS KV failover requires GMS_KV_DIRECTORY_MANIFEST so promotion "
+            "uses the same model/layout identity as the inference engine"
+        )
+        if mode == "authoritative":
+            raise RuntimeError(message)
+        logger.warning("[GMS failover] %s %s", backend_name, message)
+        return set()
     socket_path = _directory_socket(backend_name)
     if not socket_path:
         message = "GMS KV directory enabled without GMS_KV_DIRECTORY_SOCKET"

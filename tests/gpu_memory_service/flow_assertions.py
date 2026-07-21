@@ -204,7 +204,8 @@ def assert_kv_history(
     if suffix is not None:
         expected_kinds.extend(suffix)
 
-    assert [event.kind for event in events] == expected_kinds
+    actual_kinds = [event.kind for event in events]
+    assert actual_kinds == expected_kinds, (actual_kinds, expected_kinds)
     clear_counts = [
         event.allocation_count
         for event in events
