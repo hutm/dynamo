@@ -29,8 +29,8 @@ from dataclasses import dataclass
 from typing import Iterable, Optional
 from uuid import uuid4
 
-from gpu_memory_service.common.cuda_utils import (
-    align_to_granularity,
+from gpu_memory_service.common.utils import align_to_granularity
+from gpu_memory_service.common.vmm.cuda_utils import (
     cuda_ensure_initialized,
     cumem_address_free_checked,
     cumem_address_reserve_checked,
