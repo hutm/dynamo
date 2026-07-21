@@ -7,28 +7,36 @@ subtitle: Run the KV cache indexer as an independent HTTP service for querying b
 
 ## Overview
 
-The standalone KV indexer (`python -m dynamo.indexer`) is a lightweight service that maintains a radix tree of cached blocks and exposes HTTP endpoints for querying and managing workers. It supports two operational modes:
+The standalone KV indexer (`python -m dynamo.indexer`) is a lightweight service that maintains a radix tree of cached blocks and exposes HTTP endpoints for querying and managing workers.
 
-- **Standalone mode** (default): subscribes to ZMQ KV event streams directly from workers. No Dynamo runtime discovery, registration, or event-plane integration required.
-- **Dynamo runtime mode** (`--dynamo-runtime`): integrates with the Dynamo runtime for automatic worker discovery via MDC, KV event ingestion via the event plane (NATS or ZMQ), and overlap queries over the request plane for remote frontends.
+- It subscribes to ZMQ KV event streams directly from workers.
+- It exposes an HTTP API for registration, inspection, and overlap queries.
+- It preserves P2P recovery and gap detection/replay for the standalone ZMQ path.
+- It indexes device, host-pinned, and disk tier blocks and reports per-tier matches in `/query` responses.
 
 This is distinct from the [Standalone Router](../../../components/src/dynamo/router/README.md), which is a full routing service. The standalone indexer provides only the indexing and query layer without routing logic.
 
+For Dynamo-native remote indexing, use `--serve-indexer` on `dynamo.frontend` or `dynamo.router` and `--use-remote-indexer` on consumers instead. That request-plane service reuses the router's existing event ingestion and recovery machinery; it is not implemented by `dynamo.indexer`.
+
 The HTTP API follows the [Mooncake KV Indexer RFC](https://github.com/kvcache-ai/Mooncake/issues/1403) conventions.
 
-## Multi-Model and Multi-Tenant Support
+`DYN_ROUTER_MIN_INITIAL_WORKERS` is also honored here. When set to a positive integer, the
+standalone indexer waits for that many workers to register before opening its startup-ready
+gate, matching the frontend/router startup behavior.
 
-The indexer maintains one radix tree per `(model_name, tenant_id)` pair. Workers registered with different model names or tenant IDs are isolated into separate indexers — queries against one model/tenant never return scores from another.
+## Model and Routing Group Support
+
+The indexer maintains one radix tree per `(model_name, routing_group)` pair. Workers registered with different model names or routing groups are isolated into separate indexers. Queries against one pair never return scores from another.
 
 - **`model_name`** (required on `/register` and `/query`): Identifies the model. Workers serving different models get separate radix trees.
-- **`tenant_id`** (optional, defaults to `"default"`): Enables multi-tenant isolation within the same model. Omit for single-tenant deployments.
-- **`block_size`** is per-indexer: the first `/register` call for a given `(model_name, tenant_id)` sets the block size. Subsequent registrations for the same pair must use the same block size or the request will fail.
+- **`routing_group`** (optional, defaults to `"default"`): Identifies a statically assigned worker pool within the model. Omit it when the model does not need independently selectable pools.
+- **`block_size`** is per-indexer: the first `/register` call for a given `(model_name, routing_group)` sets the block size. Subsequent registrations for the same pair must use the same block size or the request will fail.
 
 ## Compatibility
 
-In standalone mode, the indexer works with any engine that publishes KV cache events over ZMQ in the expected msgpack format. This includes bare vLLM and SGLang engines, which emit ZMQ KV events natively — no Dynamo-specific wrapper is required.
+The standalone indexer works with any engine that publishes KV cache events over ZMQ in the expected msgpack format. This includes bare vLLM and SGLang engines, which emit ZMQ KV events natively — no Dynamo-specific wrapper is required.
 
-In Dynamo runtime mode, the indexer discovers workers automatically via MDC and receives KV events through the event plane. It also registers a query endpoint on the request plane, allowing frontends to query overlap scores remotely without needing direct HTTP access.
+Events tagged with non-device storage tiers (host-pinned, disk, external) are routed into a lower-tier slot rather than dropped, and surface in `/query` responses as `cpu` / `disk` reach.
 
 ## Use Cases
 
@@ -36,7 +44,7 @@ In Dynamo runtime mode, the indexer discovers workers automatically via MDC and 
 - **State verification**: Confirm that the indexer's view of KV cache state matches the router's internal state (used in integration tests).
 - **Custom routing**: Build external routing logic that queries the indexer for overlap scores and makes its own worker selection decisions.
 - **Monitoring**: Observe KV cache distribution across workers without running a full router.
-- **Remote indexing**: In Dynamo runtime mode, frontends can offload KV cache indexing to a dedicated service and query it over the request plane.
+- **Standalone microservice**: Run an indexer independently of the router/frontend when you want direct HTTP inspection and ZMQ-based ingestion.
 
 ## P2P Recovery
 
@@ -87,7 +95,6 @@ The service is exposed through the Python bindings package and launched with `py
 |---------|-------------|
 | `kv-indexer` | Core standalone indexer service path (`python -m dynamo.indexer`: HTTP API, ZMQ listeners, P2P recovery) |
 | `kv-indexer-metrics` | Optional `/metrics` endpoint |
-| `kv-indexer-runtime` | Dynamo runtime integration (`--dynamo-runtime`, discovery, event plane, request plane) |
 
 ### Standalone build
 
@@ -105,29 +112,11 @@ cd lib/bindings/python && VIRTUAL_ENV=../../.venv ../../.venv/bin/maturin develo
 
 This keeps the default `kv-indexer` build lean while still allowing Prometheus metrics when needed.
 
-### Runtime-enabled build
-
-```bash
-cd lib/bindings/python && VIRTUAL_ENV=../../.venv ../../.venv/bin/maturin develop --uv --features kv-indexer,kv-indexer-runtime
-```
-
-This enables the `--dynamo-runtime` CLI flag for MDC discovery, event-plane subscription, and request-plane queries. It also includes the metrics endpoint.
-
 ## CLI
 
-### Standalone mode (default)
-
 ```bash
-python -m dynamo.indexer --port 8090 [--threads 4] [--block-size 16 --model-name my-model --tenant-id default --workers "1=tcp://host:5557,2:1=tcp://host:5558"] [--peers "http://peer1:8090,http://peer2:8091"]
+python -m dynamo.indexer --port 8090 [--threads 4] [--block-size 16 --model-name my-model --routing-group default --workers "1=tcp://host:5557,2:1=tcp://host:5558"] [--peers "http://peer1:8090,http://peer2:8091"]
 ```
-
-### Dynamo runtime mode
-
-```bash
-python -m dynamo.indexer --dynamo-runtime --namespace default --component-name kv-indexer --worker-component backend --port 8090 [--threads 4]
-```
-
-In runtime mode, workers are discovered automatically via MDC. The `--workers` flag can still be used to register additional static workers alongside discovered ones.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -136,12 +125,17 @@ In runtime mode, workers are discovered automatically via MDC. The `--workers` f
 | `--threads` | `4` | Number of indexer threads (1 = single-threaded, >1 = thread pool) |
 | `--workers` | (none) | Initial workers as `instance_id[:dp_rank]=zmq_address,...` pairs (dp_rank defaults to 0) |
 | `--model-name` | `default` | Model name for initial `--workers` |
-| `--tenant-id` | `default` | Tenant ID for initial `--workers` |
+| `--routing-group` | `default` | Routing group for initial `--workers` |
 | `--peers` | (none) | Comma-separated peer indexer URLs for P2P recovery on startup |
-| `--dynamo-runtime` | `false` | Enable Dynamo runtime integration (requires `kv-indexer-runtime`) |
-| `--namespace` | `default` | Dynamo namespace to register the indexer component under |
-| `--component-name` | `kv-indexer` | Component name for this indexer in the Dynamo runtime |
-| `--worker-component` | `backend` | Component name that workers register under for event-plane subscription |
+| `--access-log` | (none) | Write one JSON access-log record per request to this file |
+| `--trace-id-header` | `x-trace-id` | Request header copied into each access-log record's `trace_id` field |
+| `--access-log-local-time` | disabled | Use local time for access-log timestamps instead of UTC |
+
+### Shared Startup Gate
+
+Set `DYN_ROUTER_MIN_INITIAL_WORKERS=<n>` to require at least `<n>` workers before the
+standalone indexer, frontend push-router path, and KV router config-ready gate all proceed.
+Leave it unset or set it to `0` to disable the startup wait.
 
 ## HTTP API
 
@@ -155,7 +149,7 @@ curl http://localhost:8090/health
 
 ### `GET /metrics` — Prometheus metrics
 
-Returns metrics in Prometheus text exposition format. Available when the Python bindings are built with the `kv-indexer-metrics` or `kv-indexer-runtime` feature.
+Returns metrics in Prometheus text exposition format. Available when the Python bindings are built with the `kv-indexer-metrics` feature.
 
 ```bash
 curl http://localhost:8090/metrics
@@ -166,17 +160,44 @@ curl http://localhost:8090/metrics
 | `dynamo_kvindexer_request_duration_seconds` | Histogram | `endpoint` | HTTP request latency |
 | `dynamo_kvindexer_requests_total` | Counter | `endpoint`, `method` | Total HTTP requests |
 | `dynamo_kvindexer_errors_total` | Counter | `endpoint`, `status_class` | HTTP error responses (4xx/5xx) |
-| `dynamo_kvindexer_models` | Gauge | — | Number of active model+tenant indexers |
+| `dynamo_kvindexer_models` | Gauge | — | Number of active model+routing-group indexers |
 | `dynamo_kvindexer_workers` | Gauge | — | Number of registered worker instances |
 | `dynamo_kvindexer_listeners` | Gauge | `status` | Number of ZMQ listeners by status (`pending`, `active`, `paused`, `failed`) |
+| `dynamo_kvrouter_kv_cache_events_applied` | Counter | `event_type`, `status` | Primary device-tier KV events applied, partitioned by event type and result |
+| `dynamo_kvrouter_kv_cache_event_warnings` | Counter | `warning_kind` | Suspicious-but-valid primary device-tier events, including duplicate STORE content |
+
+The core event counters aggregate process-wide across model and routing-group indexers and
+across all indexer threads. A `duplicate_store` warning is not necessarily an error:
+peer recovery replay can reapply content already restored from a snapshot. Lower-tier
+events and listener transport or replay failures are not represented by these core
+event counters; use the standalone service metrics and logs for those paths. These
+device-tier-only semantics apply to the standalone indexer. The frontend-embedded
+router's component-scoped `dynamo_component_kv_cache_events_applied` counter includes
+both device- and lower-tier events. See [KV Indexer Metrics](../../observability/metrics.md#kv-indexer-metrics).
+
+### `POST /reopen_logs` — Reopen the access log
+
+Reopen the file configured by `--access-log` after an external log rotation renames or
+moves the active file. When access logging is disabled, the endpoint returns the same
+successful no-op response.
+
+```bash
+curl -X POST http://localhost:8090/reopen_logs
+```
+
+Returns:
+
+```json
+{"status":"ok"}
+```
 
 ### `POST /register` — Register an endpoint
 
-Register a ZMQ endpoint for an instance. Each call creates or reuses the indexer for the given `(model_name, tenant_id)` pair.
+Register a ZMQ endpoint for an instance. Each call creates or reuses the indexer for the given `(model_name, routing_group)` pair.
 Registration is non-blocking: if the worker is not up yet, the listener is accepted in `pending` state and transitions to `active` once the initial ZMQ connection succeeds.
 
 ```bash
-# Single model, default tenant
+# Single model, default routing group
 curl -X POST http://localhost:8090/register \
   -H 'Content-Type: application/json' \
   -d '{
@@ -186,14 +207,14 @@ curl -X POST http://localhost:8090/register \
     "block_size": 16
   }'
 
-# With tenant isolation
+# With an explicit routing group
 curl -X POST http://localhost:8090/register \
   -H 'Content-Type: application/json' \
   -d '{
     "instance_id": 2,
     "endpoint": "tcp://127.0.0.1:5558",
     "model_name": "llama-3-8b",
-    "tenant_id": "customer-a",
+    "routing_group": "customer-a",
     "block_size": 16,
     "dp_rank": 0
   }'
@@ -205,42 +226,62 @@ curl -X POST http://localhost:8090/register \
 | `endpoint` | yes | — | ZMQ PUB address to subscribe to |
 | `model_name` | yes | — | Model name (used to select the indexer) |
 | `block_size` | yes | — | KV cache block size (must match the engine) |
-| `tenant_id` | no | `"default"` | Tenant identifier for isolation |
+| `routing_group` | no | `"default"` | Worker routing group |
 | `dp_rank` | no | `0` | Data parallel rank |
 | `replay_endpoint` | no | — | ZMQ ROUTER address for gap replay (e.g. `tcp://host:5560`) |
+| `additional_salt` | no | — | Per-tenant salt (Mooncake RFC #1403 `additionalsalt`, alias accepted). Currently parsed for forward compatibility — engines apply their own salting today. |
+
+For transition compatibility, indexer HTTP inputs also accept a string `tenant_id`, and the
+CLI accepts the hidden `--tenant-id` flag. These values are ignored. `routing_group` always
+controls worker eligibility; when it is omitted, the endpoint's normal default or all-groups
+behavior applies. Responses never include `tenant_id`.
 
 ### `POST /unregister` — Deregister an instance
 
-Remove an instance. Omitting `tenant_id` removes the instance from **all** tenants for the given model; providing it targets only that tenant's indexer.
+Remove an instance. Omitting `routing_group` removes the instance from every routing group for the given model; providing it targets one routing group.
 
 ```bash
-# Remove from all tenants
+# Remove from all routing groups
 curl -X POST http://localhost:8090/unregister \
   -H 'Content-Type: application/json' \
   -d '{"instance_id": 1, "model_name": "llama-3-8b"}'
 
-# Remove from a specific tenant
+# Remove from a specific routing group
 curl -X POST http://localhost:8090/unregister \
   -H 'Content-Type: application/json' \
-  -d '{"instance_id": 1, "model_name": "llama-3-8b", "tenant_id": "customer-a"}'
+  -d '{"instance_id": 1, "model_name": "llama-3-8b", "routing_group": "customer-a"}'
 
 # Remove a specific dp_rank
 curl -X POST http://localhost:8090/unregister \
   -H 'Content-Type: application/json' \
-  -d '{"instance_id": 1, "model_name": "llama-3-8b", "tenant_id": "default", "dp_rank": 0}'
+  -d '{"instance_id": 1, "model_name": "llama-3-8b", "routing_group": "default", "dp_rank": 0}'
 ```
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `instance_id` | yes | — | Worker instance to remove |
 | `model_name` | yes | — | Model name (identifies the indexer) |
-| `tenant_id` | no | — | Tenant identifier (omit to remove from all tenants) |
+| `routing_group` | no | — | Routing group (omit to remove from every group) |
 | `dp_rank` | no | — | Specific dp_rank to remove (omit to remove all) |
 
 ### `GET /workers` — List registered instances
 
+Returns all registered workers, optionally filtered by model and routing group.
+
+| Query parameter | Description |
+|-----------------|-------------|
+| `model_name` | Return only workers registered for this model. Omit to return all models. |
+| `routing_group` | Return only workers registered for this routing group. Omit to return all groups. |
+
 ```bash
+# All workers
 curl http://localhost:8090/workers
+
+# Workers for a specific model
+curl "http://localhost:8090/workers?model_name=llama-3-8b"
+
+# Workers for a specific model and routing group
+curl "http://localhost:8090/workers?model_name=llama-3-8b&routing_group=customer-a"
 ```
 
 Returns:
@@ -250,6 +291,9 @@ Returns:
     "instance_id": 1,
     "source": "zmq",
     "status": "active",
+    "model_name": "llama-3-8b",
+    "routing_group": "default",
+    "block_size": 16,
     "endpoints": {
       "0": "tcp://127.0.0.1:5557",
       "1": "tcp://127.0.0.1:5558"
@@ -264,18 +308,22 @@ Returns:
         "status": "active"
       }
     }
-  },
-  {
-    "instance_id": 2,
-    "source": "discovery",
-    "status": "active",
-    "endpoints": {},
-    "listeners": {}
   }
 ]
 ```
 
-For ZMQ-managed workers, `status` is aggregated across listeners with priority `failed > pending > active > paused`. Each listener entry may also expose a `last_error` field when the most recent startup or recv-loop attempt failed.
+| Response field | Description |
+|----------------|-------------|
+| `instance_id` | Worker instance identifier |
+| `source` | Always `"zmq"` for ZMQ-managed workers |
+| `status` | Aggregated listener status: `failed > pending > active > paused` |
+| `model_name` | Model this worker is registered under |
+| `routing_group` | Routing group this worker is registered under |
+| `block_size` | KV cache block size for this worker's `(model_name, routing_group)` indexer |
+| `endpoints` | Map of `dp_rank → zmq_address` |
+| `listeners` | Per-dp_rank listener detail; each entry may include a `last_error` field when the most recent startup or recv-loop attempt failed |
+
+Filters are independent — providing both `model_name` and `routing_group` returns only workers matching both. An empty array is returned (not a 404) when no workers match the filter.
 
 ### `POST /query` — Query overlap for token IDs
 
@@ -292,18 +340,37 @@ Returns:
 {
   "scores": {"1": {"0": 32}, "2": {"1": 0}},
   "frequencies": [1, 1],
-  "tree_sizes": {"1": {"0": 5}, "2": {"1": 3}}
+  "instances": {
+    "1": {
+      "longest_matched": 48,
+      "gpu": 32,
+      "dp": {"0": 32},
+      "cpu": 48,
+      "disk": 48
+    },
+    "2": {
+      "longest_matched": 0,
+      "gpu": 0,
+      "dp": {"1": 0},
+      "cpu": 0,
+      "disk": 0
+    }
+  }
 }
 ```
 
-Scores are in **matched tokens** (block overlap count × block size). Nested by `instance_id` then `dp_rank`.
+All counts are in **matched tokens** (block overlap count × block size).
+
+- `scores` / `frequencies`: legacy device-tier overlap. `scores` is nested by `instance_id` then `dp_rank`. Preserved for backward compatibility — existing callers do not need to change.
+- `instances`: per-instance, per-tier breakdown aligned with [Mooncake RFC #1403](https://github.com/kvcache-ai/Mooncake/issues/1403). See [Per-instance tier breakdown](#per-instance-tier-breakdown) below.
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `token_ids` | yes | — | Token sequence to query |
 | `model_name` | yes | — | Model name (selects the indexer) |
-| `tenant_id` | no | `"default"` | Tenant identifier |
+| `routing_group` | no | `"default"` | Worker routing group |
 | `lora_name` | no | — | LoRA adapter (overrides indexer-level lora_name for this query) |
+| `cache_salt` | no | — | Per-request cache salt (Mooncake RFC #1403). The indexer mixes it into hashes computed from `token_ids`; equal tokens with different salts do not match. |
 
 ### `POST /query_by_hash` — Query overlap for pre-computed hashes
 
@@ -313,17 +380,39 @@ curl -X POST http://localhost:8090/query_by_hash \
   -d '{"block_hashes": [123456, 789012], "model_name": "llama-3-8b"}'
 ```
 
-Same response format as `/query`. Scores are in matched tokens.
+Same response format as `/query`, including the per-instance `instances` map. Scores are in matched tokens.
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `block_hashes` | yes | — | Pre-computed block hash array |
 | `model_name` | yes | — | Model name (selects the indexer) |
-| `tenant_id` | no | `"default"` | Tenant identifier |
+| `routing_group` | no | `"default"` | Worker routing group |
+| `cache_salt` | no | — | Must be omitted or `null`. Any string value, including an empty string, returns `400 Bad Request`. |
+
+`block_hashes` are opaque outputs of token hashing, so the indexer cannot apply or verify a salt
+after they have been computed. Callers must precompute these hashes with the intended cache salt
+and omit `cache_salt` from `/query_by_hash`. Use `/query` when the indexer should compute salted
+hashes from tokens server-side.
+
+### Per-instance tier breakdown
+
+Each entry in `instances` is keyed by `instance_id` (as a string) and reports prefix reach across the device, host-pinned, and disk storage tiers:
+
+| Field | Description |
+|-------|-------------|
+| `gpu` | Tokens matched on the device tier (the longest device-tier prefix for any `dp_rank` of this instance). |
+| `dp` | Per-`dp_rank` device-tier match count, as `{rank: tokens}`. |
+| `cpu` | Tokens matched through the host-pinned tier. **Cumulative** through the device tier — includes everything counted in `gpu` plus any host-pinned extension. |
+| `disk` | Tokens matched through the disk (or external) tier. **Cumulative** through the device → host-pinned walk. |
+| `longest_matched` | The maximum of `gpu`, `cpu`, and `disk` — a single "best prefix length" the gateway can sort on. |
+
+Tier counts are cumulative because the lower-tier walk reports each tier's *extension* on top of the previous one. Under a natural offload pipeline (device → host → disk), this guarantees `gpu ≤ cpu ≤ disk` for every instance — lower tiers extend the device-tier prefix rather than shrink it.
+
+Legacy callers that only consume `scores` keep working: those values are equal to each instance's per-`dp_rank` `gpu` count.
 
 ### `GET /dump` — Dump all radix tree events
 
-Returns the full radix tree state as a JSON object keyed by `model_name:tenant_id`:
+Returns the full radix tree state as a JSON object keyed by `model_name:routing_group`:
 
 ```bash
 curl http://localhost:8090/dump
@@ -390,38 +479,9 @@ If no `replay_endpoint` is configured, gaps are logged as warnings but not recov
 
 The sequence counter (`last_seq`) persists across unregister/register cycles, so re-registering a worker after a gap will trigger replay on the first batch received by the new listener.
 
-## Dynamo Runtime Mode
-
-When started with `--dynamo-runtime`, the indexer integrates with the Dynamo distributed runtime:
-
-### Worker Discovery
-
-The indexer watches MDC (Model Discovery Catalog) for worker additions and removals. When a worker registers with MDC, the indexer automatically creates an indexer for its model and block size. Workers discovered via MDC are tracked separately from those registered via `--workers` or the `/register` HTTP API; a worker cannot be registered through both paths simultaneously.
-
-### Event Plane Subscription
-
-Instead of connecting directly to ZMQ PUB sockets on each worker, the indexer subscribes to KV events through the Dynamo event plane. The transport (NATS or ZMQ) is determined by the `DYNAMO_EVENT_TRANSPORT` environment variable. Events are routed to the appropriate indexer based on the worker ID.
-
-### Request Plane Query Endpoint
-
-The indexer registers a query endpoint on the Dynamo request plane, allowing frontends to send `IndexerQueryRequest` messages containing a model name, namespace, and block hashes. The indexer looks up the appropriate radix tree and returns overlap scores. This enables frontends to use a remote indexer for KV-aware routing without direct HTTP access.
-
-### Example
-
-```bash
-# Start the indexer with runtime integration
-python -m dynamo.indexer --dynamo-runtime \
-  --namespace my-namespace \
-  --component-name kv-indexer \
-  --worker-component backend \
-  --port 8090 --threads 4
-```
-
-The HTTP API remains fully available in runtime mode. Static workers can be added via `--workers` alongside discovered workers.
-
 ## Limitations
 
-- **Standalone mode is ZMQ only**: In standalone mode, workers must publish KV events via ZMQ PUB sockets. Build with `kv-indexer-runtime` and use `--dynamo-runtime` to receive events via the event plane (NATS or ZMQ).
+- **Standalone mode is ZMQ only**: Workers must publish KV events via ZMQ PUB sockets.
 - **No routing logic**: The indexer only maintains the radix tree and answers queries. It does not track active blocks, manage request lifecycle, or perform worker selection.
 
 ## Architecture
@@ -438,7 +498,7 @@ graph TD
     subgraph "Standalone Indexer (HTTP)"
         REG[Worker Registry]
         ZMQ[ZMQ SUB Listeners]
-        IDX["Indexer Map<br/>(model, tenant) → Radix Tree"]
+        IDX["Indexer Map<br/>(model, routing group) → Radix Tree"]
         HTTP[HTTP API<br/>/query /dump /register /health]
     end
 
@@ -458,62 +518,6 @@ graph TD
     style ZMQ fill:#2e8b57,stroke:#333,color:#fff
     style REG fill:#2e8b57,stroke:#333,color:#fff
     style HTTP fill:#2e8b57,stroke:#333,color:#fff
-    style CLIENT fill:#fff3e0,stroke:#333,color:#333
-```
-
-### Dynamo Runtime Mode
-
-```mermaid
-graph TD
-    subgraph Workers
-        W1[Worker 1]
-        W2[Worker 2]
-    end
-
-    subgraph "Dynamo Runtime"
-        MDC[MDC Discovery]
-        EP[Event Plane<br/>NATS / ZMQ]
-        RP[Request Plane]
-    end
-
-    subgraph "Standalone Indexer"
-        DISC[Discovery Watcher]
-        SUB[Event Subscriber]
-        REG[Worker Registry]
-        IDX["Indexer Map<br/>(model, tenant) → Radix Tree"]
-        QE[Query Endpoint]
-        HTTP[HTTP API<br/>/query /dump /register /metrics]
-    end
-
-    FRONTEND[Frontend / Router]
-    CLIENT[External Client]
-
-    W1 -->|register| MDC
-    W2 -->|register| MDC
-    MDC -->|added/removed| DISC
-    DISC -->|add/remove workers| REG
-    W1 -->|KV events| EP
-    W2 -->|KV events| EP
-    EP -->|RouterEvent| SUB
-    SUB -->|apply events| IDX
-    FRONTEND -->|IndexerQueryRequest| RP
-    RP --> QE
-    QE -->|query| IDX
-    CLIENT -->|POST /query, GET /dump| HTTP
-    HTTP -->|query| IDX
-
-    style W1 fill:#f3e5f5,stroke:#333,color:#333
-    style W2 fill:#f3e5f5,stroke:#333,color:#333
-    style MDC fill:#e3f2fd,stroke:#333,color:#333
-    style EP fill:#e3f2fd,stroke:#333,color:#333
-    style RP fill:#e3f2fd,stroke:#333,color:#333
-    style IDX fill:#2e8b57,stroke:#333,color:#fff
-    style SUB fill:#2e8b57,stroke:#333,color:#fff
-    style DISC fill:#2e8b57,stroke:#333,color:#fff
-    style REG fill:#2e8b57,stroke:#333,color:#fff
-    style QE fill:#2e8b57,stroke:#333,color:#fff
-    style HTTP fill:#2e8b57,stroke:#333,color:#fff
-    style FRONTEND fill:#fff3e0,stroke:#333,color:#333
     style CLIENT fill:#fff3e0,stroke:#333,color:#333
 ```
 
@@ -538,6 +542,6 @@ sequenceDiagram
 ## See Also
 
 - **[Mooncake KV Indexer RFC](https://github.com/kvcache-ai/Mooncake/issues/1403)**: Community API standardization for KV cache indexers
-- **[Router Guide](router-guide.md)**: Full KV router configuration and tuning
+- **[Configuration and Tuning](router-configuration.md)**: Full KV router configuration and tuning
 - **[Router Design](../../design-docs/router-design.md)**: Architecture and event transport modes
 - **[Standalone Router](../../../components/src/dynamo/router/README.md)**: Full routing service (routes requests to workers)

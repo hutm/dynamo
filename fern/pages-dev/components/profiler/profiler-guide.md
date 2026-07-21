@@ -2,13 +2,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 title: Profiler Guide
+subtitle: Runs the AI Configurator-driven profiling pipeline that turns a model, SLA targets, and backend into a ready-to-deploy DGD.
 ---
 
 ## Overview
 
 The Dynamo Profiler analyzes model inference performance and generates optimized deployment configurations (DynamoGraphDeployments). Given a model, hardware, and SLA targets, it determines the best parallelization strategy, selects optimal prefill and decode engine configurations, and produces a ready-to-deploy DGD YAML.
 
-The profiler accepts a `DynamoGraphDeploymentRequestSpec` (DGDR) as input and uses [AI Configurator (AIC)](https://github.com/ai-dynamo/aiconfigurator) for performance simulation, candidate enumeration, and configuration picking. When the planner is enabled, the profiler additionally generates engine interpolation curves used for runtime autoscaling.
+The profiler accepts a `DynamoGraphDeploymentRequestSpec` (DGDR) as input and uses [AI Configurator (AIC)](https://github.com/ai-dynamo/aiconfigurator) for performance simulation, candidate enumeration, and configuration picking. When the planner is enabled, the profiler also emits native AIC perf-model identity for the Rust engine perf shim and can generate optional engine interpolation curves used to bootstrap runtime autoscaling.
 
 ## Workflow
 
@@ -46,7 +47,7 @@ flowchart TD
     MockerBase --> PlannerCheck{planner?}
     PlannerCheck -->|yes| AddPlanner["add_planner_to_config()"]
     PlannerCheck -->|no| ProfileCheck
-    AddPlanner --> ProfileCheck{"needs profile data?\n(mocker or throughput\nplanner enabled)"}
+    AddPlanner --> ProfileCheck{"needs profile data?\n(thorough mocker or\nthorough throughput planner)"}
     ProfileCheck -->|yes| AddProfile["add_profile_data_to_config()"]
     ProfileCheck -->|no| Final
     AddProfile --> Final["final_config.yaml"]
@@ -64,12 +65,12 @@ flowchart TD
 
 4. **DGD Generation**: The picked configuration is rendered into a complete DGD YAML via AIC's generator pipeline, including correct parallelization, replica counts, container image, and PVC mounts.
 
-5. **Interpolation** (throughput planner/mocker): When the planner is enabled, the profiler generates detailed performance interpolation curves — TTFT vs ISL for prefill, ITL vs KV-cache utilization for decode. These are stored as NPZ files and later packaged into a ConfigMap during final assembly.
+5. **Interpolation** (planner bootstrap/mocker): When mocker or planner bootstrap data is requested, the profiler generates detailed performance interpolation curves — TTFT vs ISL for prefill, ITL vs KV-cache utilization for decode. In thorough sweeping, these are stored as NPZ files and later packaged into a ConfigMap during final assembly. In rapid sweeping, consumers use AIC performance-model flags, planner `aic_perf_model`, or in-process interpolation instead, so no profile-data ConfigMap is generated.
 
 6. **Final Assembly** (3 composable layers):
    1. **Mocker base**: If mocker is enabled, the base DGD is swapped for the mocker DGD template (`generate_mocker_config`). Otherwise the AIC-picked DGD is kept.
    2. **Planner service**: If the planner is enabled, the Planner pod and its planner-config ConfigMap are injected into the DGD (`add_planner_to_config`).
-   3. **Profile data**: If mocker is enabled or planner throughput-based scaling is enabled, the interpolation data ConfigMap is created and mounted into all consumers — the Planner service and/or mocker workers (`add_profile_data_to_config`).
+   3. **Profile data**: In thorough sweeping, if mocker is enabled or planner throughput-based scaling is enabled, the interpolation data ConfigMap is created and mounted into all consumers — the Planner service and/or mocker workers (`add_profile_data_to_config`). Rapid sweeping does not create this ConfigMap.
 
    The result is written to `final_config.yaml`.
 
@@ -77,14 +78,18 @@ flowchart TD
 
 ### Rapid
 
-Uses AIC's performance simulation to estimate optimal configurations without deploying real engines. Completes in ~30 seconds.
+Uses AIC's performance simulation to estimate optimal configurations without
+deploying real engines. Completes in ~30 seconds; see the
+[AIC support matrix](https://ai-dynamo.github.io/aiconfigurator/support-matrix/).
 
 ```yaml
 searchStrategy: rapid
 ```
 
 - Supports all backends: vLLM, SGLang, TensorRT-LLM
-- If the model/hardware/backend combination is not supported by AIC, falls back to a naive config (memory-fit TP calculation)
+- Falls back to a naive config (memory-fit TP calculation) only after DGDR
+  accepts the GPU SKU. Fallback sizing depends on AIC system metadata and does
+  not add support for additional GPU SKUs.
 - No GPU resources consumed during profiling
 
 ### Thorough
@@ -123,22 +128,25 @@ Triggered when there is **no planner and no target load**. Maximizes throughput 
 
 ## Planner Integration
 
-When the planner is enabled, the profiler generates engine interpolation data needed for throughput-based autoscaling. The `pre_deployment_sweeping_mode` field controls how this data is produced:
+When the planner is enabled, the profiler emits `aic_perf_model` identity for the Rust engine perf shim whenever picked configs are available. The `pre_deployment_sweeping_mode` field controls optional bootstrap data:
 
 ```yaml
 features:
   planner:
+    optimization_target: sla              # required for throughput-based scaling and specific SLA targets
     pre_deployment_sweeping_mode: rapid   # rapid | thorough | none
     enable_throughput_scaling: true
 ```
 
-- **rapid**: Uses AIC simulation to generate interpolation curves (~30s, no GPUs)
-- **thorough**: Deploys the selected engine config on real GPUs and sweeps across ISL/concurrency ranges (2-4h)
-- **none**: Skips interpolation. Only valid when using load-based scaling without throughput-based scaling.
+`optimization_target` must be set to `sla` for `enable_throughput_scaling` and the planner's `ttft_ms`/`itl_ms` SLA targets to take effect. The `PlannerConfig` default is `throughput`, which uses static queue/utilization thresholds: it silently flips `enable_throughput_scaling` to `false` (so pre-deployment profiling is skipped and `planner-profile-data-XXXX` is not emitted) and ignores any `features.planner.ttft_ms`/`itl_ms` values. `enable_load_scaling` is unaffected (easy-mode keeps load scaling enabled). See the [Planner Guide](../planner/planner-guide.md#optimization-target) for the full explanation of each `optimization_target` value.
 
-The profiler saves two ConfigMaps into the generated DGD:
-- **planner-config-XXXX**: Serialized `PlannerConfig` JSON (with `profile_results_dir` pointing to the profiling data mount)
-- **planner-profile-data-XXXX**: Prefill and decode interpolation data (JSON)
+- **rapid**: Uses AIC simulation to generate interpolation curves (~30s, no GPUs). Consumers use AIC performance-model flags, planner `aic_perf_model`, or in-process interpolation, so `planner-profile-data-XXXX` is not emitted.
+- **thorough**: Deploys the selected engine config on real GPUs and sweeps across ISL/concurrency ranges (2-4h). When profile data is needed, the profiler packages it into `planner-profile-data-XXXX`.
+- **none**: Skips interpolation. Planner throughput scaling can still start from native AIC or live FPM regression warmup. Mocker still requires pre-deployment sweeping.
+
+The generated DGD can include these ConfigMaps:
+- **planner-config-XXXX**: Serialized `PlannerConfig` JSON (with `aic_perf_model` when available and `profile_results_dir` pointing to the profiling data mount)
+- **planner-profile-data-XXXX**: Prefill and decode interpolation data (JSON). Only emitted when `pre_deployment_sweeping_mode: thorough` and either `optimization_target: sla` is set alongside `enable_throughput_scaling: true`, or mocker is enabled. Rapid mode does not emit this ConfigMap.
 
 See the [Planner Guide](../planner/planner-guide.md) for the full `PlannerConfig` reference.
 
@@ -155,10 +163,12 @@ The profiler enforces these rules at startup:
 | Condition | Behavior |
 |-----------|----------|
 | `searchStrategy: thorough` + `backend: auto` | Rejected. Specify a concrete backend. |
-| AIC unsupported + `enable_throughput_scaling: true` | Rejected. Throughput planner requires AIC support. |
-| AIC unsupported + `pre_deployment_sweeping_mode: rapid` | Falls back to `none` with a warning. |
-| `e2eLatency` provided without `ttft: null, itl: null` | Rejected by SLA validator. When using `e2eLatency`, explicitly null out `ttft` and `itl`. |
-| SLA unachievable | Warning logged, SLA updated to best achievable value. |
+| `enable_throughput_scaling: true` without `optimization_target: sla` | Silently coerced. `PlannerConfig` defaults `optimization_target` to `throughput`, which flips `enable_throughput_scaling` to `false` at validation time. Set `optimization_target: sla` explicitly to keep throughput-based scaling enabled. |
+| `enable_throughput_scaling: true` + `pre_deployment_sweeping_mode: none` (or unset) | Allowed for planner. The perf model starts from native AIC when available or waits for enough live FPM observations. |
+| `enable_throughput_scaling: true` + `pre_deployment_sweeping_mode: rapid` + AIC unsupported | Allowed for planner. The Rust shim falls back to observed-FPM regression when native AIC estimates are unavailable. |
+| `e2eLatency` provided together with an explicitly-set `ttft` or `itl` | Rejected by SLA validator. Provide only `e2eLatency`; `ttft` and `itl` do not need to be explicitly nulled. |
+| All AIC rapid experiments return no SLA-feasible configuration | Profiling fails and no DGD is generated. SLA targets are not relaxed automatically. |
+| A real-GPU thorough sweep returns results, but none meet the SLA | Warning logged and the closest measured configuration is selected. |
 | Load-match needs more GPUs than available | Warning logged. |
 
 ## Support Matrix
@@ -185,13 +195,7 @@ Exact model x parallelization mapping support is dependent on the backend. The p
 
 ### Kubernetes Deployment (DGDR)
 
-The recommended deployment method is through DGDRs. Sample configurations are provided in `components/src/dynamo/profiler/deploy/`:
-
-| Sample | Description |
-|--------|-------------|
-| `profile_sla_dgdr.yaml` | Standard online profiling with AIPerf |
-| `profile_sla_aic_dgdr.yaml` | Fast offline profiling with AI Configurator |
-| `profile_sla_moe_dgdr.yaml` | MoE model profiling (SGLang) |
+The recommended deployment method is through DGDRs. See [Profiler Examples](profiler-examples.md) for complete DGDR YAML examples covering rapid, thorough, MoE, custom SLA, and override use cases.
 
 #### Container Images
 
@@ -201,7 +205,7 @@ Each DGDR requires a container image for profiling and deployment:
 
 ```yaml
 spec:
-  image: "nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.0"
+  image: "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.2.1"  # dynamo-frontend for Dynamo < 1.1.0
 ```
 
 #### Quick Start: Deploy with DGDR
@@ -218,7 +222,7 @@ metadata:
 spec:
   model: "Qwen/Qwen3-0.6B"
   backend: vllm
-  image: "nvcr.io/nvidia/ai-dynamo/dynamo-frontend:1.0.0"
+  image: "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.2.1"  # dynamo-frontend for Dynamo < 1.1.0
 ```
 
 **Step 2: Apply the DGDR**
@@ -266,6 +270,33 @@ curl http://localhost:8000/v1/models
 DGDRs are **immutable**. To update SLAs or configuration, delete the existing DGDR and create a new one.
 </Note>
 
+### Local Runs with DGD Overrides
+
+The operator supplies `dgd-apply-overrides` to Kubernetes profiling jobs when
+`overrides.dgd` is present. For a local run, put the matching binary on `PATH`.
+From a Dynamo checkout with Go installed, build and install it with:
+
+```bash
+go -C deploy/operator install ./cmd/dgd-apply-overrides
+python -m dynamo.profiler --config /path/to/dgdr-spec.yaml
+```
+
+`go install` writes the binary to `GOBIN`, or to `$(go env GOPATH)/bin` when
+`GOBIN` is unset. Add that directory to `PATH` if needed. Alternatively, set
+`DYNAMO_DGD_APPLY_OVERRIDES_BIN` to the binary's absolute path. The profiler
+does not download the binary at runtime. Runs without `overrides.dgd` do not
+require the helper.
+
+Use a binary from the same Dynamo release as the profiler. The profiler checks
+the binary protocol before applying an override and rejects incompatible versions.
+For supported DGD versions and merge behavior, see
+[Generated DGD Overrides](../../kubernetes/dgdr.md#generated-dgd-overrides).
+
+Registry credentials are namespace-scoped. The operator chart's
+`imagePullSecrets` pull the operator Pod only. A profiling Job that needs
+credentials for the operator image must receive them from its ServiceAccount or
+from `overrides.profilingJob.template.spec.imagePullSecrets` in the DGDR namespace.
+
 ## Profiling Method
 
 The profiler follows a 5-step process:
@@ -310,7 +341,7 @@ Uses performance simulation to rapidly estimate optimal configurations without r
 - **Duration**: 20-30 seconds
 - **Accuracy**: Estimated (may have errors for unusual configurations)
 - **GPU Requirements**: None
-- **Backends**: TensorRT-LLM only (vLLM/SGLang coming soon)
+- **Backends**: All (vLLM, SGLang, TensorRT-LLM)
 
 AI Configurator is used by default with `searchStrategy: rapid`:
 
@@ -324,7 +355,7 @@ spec:
 </Note>
 
 **Currently supports:**
-- **Backends**: TensorRT-LLM (versions 0.20.0, 1.0.0rc3, 1.0.0rc6)
+- **Backends**: vLLM, SGLang, TensorRT-LLM
 - **Systems**: H100 SXM, H200 SXM, B200 SXM, GB200 SXM, A100 SXM
 - **Models**: Wide range including GPT, Llama, Mixtral, DeepSeek, Qwen, and more
 
@@ -335,10 +366,15 @@ See [AI Configurator documentation](https://github.com/ai-dynamo/aiconfigurator#
 The operator automatically discovers GPU resources from cluster nodes, providing hardware info (GPU model, VRAM, GPUs per node) and automatic profiling search space calculation.
 
 **Requirements:**
-- **Cluster-scoped operators**: Have node read permissions by default
-- **Namespace-scoped operators**: GPU discovery is enabled by default when installing via Helm — the chart provisions the required ClusterRole/ClusterRoleBinding automatically
+- **Cluster-scoped operators** (recommended): Have node read permissions by default. GPU discovery works automatically.
 
-**For namespace-scoped operators**, GPU discovery is controlled by a Helm value:
+<Warning>
+Namespace-restricted operators are only for development and testing. They are not supported for production.
+</Warning>
+
+- **Namespace-restricted operators**: GPU discovery is enabled by default when installing with Helm. The chart provisions the required ClusterRole and ClusterRoleBinding.
+
+For namespace-restricted operators, control GPU discovery with a Helm value:
 
 ```bash
 # GPU discovery enabled (default) — Helm provisions read-only node access automatically
@@ -354,7 +390,7 @@ If GPU discovery is disabled, provide hardware config manually in the DGDR:
 spec:
   hardware:
     numGpusPerNode: 8
-    gpuSku: "H100-SXM5-80GB"
+    gpuSku: h100_sxm
     vramMb: 81920
 ```
 
@@ -374,7 +410,7 @@ metadata:
 spec:
   model: "Qwen/Qwen3-0.6B"
   backend: vllm
-  image: "nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.0"
+  image: "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.2.1"  # dynamo-frontend for Dynamo < 1.1.0
 
   searchStrategy: rapid  # or thorough
   autoApply: true
@@ -439,13 +475,14 @@ Pass arguments to the SLA planner via the features section:
 ```yaml
 features:
   planner:
-    planner_min_endpoint: 2                    # Minimum endpoints to maintain
-    planner_adjustment_interval: 60            # Adjustment interval (seconds)
-    planner_load_predictor: linear             # Load prediction method
+    min_endpoint: 2                            # Minimum endpoints to maintain
+    load_adjustment_interval_seconds: 5        # Load-scaling interval (seconds)
+    throughput_adjustment_interval_seconds: 60 # Throughput-scaling interval (seconds)
+    load_predictor: linear                     # Load prediction method
 ```
 
 <Note>
-Planner arguments use `planner_` prefix. See [SLA Planner documentation](../planner/planner-guide.md) for full list.
+Planner arguments use the `PlannerConfig` field names consumed by the planner service. See [SLA Planner documentation](../planner/planner-guide.md) for full list.
 </Note>
 
 ### Model Cache PVC (Advanced)
@@ -518,9 +555,23 @@ The Profiler generates interpolation data that the SLA Planner uses for autoscal
 When using DGDR, the Dynamo Operator:
 
 1. Creates profiling jobs automatically
-2. Stores profiling data in ConfigMaps (`planner-profile-data`)
+2. Stores profiler output in ConfigMaps (`dgdr-output-<name>` and, when thorough profile data is needed, `planner-profile-data`)
 3. Generates optimized DGD configurations
 4. Deploys the DGD with SLA Planner integration
+
+#### Failure Handling
+
+Profiling failures are not retried at the Kubernetes Job level (`backoffLimit: 0`).
+Most profiler errors — validation failures, unsupported model/hardware combinations,
+missing configs — are deterministic and will never succeed on retry, so re-running
+the full profiling cycle would only waste GPU time.
+
+When the profiler reports failure, the output-copier sidecar writes the error
+details (phase, error message, profiler status) to the output ConfigMap and exits
+successfully. The DGDR controller reads the failure from the ConfigMap and
+transitions the DGDR directly to the `Failed` phase with the specific sub-phase
+failure reason (e.g., `SweepingDecodeFailed`, `GeneratingDGDFailed`). Use
+`kubectl describe dgdr <name>` to see the failure details in the conditions.
 
 The generated DGD is tracked via labels:
 ```yaml
@@ -574,11 +625,11 @@ spec:
   autoApply: true
 ```
 
-Profiling still runs against the real backend to collect performance data. The mocker uses this data to simulate realistic timing behavior. Useful for large-scale experiments, testing Planner behavior, and validating configurations.
+With thorough sweeping, profiling still runs against the real backend to collect performance data and stores it in `planner-profile-data`. With rapid sweeping, the mocker uses AIC performance-model flags instead of a profile-data ConfigMap. Useful for large-scale experiments, testing Planner behavior, and validating configurations.
 
 ### Accessing Profiling Artifacts
 
-By default, profiling data is stored in ConfigMaps. For detailed artifacts (plots, logs, raw data), attach a PVC via overrides:
+By default, profiler output is stored in ConfigMaps. For detailed artifacts (plots, logs, raw data), attach a PVC via overrides:
 
 ```yaml
 overrides:
@@ -591,9 +642,9 @@ overrides:
             claimName: "dynamo-pvc"
 ```
 
-**ConfigMaps (always created):**
+**ConfigMaps:**
 - `dgdr-output-<name>`: Generated DGD configuration
-- `planner-profile-data`: Profiling data for Planner (JSON)
+- `planner-profile-data`: Profiling data for Planner and mocker consumers (JSON). Only created for thorough sweeping when profile data is needed.
 
 **PVC artifacts (optional):**
 - Performance plots (PNGs)
@@ -630,14 +681,14 @@ SGLang workers expose profiling endpoints for runtime performance analysis:
 
 ```bash
 # Start profiling
-curl -X POST http://localhost:9090/engine/start_profile \
+curl -X POST http://localhost:9090/engine/control/start_profile \
   -H "Content-Type: application/json" \
   -d '{"output_dir": "/tmp/profiler_output"}'
 
 # Run inference requests...
 
 # Stop profiling
-curl -X POST http://localhost:9090/engine/stop_profile
+curl -X POST http://localhost:9090/engine/control/stop_profile
 ```
 
 View traces using Chrome's `chrome://tracing`, [Perfetto UI](https://ui.perfetto.dev/), or TensorBoard.
@@ -646,7 +697,13 @@ View traces using Chrome's `chrome://tracing`, [Perfetto UI](https://ui.perfetto
 
 ### SLA Cannot Be Met
 
-The profiler logs a warning and updates the SLA to the best achievable value. To improve results:
+The behavior depends on the search strategy:
+
+- With `searchStrategy: rapid`, profiling fails when all AIC experiments return no SLA-feasible configuration. The profiler does not relax the SLA or generate a DGD.
+- With `searchStrategy: thorough`, the profiler selects the closest measured configuration and logs a warning when the sweep produces results but none meet the SLA. Profiling fails if the sweep produces no usable results.
+
+To improve results:
+
 - Relax SLA targets (increase TTFT/ITL)
 - Add more GPU resources
 - Try a different backend

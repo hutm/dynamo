@@ -2,9 +2,24 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 title: Autoscaling
+subtitle: Scales DGD services with the DynamoGraphDeploymentScalingAdapter using KEDA, Kubernetes HPA, or the Dynamo Planner.
 ---
 
 This guide explains how to configure autoscaling for DynamoGraphDeployment (DGD) services using the `sglang-agg` example from `examples/backends/sglang/deploy/agg.yaml`.
+
+## Scale-to-Zero Limitation
+
+<Warning>
+Scale-to-zero is currently not fully supported for DGD worker components. The
+`DynamoGraphDeploymentScalingAdapter` (DGDSA) and operator accept a replica count of `0`, but when
+every worker for a model scales to zero, the frontend removes the model from `/v1/models` because
+no live `ModelDeploymentCard` remains. Requests for the model return HTTP 404 and do not provide
+a model-specific demand signal that Kubernetes Event-driven Autoscaling (KEDA) or Planner can use
+to scale the workers up again. For request-driven autoscaling, keep at least one replica for each
+required worker component by setting `minReplicas: 1` for the Kubernetes Horizontal Pod
+Autoscaler (HPA) or `minReplicaCount: 1` for KEDA. Scaling back up from zero requires a manual
+action or another external signal that does not depend on frontend model discovery.
+</Warning>
 
 ## Example DGD
 
@@ -20,12 +35,10 @@ metadata:
 spec:
   services:
     Frontend:
-      dynamoNamespace: sglang-agg
       componentType: frontend
       replicas: 1
 
     decode:
-      dynamoNamespace: sglang-agg
       componentType: worker
       replicas: 1
       resources:
@@ -228,11 +241,15 @@ Dynamo exports several metrics useful for autoscaling. These are available at th
 
 | Metric | Type | Description | Good for scaling |
 |--------|------|-------------|------------------|
-| `dynamo_frontend_queued_requests` | Gauge | Requests waiting in HTTP queue | ✅ Workers |
-| `dynamo_frontend_inflight_requests` | Gauge | Concurrent requests to engine | ✅ All services |
+| `dynamo_frontend_active_requests` | Gauge | Total concurrent requests from HTTP entry to response complete | ✅ All services |
+| `dynamo_frontend_stage_requests{stage,phase}` | Gauge | Requests currently in a given frontend pipeline stage (`preprocess`, `route`, `dispatch`) | ✅ Workers — use `sum(...)` for queue-depth behavior, or `stage="dispatch"` for backend-prefill saturation |
 | `dynamo_frontend_time_to_first_token_seconds` | Histogram | TTFT latency | ✅ Workers |
 | `dynamo_frontend_inter_token_latency_seconds` | Histogram | ITL latency | ✅ Decode |
 | `dynamo_frontend_request_duration_seconds` | Histogram | Total request duration | ⚠️ General |
+| `dynamo_frontend_inflight_requests` | Gauge | Concurrent requests to engine | ⚠️ **Deprecated** — use `dynamo_frontend_active_requests` |
+| `dynamo_frontend_queued_requests` | Gauge | Requests waiting in HTTP queue | ⚠️ **Deprecated** — use `sum(dynamo_frontend_stage_requests)` across `preprocess` + `route` + `dispatch` |
+
+For the full definition of the `stage` and `phase` labels and derived-signal formulas, see [Stage and phase labels](../observability/metrics.md#stage-and-phase-labels) in the Metrics Reference.
 
 #### Metric Labels
 
@@ -240,7 +257,7 @@ Dynamo metrics include these labels for filtering:
 
 | Label | Description | Example |
 |-------|-------------|---------|
-| `dynamo_namespace` | Unique DGD identifier (`{k8s-namespace}-{dynamoNamespace}`) | `default-sglang-agg` |
+| `dynamo_namespace` | Unique DGD identifier (`{k8s-namespace}-{dgd-name}`) | `default-sglang-agg` |
 | `model` | Model being served | `Qwen/Qwen3-0.6B` |
 
 <Note>
@@ -315,7 +332,7 @@ spec:
         name: dynamo_ttft_p95_seconds
         selector:
           matchLabels:
-            dynamo_namespace: "default-sglang-agg"  # ← {namespace}-{dynamoNamespace}
+            dynamo_namespace: "default-sglang-agg"  # ← {namespace}-{dgd-name}
       target:
         type: Value
         value: "500m"  # Scale up when TTFT p95 > 500ms
@@ -344,16 +361,18 @@ spec:
 
 #### Example: Scale Based on Queue Depth
 
+"Queue depth" here means the number of requests that have entered the frontend but haven't yet received a first token — i.e. the sum of `dynamo_frontend_stage_requests` across the `preprocess`, `route`, and `dispatch` stages. This replaces the deprecated `dynamo_frontend_queued_requests` gauge.
+
 Add this rule to your `prometheus-adapter-values.yaml` (alongside the TTFT rule):
 
 ```yaml
 # Add to rules.external in prometheus-adapter-values.yaml
-- seriesQuery: 'dynamo_frontend_queued_requests{namespace!=""}'
+- seriesQuery: 'dynamo_frontend_stage_requests{namespace!="",stage=~"preprocess|route|dispatch"}'
   resources:
     overrides:
       namespace: {resource: "namespace"}
   name:
-    as: "dynamo_queued_requests"
+    as: "dynamo_frontend_pending_requests"
   metricsQuery: |
     sum(<<.Series>>{<<.LabelMatchers>>}) by (namespace, dynamo_namespace)
 ```
@@ -377,7 +396,7 @@ spec:
   - type: External
     external:
       metric:
-        name: dynamo_queued_requests
+        name: dynamo_frontend_pending_requests
         selector:
           matchLabels:
             dynamo_namespace: "default-sglang-agg"
@@ -394,13 +413,12 @@ KEDA (Kubernetes Event-driven Autoscaling) extends Kubernetes with event-driven 
 - No Prometheus Adapter configuration needed
 - PromQL queries are defined in the ScaledObject itself (declarative, per-deployment)
 - Easy to update - just `kubectl apply` the ScaledObject
-- Can scale to zero when idle
 - Supports multiple triggers per object
 
 **When to use KEDA:**
 - You want simpler configuration (no Prometheus Adapter to manage)
 - You need event-driven scaling (e.g., queue depth, Kafka, etc.)
-- You want to scale to zero when idle
+- You want event-driven scaling while retaining at least one replica for each required worker component
 
 ### Installing KEDA
 
@@ -500,9 +518,9 @@ spec:
   - type: prometheus
     metadata:
       serverAddress: http://prometheus-kube-prometheus-prometheus.monitoring.svc:9090
-      metricName: dynamo_queued_requests
+      metricName: dynamo_frontend_pending_requests
       query: |
-        sum(dynamo_frontend_queued_requests{dynamo_namespace="default-sglang-agg"})
+        sum(dynamo_frontend_stage_requests{dynamo_namespace="default-sglang-agg",stage=~"preprocess|route|dispatch"})
       threshold: "10"    # Scale up when queue > 10 requests
 ```
 
@@ -651,8 +669,8 @@ Avoid configuring multiple autoscalers for the same service:
 | Service Type | Recommended Metrics | Dynamo Metric |
 |--------------|---------------------|---------------|
 | Frontend | CPU utilization, request rate | `dynamo_frontend_requests_total` |
-| Prefill | Queue depth, TTFT | `dynamo_frontend_queued_requests`, `dynamo_frontend_time_to_first_token_seconds` |
-| Decode | ITL | `dynamo_frontend_inter_token_latency_seconds` |
+| Prefill | Dispatch-stage depth (backend prefill saturation), TTFT | `dynamo_frontend_stage_requests{stage="dispatch"}`, `dynamo_frontend_time_to_first_token_seconds` |
+| Decode | ITL, active concurrency | `dynamo_frontend_inter_token_latency_seconds`, `dynamo_frontend_active_requests` |
 
 ### 3. Configure Stabilization Windows
 
@@ -673,9 +691,9 @@ spec:
 
 ### 4. Set Sensible Min/Max Replicas
 
-Always configure minimum and maximum replicas in your HPA/KEDA to prevent:
-- Scaling to zero (unless intentional)
-- Unbounded scaling that exhausts cluster resources
+Always configure minimum and maximum replicas in your HPA/KEDA. For request-driven autoscaling, set
+the minimum to `1` or higher for each required worker component because scale-to-zero is not fully
+supported. Set a maximum to prevent unbounded scaling that exhausts cluster resources.
 
 ## Troubleshooting
 
@@ -712,9 +730,13 @@ If HPA/KEDA shows `<unknown>` for metrics:
 kubectl port-forward -n default svc/sglang-agg-frontend 8000:8000
 curl http://localhost:8000/metrics | grep dynamo_frontend
 
-# Example output:
-# dynamo_frontend_queued_requests{model="Qwen/Qwen3-0.6B"} 2
-# dynamo_frontend_inflight_requests{model="Qwen/Qwen3-0.6B"} 5
+# Example output (note: stage_requests has no `model` label — it's per frontend pod):
+# dynamo_frontend_active_requests{model="Qwen/Qwen3-0.6B"} 5
+# dynamo_frontend_stage_requests{stage="preprocess",phase=""} 0
+# dynamo_frontend_stage_requests{stage="route",phase="aggregated"} 0
+# dynamo_frontend_stage_requests{stage="dispatch",phase="aggregated"} 2
+# dynamo_frontend_queued_requests{model="Qwen/Qwen3-0.6B"} 2        # deprecated
+# dynamo_frontend_inflight_requests{model="Qwen/Qwen3-0.6B"} 5      # deprecated
 
 # Verify Prometheus is scraping the metrics
 kubectl port-forward -n monitoring svc/prometheus-kube-prometheus-prometheus 9090:9090
@@ -740,4 +762,3 @@ If you see unstable scaling:
 - [Planner Documentation](../components/planner/planner-guide.md)
 - [Dynamo Metrics Reference](../observability/metrics.md)
 - [Prometheus and Grafana Setup](../observability/prometheus-grafana.md)
-

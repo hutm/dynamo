@@ -18,7 +18,7 @@ Under the hood, the Tiltfile:
 1. **Compiles** the Go manager binary locally (`CGO_ENABLED=0`).
 2. **Builds** a minimal Docker image containing only the binary.
 3. **Renders** the production Helm chart (`deploy/helm/charts/platform`) with
-   `helm template`, applies CRDs via `kubectl`, and deploys all rendered
+   `helm template`, applies generated CRDs with `crd-apply`, and deploys all rendered
    resources.
 4. **Live-updates** the binary inside the running container on every code
    change — no full image rebuild required.
@@ -33,7 +33,7 @@ workloads — while iterating on controller logic with sub-second feedback.
 |------|---------|---------|
 | [Tilt](https://docs.tilt.dev/install.html) | v0.33+ | Development orchestration |
 | [Helm](https://helm.sh/docs/intro/install/) | v3 | Chart rendering |
-| [Go](https://go.dev/dl/) | 1.25+ | Compiling the operator |
+| [Go](https://go.dev/dl/) | 1.26.3+ | Compiling the operator |
 | [kubectl](https://kubernetes.io/docs/tasks/tools/) | — | Cluster access |
 | A Kubernetes cluster | — | kind, minikube, or remote cluster |
 
@@ -58,7 +58,7 @@ EOF
 tilt up
 ```
 
-Tilt opens a terminal UI and a web dashboard at <http://localhost:10350>.
+Tilt opens a terminal UI and a web dashboard at [http://localhost:10350](http://localhost:10350).
 The dashboard shows resource status, build logs, and port-forwards.
 
 Press **Space** in the terminal to open the web UI. Press **Ctrl-C** to
@@ -127,7 +127,7 @@ The operator image needs to be pullable by your cluster's nodes. The registry is
 1. **`REGISTRY` env var** — `REGISTRY=docker.io/myuser tilt up`
 2. **`registry` in `tilt-settings.yaml`**
 
-The image is pushed as `<registry>/controller:tilt-dev`.
+The image is pushed as `{registry}/controller:tilt-dev`.
 
 <Warning>
 If no registry is configured, the image is only available locally. This works
@@ -155,7 +155,7 @@ MPI SSH key provisioning at runtime — no external setup needed.
 compile the operator binary. Re-runs on changes to `api/`, `cmd/`, `internal/`,
 `go.mod`, or `go.sum`.
 
-**crds** — Applies CRDs from the Helm chart via `kubectl apply --server-side`.
+**crds** — Applies generated CRDs from `deploy/operator/config/crd/bases` using server-side apply.
 When `skip_codegen` is `false`, runs `make generate && make manifests` first.
 
 **operator** — The operator Deployment itself. Tilt watches the compiled binary
@@ -246,7 +246,7 @@ REGISTRY=ghcr.io/myorg tilt up
 
 ## Tilt UI
 
-The web UI at <http://localhost:10350> shows:
+The web UI at [http://localhost:10350](http://localhost:10350) shows:
 
 - **Resource status** — green/red/pending for each resource
 - **Build logs** — compilation output and errors
