@@ -876,7 +876,7 @@ class GMSClientMemoryManager:
             )
             if synchronize_per_mapping:
                 self._vmm.synchronize()
-                cuda_validate_pointer(va)
+                self._vmm.validate_pointer(va)
             else:
                 remapped_vas.append(va)
 
@@ -893,7 +893,7 @@ class GMSClientMemoryManager:
         if remapped_vas and validate_after_remap:
             self._vmm.synchronize()
             for va in remapped_vas:
-                cuda_validate_pointer(va)
+                self._vmm.validate_pointer(va)
 
         self._va_preserved = False
         self._unmapped = False
