@@ -512,6 +512,18 @@ def install(factory: Callable[[int], KVLeaseClient] | None = None) -> bool:
                 installed.append(block)
                 claimed_entries.append((key, entry))
 
+            # The adopted blocks are sealed cache entries, not immediately
+            # allocatable slots. A fresh vLLM BlockPool orders its free queue
+            # by block ID, so leaving recovered entries in place can put a
+            # large run of unavailable leases at the head. The next allocation
+            # then misses every preferred ID and the native lease ring rescans
+            # from slot zero. Hydration is a cache touch: move the recovered
+            # entries to the MRU tail once, off the steady-state request path,
+            # so genuinely free queue heads remain aligned with free leases.
+            for block in installed:
+                self.free_block_queue.remove(block)
+            self.free_block_queue.append_n(installed)
+
             # Bulk-hydrated entries are native evictable cache blocks, not
             # active request blocks. Seal and return them to READY immediately.
             client.seal(acquired)

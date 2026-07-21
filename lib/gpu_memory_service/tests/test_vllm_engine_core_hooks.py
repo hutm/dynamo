@@ -220,6 +220,7 @@ def test_block_pool_hbm_directory_survives_engine_replacement(monkeypatch):
         assert hydrated is not None
         assert hydrated[0].block_id == blocks[1].block_id
         assert state.held[blocks[1].block_id][1] == "shadow"
+        assert shadow.free_block_queue.get_all_free_blocks()[-1] is hydrated[0]
         assert stale_hash not in directory.entries
         assert shadow._gms_hydrate_hbm is False
 
