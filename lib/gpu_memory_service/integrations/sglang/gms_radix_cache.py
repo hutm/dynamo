@@ -1969,11 +1969,18 @@ def make_gms_radix_cache_class():
                     self._publish_inserted_hbm(key, value, prefix_len)
             return result
 
-        def cache_finished_req(self, req, is_insert: bool = True):
-            committed_len = int(req._cache_commit_len())
+        def cache_finished_req(self, req, is_insert: bool = True, **kwargs):
+            # Newer SGLang passes the committed length as a required keyword-only
+            # kv_len_to_handle and dropped req._cache_commit_len(); older releases
+            # had _cache_commit_len() and no extra kwargs. Accept/forward **kwargs
+            # and derive the committed length from whichever the engine provides.
+            if "kv_len_to_handle" in kwargs:
+                committed_len = int(kwargs["kv_len_to_handle"])
+            else:
+                committed_len = int(req._cache_commit_len())
             token_ids = (req.origin_input_ids + req.output_ids)[:committed_len]
             extra_key = req.extra_key
-            result = super().cache_finished_req(req, is_insert=is_insert)
+            result = super().cache_finished_req(req, is_insert=is_insert, **kwargs)
             if is_insert and not self.disable_finished_insert:
                 self._commit_finished_hbm_prefix(token_ids, extra_key)
             return result
