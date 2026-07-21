@@ -688,9 +688,6 @@ async def init_llm_worker(
             "GMS_TRTLLM_DAEMON_SOCKET",
             default_when_cross_node="/tmp/gms.sock",
         )
-        if gms_daemon_socket:
-            runtime_config.set_gms_placement_enabled()
-            logging.info("Publishing GMS placement capability to discovery")
         # Set data_parallel_size for attention DP mode
         # This enables the router's scheduler to correctly iterate over all dp_ranks
         # Need to name ADP as `data_parallel_size` for parity with other frameworks
