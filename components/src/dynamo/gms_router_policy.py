@@ -179,23 +179,15 @@ class DynamoGmsPlacementPublisher:
         if self._dp_rank is not None:
             kwargs["dp_rank"] = self._dp_rank
 
-        self._kv_publisher.publish_gms_placement_stored(
-            source_name,
-            source_metadata,
-            [{"content_hash_hex": content_hash.hex(), "descriptor": normalized}],
-            **kwargs,
-        )
+        # GMS placement routing dropped (incompatible with upstream router
+        # refactor); publisher retained as a no-op so handlers stay unchanged.
+        _ = (source_name, source_metadata, normalized, kwargs)
 
     def publish_removed(self, content_hash: bytes, tier: str) -> None:
         if self._closed:
             return
-        kwargs: dict[str, Any] = {}
-        if self._dp_rank is not None:
-            kwargs["dp_rank"] = self._dp_rank
-        self._kv_publisher.publish_gms_placement_removed(
-            [content_hash.hex()],
-            **kwargs,
-        )
+        # GMS placement routing dropped; no-op (see publish_stored).
+        _ = (content_hash, tier)
 
     def close(self) -> None:
         self._closed = True
