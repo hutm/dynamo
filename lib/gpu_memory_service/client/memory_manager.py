@@ -70,8 +70,6 @@ class StaleMemoryLayoutError(Exception):
     pass
 
 
-@dataclass
-@dataclass
 @dataclass(frozen=True)
 class LocalMapping:
     """Immutable record of a local VA mapping.
@@ -832,14 +830,14 @@ class GMSClientMemoryManager:
                 )
 
             fd = self.export_persistent_handle(engine_id, mapping.tag)
-            handle = cumem_import_from_shareable_handle_close_fd(fd)
-            cumem_map(va, mapping.aligned_size, handle)
-            cumem_set_access(
+            handle = self._vmm.import_shareable_handle_close_fd(fd)
+            self._vmm.map(va, mapping.aligned_size, handle)
+            self._vmm.set_access(
                 va, mapping.aligned_size, self.device, self._granted_lock_type
             )
             if synchronize_per_mapping:
-                cuda_synchronize()
-                cuda_validate_pointer(va)
+                self._vmm.synchronize()
+                self._vmm.validate_pointer(va)
             else:
                 remapped_vas.append(va)
 
@@ -854,9 +852,9 @@ class GMSClientMemoryManager:
             total_bytes += mapping.aligned_size
 
         if remapped_vas and validate_after_remap:
-            cuda_synchronize()
+            self._vmm.synchronize()
             for va in remapped_vas:
-                cuda_validate_pointer(va)
+                self._vmm.validate_pointer(va)
 
         self._va_preserved = False
         self._unmapped = False
@@ -934,7 +932,7 @@ class GMSClientMemoryManager:
             self._mappings.clear()
             self._inverse_mapping.clear()
         else:
-            cuda_synchronize()
+            self._vmm.synchronize()
             for va in list(self._mappings.keys()):
                 self.unmap_va(va)
                 self.free_va(va)
