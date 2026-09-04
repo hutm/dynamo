@@ -1026,12 +1026,18 @@ class GmsKvCacheManager:
             from cuda.bindings import driver as drv
 
             try:
+                # RPC dispatch uses an executor, so detach may run on a
+                # different thread than attach. Make the primary context
+                # current here before touching the daemon stream.
+                _ensure_cuda_context()
                 # Drain pending work BEFORE destroy + free. cuStreamDestroy
                 # is non-blocking and leaves in-flight ops to complete in
                 # the background; without an explicit sync, the next
                 # daemon's freshly-created stream can wedge waiting on
                 # this stream's residual work.
-                drv.cuStreamSynchronize(pool.stream)
+                err = drv.cuStreamSynchronize(pool.stream)[0]
+                if err != drv.CUresult.CUDA_SUCCESS:
+                    raise RuntimeError(f"cuStreamSynchronize failed: {err}")
             except Exception:  # noqa: BLE001
                 sync_ok = False
                 logger.warning(
@@ -1042,7 +1048,9 @@ class GmsKvCacheManager:
                     exc_info=True,
                 )
             try:
-                drv.cuStreamDestroy(pool.stream)
+                err = drv.cuStreamDestroy(pool.stream)[0]
+                if err != drv.CUresult.CUDA_SUCCESS:
+                    raise RuntimeError(f"cuStreamDestroy failed: {err}")
             except Exception:  # noqa: BLE001
                 logger.debug("cuStreamDestroy failed", exc_info=True)
         if sync_ok:

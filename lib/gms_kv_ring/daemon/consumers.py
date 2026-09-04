@@ -139,6 +139,10 @@ class _EvictConsumer:
             )
         elif self.counter_path and self.num_counters:
             # Cross-process: open the file and pin our own VA.
+            # RPC handlers run in an executor, so this attach is not
+            # guaranteed to run on the worker thread that handled
+            # attach_engine_pool and initialized its CUDA context.
+            _ensure_cuda_context()
             self._counters = DaemonCounterArray.attach(
                 self.counter_path,
                 num_counters=self.num_counters,
@@ -367,6 +371,9 @@ class _RestoreConsumer:
                 num_counters=self.num_counters,
             )
         else:
+            # See _EvictConsumer.start: each executor worker needs its
+            # own current CUDA context before registering host memory.
+            _ensure_cuda_context()
             self._counters = DaemonCounterArray.attach(
                 self.counter_path,
                 num_counters=self.num_counters,
