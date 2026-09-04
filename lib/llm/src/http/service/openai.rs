@@ -60,7 +60,6 @@ use crate::protocols::common::extensions::{
 use crate::protocols::common::input_trigger::{
     classify_chat_request, classify_completion_request, classify_response_request,
 };
-use crate::protocols::openai::ParsingOptions;
 use crate::protocols::openai::chat_completions::aggregator::ChatCompletionAggregator;
 use crate::protocols::openai::{
     ParsingOptions,

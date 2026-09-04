@@ -9,11 +9,12 @@ use tokio::time::{Duration, Instant, sleep_until};
 
 use crate::{
     backend::{Backend, ExecutionContext},
-    discovery::{KvWorkerMonitor, ModelManager, WORKER_TYPE_DECODE},
+    discovery::{LoadThresholdHandle, ModelManager, WORKER_TYPE_DECODE},
     engines::StreamingEngineAdapter,
     entrypoint::{EngineConfig, build_preprocessed_routing},
     first_token::{FirstTokenNotifier, FirstTokenSource},
     http::service::metrics::Metrics,
+    kv_router::{RouterLoadSource, RoutingLoadContext},
     model_card::ModelDeploymentCard,
     model_type::{ModelInput, ModelType},
     namespace::NamespaceFilter,
@@ -28,6 +29,7 @@ use crate::{
     worker_type::WorkerType,
 };
 
+use dynamo_kv_router::selector::DefaultWorkerSelector;
 use dynamo_runtime::engine::AsyncEngineStream;
 use dynamo_runtime::{
     DistributedRuntime,
@@ -231,17 +233,35 @@ pub async fn run(
                 .as_ref()
                 .unwrap_or(local_model.router_config());
 
+            let worker_role = private_card.worker_type.unwrap_or(WorkerType::Aggregated);
+            let load_context = RoutingLoadContext::start(
+                private_client,
+                RouterLoadSource::from_worker_type(worker_role),
+                LoadThresholdHandle::new(router_config.load_threshold_config.clone()),
+                &distributed_runtime.primary_token(),
+                None,
+            )
+            .await?;
+
             let kv_chooser = if router_config.router_mode == RouterMode::KV {
+                let selector = DefaultWorkerSelector::new(
+                    Some(router_config.kv_router_config.clone()),
+                    WORKER_TYPE_DECODE,
+                );
                 Some(
                     model_manager
-                        .kv_chooser_for(
-                            &private_endpoint,
+                        .kv_chooser_for_with_selector_and_client(
+                            load_context.client().clone(),
                             private_card.kv_cache_block_size,
+                            selector,
                             Some(router_config.kv_router_config.clone()),
                             prefill_load_estimator.clone(),
+                            Some(worker_role),
                             WORKER_TYPE_DECODE,
                             Some(private_card.display_name.clone()),
                             private_card.runtime_config.enable_eagle,
+                            load_context.scheduler_load_sender(),
+                            load_context.cancellation_token(),
                         )
                         .await?,
                 )
@@ -249,20 +269,12 @@ pub async fn run(
                 None
             };
 
-            let monitor_client = kv_chooser
-                .as_ref()
-                .map(|chooser| chooser.client().clone())
-                .unwrap_or_else(|| private_client.clone());
-            let worker_monitor = Some(KvWorkerMonitor::new(
-                monitor_client,
-                router_config.load_threshold_config.clone(),
-            ));
-
+            let routing_client = load_context.client().clone();
             let routing = build_preprocessed_routing(
-                &private_client,
+                &routing_client,
                 model_manager,
                 router_config.router_mode,
-                worker_monitor,
+                load_context,
                 kv_chooser,
                 None,
                 None,
@@ -531,6 +543,7 @@ fn spawn_gateway_backend_readiness_monitor(
                         Ok(DiscoveryEvent::Removed(id)) => {
                             active_backends.remove(&id);
                         }
+                        Ok(DiscoveryEvent::ModelTaintsUpdated(_)) => {}
                         Err(err) => {
                             tracing::warn!(
                                 %err,
