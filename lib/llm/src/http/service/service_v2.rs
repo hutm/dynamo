@@ -1234,7 +1234,7 @@ impl HttpServiceConfigBuilder {
                 Arc::new(KVStoreDiscovery::new(
                     dynamo_runtime::storage::kv::Manager::memory(),
                     cancel_token.child_token(),
-                )) as Arc<dyn Discovery>
+                )?) as Arc<dyn Discovery>
             }
         };
         // Both surfaces are on by default; an env-truthy DISABLE var turns them
