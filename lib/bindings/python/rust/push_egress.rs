@@ -207,6 +207,17 @@ impl std::fmt::Debug for PushFrame {
     }
 }
 
+impl MaybeError for PushFrame {
+    fn from_err(err: impl std::error::Error + 'static) -> Self {
+        Self::error(Annotated::from_err(err))
+    }
+
+    fn err(&self) -> Option<DynamoError> {
+        self.is_error
+            .then(|| DynamoError::msg("push egress response error"))
+    }
+}
+
 impl PushFrame {
     /// Encode one Python response object, with the GIL held by the caller.
     ///
