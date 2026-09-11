@@ -298,6 +298,7 @@ async def init_decode(
             engine,
             node_rank=server_args.node_rank,
             leader_host=_rank_liveness_leader_host(server_args),
+            cohort_identity=getattr(server_args, "dist_init_addr", None),
         )
         # Keep the owner alive for the non-leader loop. Its attached lock fd is
         # the local primary/shadow fencing token.
@@ -367,6 +368,7 @@ async def init_decode(
                 engine,
                 node_rank=0,
                 leader_host=None,
+                cohort_identity=getattr(server_args, "dist_init_addr", None),
                 expected_ranks=None,
             )
             if rank_liveness_monitor is not None:
@@ -409,6 +411,7 @@ async def init_decode(
             engine,
             node_rank=0,
             leader_host=None,
+            cohort_identity=getattr(server_args, "dist_init_addr", None),
             expected_ranks=range(1, server_args.nnodes),
         )
 
