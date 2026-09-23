@@ -77,6 +77,12 @@ def _scope_failover_lock_to_node_rank(server_args) -> None:
     )
 
 
+def _export_gms_node_rank(server_args) -> None:
+    """Expose SGLang multi-node rank to GMS children without torchrun env."""
+
+    os.environ["GMS_SGLANG_NODE_RANK"] = str(int(server_args.node_rank))
+
+
 def _enable_gms_nccl_prewarm(server_args) -> None:
     """Pay lazy TP communicator setup at startup, before standby quiesce."""
 
@@ -280,6 +286,7 @@ async def init_decode(
     _validate_gms_tp_topology(server_args)
     _enable_gms_nccl_prewarm(server_args)
 
+    _export_gms_node_rank(server_args)
     if server_args.node_rank >= 1:
         os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
 
@@ -594,6 +601,7 @@ async def init_prefill(
     server_args, dynamo_args = config.server_args, config.dynamo_args
     _enable_gms_nccl_prewarm(server_args)
 
+    _export_gms_node_rank(server_args)
     if server_args.node_rank >= 1:
         os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
 
