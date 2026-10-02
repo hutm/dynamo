@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
 import os
 import sys
 import types
@@ -105,8 +106,13 @@ def test_headless_clears_false_enable_before_workers(monkeypatch):
     try:
         from dynamo.vllm.headless import run_dynamo_headless
 
-        run_dynamo_headless(
-            SimpleNamespace(engine_args=SimpleNamespace(load_format="auto"))
+        asyncio.run(
+            run_dynamo_headless(
+                SimpleNamespace(
+                    engine_args=SimpleNamespace(load_format="auto"),
+                    gms_shadow_mode=False,
+                )
+            )
         )
     finally:
         if not loaded_headless:
