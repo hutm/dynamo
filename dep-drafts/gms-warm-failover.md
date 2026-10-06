@@ -77,21 +77,6 @@ Separate the lifetime of GPU memory from the lifetime of the engine process.
 | #14828 | Pluggable KV recovery strategies: lease-based versus whole-pool | vLLM and SGLang, pool backends (#14814, #14818) |
 | #15035 | Production hardening for persistent GMS KV failover | Hardening (#15036–#15050) |
 
-### Results so far
-
-Model: Qwen3-235B-A22B-FP8 on B200. Each deployment fails twice, SIGKILL or a real CUDA fault:
-
-| Scale | Longest stream pause | First new request served | Request errors | KV reused |
-|---|---|---|---|---|
-| TP2 (0.6B, local) | 0.6–1.0 s | — | 0 | yes |
-| TP8, one node | 1.7–2.6 s | 2.1–3.2 s | 0 | yes |
-| TP16, two nodes (SIGKILL; GPU-fault runs in progress) | 1.7–2.7 s | 2.1–3.2 s | 0 | yes |
-
-Steady-state cost compared with a vanilla engine, at TP8:
-- **SGLang:** within about 2%.
-- **vLLM:** decode slows by about 20% at batch 4. Running a plain vLLM engine under MPS reproduces the same slowdown, so it is not GMS code. Two things combine: vLLM's batch-invariant mode uses untuned Triton fused-MoE tiles, and those tiles run 2–3.5× slower under MPS.
-- **Mitigations, not yet done:** MPS-tuned MoE configs, or a non-Triton MoE backend.
-
 ## Relation to KVCR
 
 KVCR, the KV Cache Runner behind DEP #11673 (KV Cache Controller), and this work both keep KV useful across failures. They cover different memory and different failures, and they are designed to compose.
@@ -112,18 +97,25 @@ KVCR, the KV Cache Runner behind DEP #11673 (KV Cache Controller), and this work
 
 ## Alternate Solutions
 
-- **Cold restart plus request migration.** No new machinery, but minutes of downtime and a full recompute of every prefix.
-- **Process snapshots** (Dynamo Snapshot, #12521; vLLM's CRIU engine snapshots). Restore an initialized engine faster, but the KV cache is still lost. Complementary to this work.
-- **Weight-only daemons** (for example vLLM's `vllm preload`). Fast restarts for weights only, with no KV, no standby, and no fencing.
-- **Copy KV off the GPU when a failure happens.** Impossible after a crash, because the process is already gone.
-- **Whole-pool recovery without per-block leases** (#14828). Simpler, but it needs stronger proof that the predecessor has stopped before any reuse.
+Several existing mechanisms are complements to standby failover, not replacements:
+
+- **Snapshot (#12521, #13220): used together with failover.** The standby is restored from a snapshot of an initialized engine instead of booting from scratch, then attaches to the weights and KV that GMS holds. After a takeover, a fresh standby is re-armed the same way. Snapshot shortens the time to have a standby; GMS makes the takeover itself fast and keeps the KV.
+- **KVCR (#11673): covers what GMS cannot.** It handles GPU or node loss and cache capacity through lower tiers and peers (see the KVCR section above).
+- **Request migration: required building block.** The frontend's migration replays interrupted streams. GMS makes that replay hit cached KV instead of recomputing the prompt.
+- **Cold restart: fallback.** Used when no standby or usable GMS state exists.
+
+These are real alternatives:
+
+- **Weight-only resident daemons**, such as vLLM's `vllm preload`. They make restarts fast for weights only, with no KV, no standby, and no fencing. GMS could act as the backend for such loaders.
+- **Whole-pool recovery without per-block leases** (#14828). The same framework with a simpler strategy, but it needs stronger proof that the predecessor has stopped before any reuse.
+- **Copying KV off the GPU when a failure happens.** Not viable after a crash, because the process is already gone.
 
 ## Requirements
 
 - A replacement never serves a block whose generation is stale, and never writes before predecessor writers are retired and their pages classified.
 - All TP ranks agree before allocation, adoption, reclamation, or takeover.
 - Ambiguous or incompatible recovery state fails closed: a cache miss or a startup refusal.
-- Coordination stays off the per-token hot path. Steady-state overhead is measured against vanilla engines and reported.
+- Coordination stays off the per-token hot path.
 - Engine-native scheduling, hashing, eviction, and capacity semantics are preserved.
 
 **Known limitations:**
