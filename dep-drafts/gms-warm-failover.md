@@ -56,9 +56,13 @@ Separate the lifetime of GPU memory from the lifetime of the engine process.
 4. **Safety first: a dead or slow primary must never write into memory the successor uses.**
    - Takeover fences the old writer: it bumps the generations and retires the writer cohort, which is all ranks.
    - Pages the old primary may still touch are quarantined.
-   - They are reclaimed only after the GPU proves the old process's work has stopped, using MPS client termination.
+   - They are reclaimed only after the old process's GPU work has provably stopped. One switch, `DYN_GMS_GPU_ISOLATION`, selects how:
+     - `mps`: engines run as MPS clients, and GMS terminates the dead client's MPS context before reclaiming (`gpu-proof`).
+     - `process`: engines run as plain CUDA processes, and the driver tears down a process's CUDA context when it exits. The predecessor is fenced by its writer-cohort lifetime, and pages are reclaimed after the process dies (`process-death-timeout`).
+   - A GPU fault in any rank, such as an illegal memory access, fail-stops the whole TP cohort at once and notifies the TP leader, in both modes.
    - Anything ambiguous fails closed: a cache miss, or a refusal to start. It is never silent reuse.
 5. **Request continuity.** The frontend migrates interrupted streams to the standby. The replay hits the reused KV instead of recomputing the prompt.
+6. **Near-native steady state.** Keeping KV recoverable must not slow normal serving. Directory publication, confirmation and capacity retirement are batched and kept off the scheduler's critical path, in particular off the step that releases first tokens. Lease acquisition stays lock-free.
 
 ### The three PR trains
 
@@ -66,7 +70,7 @@ Separate the lifetime of GPU memory from the lifetime of the engine process.
 |---|---|---|
 | vLLM | #12053 | Persistent allocation protocol and daemon (#12056, #14576), client and PyTorch attachment (#14577), KV lease ring, content directory, pool identity, BlockPool adoption (#13398), worker activation and failover primitives, five-process acceptance test (#12032) |
 | SGLang | #14704 | The same model for SGLang: persistent KV identity, page leases, unified cache persistence, TP1 then TP2 failover, verified fencing, rank liveness, serving timeouts (#14706–#14719) |
-| Hardening | #15035 | Common to both engines, in 5 PRs: startup verification and service fencing (#15036); ownership through takeover and MPS-proven quiescence (#15040); TP rank fail-stop and crash headroom (#15044); shadow prewarm, journaling, and migration continuity (#15048); frozen-predecessor two-phase takeover, GPU fault watchdog, and the standby-before-serving gate (#15050). Backend abstraction for v0 and v1 pools: #14814, #14818 |
+| Hardening | #15035 | Common to both engines, in 5 PRs: startup verification, service fencing, and bounded steady-state scheduler cost (#15036); ownership through takeover and MPS-proven quiescence (#15040); TP rank fail-stop and crash headroom (#15044); shadow prewarm, journaling, batched publication, and migration continuity (#15048); frozen-predecessor two-phase takeover, the MPS/process isolation switch, GPU fault watchdog, and the standby-before-serving gate (#15050). Backend abstraction for v0 and v1 pools: #14814, #14818 |
 
 **DEPs from this initiative.** This issue ties them together:
 
@@ -115,11 +119,13 @@ These are real alternatives:
 - A replacement never serves a block whose generation is stale, and never writes before predecessor writers are retired and their pages classified.
 - All TP ranks agree before allocation, adoption, reclamation, or takeover.
 - Ambiguous or incompatible recovery state fails closed: a cache miss or a startup refusal.
-- Coordination stays off the per-token hot path.
+- Coordination stays off the per-token hot path; steady-state TTFT, ITL and throughput stay within a small margin of the vanilla engine.
 - Engine-native scheduling, hashing, eviction, and capacity semantics are preserved.
 
 **Known limitations:**
-- After a hard crash, the default `gpu-proof` policy keeps the predecessor's pages quarantined until a restart, because MPS cannot certify the dead client. An opt-in best-effort policy reclaims them after the process dies.
+- Under MPS isolation, after a hard crash the `gpu-proof` policy keeps the predecessor's pages quarantined until a restart, because MPS cannot certify the dead client. Process isolation reclaims them after the process dies, relying on the driver's context teardown instead of an MPS proof.
+- SGLang confirms live prefixes in batches after their tokens are released. After a crash inside that window, the replay recomputes those pages instead of reusing them.
+- Retiring capacity off the scheduler thread (`DYN_GMS_ASYNC_DIRECTORY_WORK=1`) is opt-in: it removes retirement stalls, but freed capacity arrives a few steps later and can delay admission under bursts.
 - SGLang cannot reproduce output byte for byte across a replay boundary, even without a fault.
 - GPU reset and node loss are not covered.
 
