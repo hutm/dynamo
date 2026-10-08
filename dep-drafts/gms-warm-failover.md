@@ -1,154 +1,149 @@
 ## Summary
 
-When an inference engine crashes today, everything in its GPU memory is lost. Weights must be reloaded, which takes minutes for large models. The KV cache, every prompt prefix the engine has computed, disappears, so in-flight requests either fail or start over.
+When an inference engine crashes today, its GPU memory is lost. Reloading the weights of a large model takes minutes, and the KV cache (every prompt prefix already computed) is gone, so in-flight requests fail or start over.
 
-This DEP proposes keeping GPU memory alive outside the engine process, in the GPU Memory Service (GMS), and pairing each engine with a **warm standby** on the same GPUs. When the primary dies, the standby takes over in a few seconds. It reuses the weights and the cached KV that are already resident, and the frontend replays interrupted streams onto it.
+This DEP keeps GPU memory alive outside the engine and adds a **warm standby** engine on the same GPUs. When the main engine (the primary) dies, the standby takes over in about a second or two. It reuses the weights and KV cache that are still in GPU memory, and Dynamo resumes the interrupted requests on it.
 
-Each failover pod is self-contained. A local frontend routes to one logical worker that the primary and standby share, and discovery lives on the pod's own filesystem, so the pod needs neither etcd nor NATS. Callers outside the pod see one stable endpoint; a takeover only changes which local process answers behind it.
+Each failover deployment is self-contained: a local frontend, the primary, the standby, and the memory service, with no etcd or NATS. Clients see one stable endpoint. A takeover only changes which process answers behind it.
 
-The work is implemented in three PR trains:
-- vLLM: #12053
-- SGLang: #14704
-- Production hardening: #15035
-
-This issue is the umbrella design for all three.
+The work is split across three PR trains: vLLM (#12053), SGLang (#14704), and production hardening (#15035). This issue is the umbrella design for all three.
 
 ## Motivation
 
-**Problem.** Engine failures are common at scale: crashes, CUDA errors, OOMs, bad requests. Recovery today is a cold restart:
+Engines fail often at scale: crashes, CUDA errors, out-of-memory, bad requests. Today recovery is a cold restart:
 
 | Step | Cost for a 235B model at TP8/TP16 |
 |---|---|
-| Restart process, reload weights, capture graphs | minutes |
-| Rebuild the KV cache | every cached prefix is recomputed |
-| In-flight requests | migrated, but the full prompt is prefilled again |
+| Restart, reload weights, capture CUDA graphs | minutes |
+| KV cache | lost; every prompt prefix is recomputed |
+| In-flight requests | moved to another replica, which prefills the whole prompt again |
 
-Request migration hides the error, but the user still waits minutes, and capacity drops while the replica is down.
+Dynamo already moves interrupted requests, so clients see no error, but they wait minutes, and the replica's capacity is gone meanwhile.
 
-**Goal.** Recover from an engine-process failure in seconds, with:
-- no client-visible errors;
-- reuse of already-computed KV;
-- no change to how vLLM or SGLang schedule, hash, or evict.
+**Goal:** recover from an engine crash in seconds, with no client-visible errors, reusing the KV already computed, and without changing how vLLM or SGLang schedule, hash, or evict.
 
-**Non-goals:**
-- surviving GPU reset or node loss;
-- durable or offloaded KV tiers (see the KVCR section);
-- multi-tenant isolation.
+**Not in scope:** GPU reset or node loss, KV in CPU memory or storage (see "Relation to KVCR"), and multi-tenant isolation.
 
 ## Proposal
 
-### Idea
-
-Separate the lifetime of GPU memory from the lifetime of the engine process.
+The core idea: GPU memory should outlive the engine process.
 
 ```text
-     clients ──► local frontend (one stable endpoint; holds and migrates streams)
-                    │  pod-local file discovery: one logical worker id
-                    ▼
-          primary engine          standby engine (initialized, asleep)
-                 │                      │
-                 └──── map via CUDA VMM ─┘
-                           │
-          GMS daemon: owns weights + KV pool on each GPU
-          + KV leases and generations + content directory
+ clients ──► local frontend (one stable endpoint; holds and resumes requests)
+                  │   one logical worker, discovered through local files
+                  ▼
+        primary engine        standby engine (ready, asleep)
+                  │                  │
+                  └── map the same GPU memory ──┘
+                              │
+        GPU Memory Service (GMS): owns weights and KV cache on each GPU
 ```
 
-1. **GMS owns the memory.** A per-GPU daemon allocates the weights and the KV pool. Engines map them and never own them, so a crash releases nothing.
-2. **Warm standby.** A second engine process on the same GPUs is fully initialized (weights mapped, CUDA graphs captured), then sleeps. The primary only starts serving once the standby is armed.
-3. **KV survives in the engine's own format.** Each KV block is guarded by a lease with a generation number. Completed blocks are published to a small content directory keyed by prefix hash. On takeover, the standby adopts those blocks into its native prefix cache. The engine stays the source of truth; GMS does not mirror its index.
-4. **Safety first: a dead or slow primary must never write into memory the successor uses.**
-   - Takeover fences the old writer: it bumps the generations and retires the writer cohort, which is all ranks. Each pod keeps its cohort on a pod-local filesystem, and an all-rank collective is the cross-node barrier.
-   - The fence completes as soon as every old writer can no longer run user code (each thread is exiting or has SIGKILL pending). It does not wait for the seconds of driver teardown before the process finally exits.
-   - When a fault is detected, the broken cohort is killed at once. A GPU-quiescence proof is never on the handoff path: it only gates when the predecessor's quarantined pages are reclaimed.
-   - Pages the old primary may still touch are quarantined.
-   - They are reclaimed only after the old process's GPU work has provably stopped. One switch, `DYN_GMS_GPU_ISOLATION`, selects how:
-     - `mps`: engines run as MPS clients, and GMS terminates the dead client's MPS context before reclaiming (`gpu-proof`).
-     - `process`: engines run as plain CUDA processes, and the driver tears down a process's CUDA context when it exits. The predecessor is fenced by its writer-cohort lifetime, and pages are reclaimed after the process dies (`process-death-timeout`).
-   - A GPU fault in any rank, such as an illegal memory access, fail-stops the whole TP cohort at once and notifies the TP leader, in both modes.
-   - Anything ambiguous fails closed: a cache miss, or a refusal to start. It is never silent reuse.
-5. **Request continuity.** The frontend migrates interrupted streams to the standby. The replay hits the reused KV instead of recomputing the prompt. New requests that arrive during a takeover wait, bounded by the failover grace, instead of receiving "model not ready".
-6. **One logical worker per pod, no external control plane.**
-   - The primary and standby publish one logical discovery instance (`DYN_DISCOVERY_LOGICAL_INSTANCE_KEY`). Only the failover-lock owner registers, and a successor takes over the shared records with compare-and-replace. Routers therefore see one worker whose address moves, never a worker leaving and another joining.
-   - Discovery uses the file backend on the pod's shared emptyDir, with the TCP request plane and ZMQ events. All registering processes share one kernel, so inotify delivers changes immediately and flock arbitrates writers. The failover pod runs no etcd and no NATS.
-   - A dying predecessor cannot remove or refresh records its successor took over: the store deletes or refreshes a key only while it still holds the bytes it wrote.
-   - No operator is required. A failover deployment is plain Kubernetes objects: the leader pod (both GMS daemons, the frontend, and both engines), one pod per additional TP rank, a Service for the leader, and the GPU claims. A LeaderWorkerSet adds gang scheduling and in-place restarts. Rendering the same pod from a DynamoGraphDeployment is optional follow-up work.
-7. **Near-native steady state.** Keeping KV recoverable must not slow normal serving. Directory publication, confirmation and capacity retirement are batched and kept off the scheduler's critical path, in particular off the step that releases first tokens. Lease acquisition stays lock-free.
+**1. GMS owns the GPU memory.** A small daemon on each GPU allocates the weights and the KV cache. Engines only map that memory, so an engine crash frees nothing.
+
+**2. A warm standby waits on the same GPUs.** It is fully started (weights mapped, CUDA graphs captured) and then sleeps. The primary starts serving only once its standby is ready.
+
+**3. The KV cache survives in the engine's own format.** Every KV block carries a lease with a version number, and finished blocks are listed in a small directory by prefix hash. On takeover, the standby adds those blocks to its own prefix cache. The engine stays in charge of its cache; GMS does not keep a copy of its index.
+
+**4. Safety comes first: a dead or stuck primary must never write into memory the standby is using.**
+- On takeover, the standby bumps the block versions and shuts out every process of the old engine, on all GPU ranks. The rank processes coordinate over the network (TCP and the engine's own channels), not through a shared filesystem.
+- When a crash is detected, all of the old engine's processes are killed at once. The standby does not wait for the GPU driver's slow cleanup; it only waits until no old process can run code anymore.
+- Memory the old engine might still touch is set aside (quarantined) and reused only once its GPU work has provably stopped. One setting, `DYN_GMS_GPU_ISOLATION`, chooses how that is proven:
+  - `mps`: engines run under NVIDIA MPS, and GMS asks MPS to terminate the dead engine's GPU work first.
+  - `process`: engines run as plain CUDA processes, and memory is reused after the old process has exited, since the driver then tears down its GPU work.
+- A GPU fault on any rank stops the whole engine at once and tells the lead rank, in both modes.
+- When anything is unclear, the system is cautious: it treats the data as a cache miss or refuses to start, and never reuses memory silently.
+
+**5. Requests keep going.** Dynamo resumes interrupted requests on the standby, which finds their KV still cached instead of recomputing the prompt. New requests that arrive during a takeover wait briefly instead of getting a "model not ready" error.
+
+**6. One worker identity, and no extra infrastructure.**
+- The primary and standby share one worker ID. Only the engine that currently holds the failover lock registers it, so the frontend sees one worker whose address changes, never one worker leaving and another joining.
+- Discovery uses plain files in a directory that all processes on the host share. Changes show up immediately through the operating system's file notifications, and file locks make sure only one process writes a record at a time. No etcd and no NATS are needed.
+- An old engine that is shutting down cannot delete or refresh records that its successor has taken over.
+- No Kubernetes operator is required. A deployment is plain Kubernetes objects: one pod with both GMS daemons, the frontend, and both engines, plus one pod per extra GPU rank, a Service, and the GPU claims. A LeaderWorkerSet adds gang scheduling and restarts in place. Support in the Dynamo operator can come later.
+
+**7. Normal serving stays fast.** The bookkeeping that makes the KV cache recoverable is batched and kept off the critical path of each step, especially the step that releases the first token. Taking a lease never waits on a lock.
 
 ### The three PR trains
 
 | Train | Tracker | What it delivers |
 |---|---|---|
-| vLLM | #12053 | Persistent allocation protocol and daemon (#12056, #14576), client and PyTorch attachment (#14577), KV lease ring, content directory, pool identity, BlockPool adoption (#13398), worker activation and failover primitives, five-process acceptance test (#12032) |
-| SGLang | #14704 | The same model for SGLang: persistent KV identity, page leases, unified cache persistence, TP1 then TP2 failover, verified fencing, rank liveness, serving timeouts (#14706–#14719) |
-| Hardening | #15035 | Common to both engines, in 6 PRs: startup verification, service fencing, and bounded steady-state scheduler cost (#15036); ownership through takeover and MPS-proven quiescence (#15040); TP rank fail-stop and crash headroom (#15044); shadow prewarm, journaling, batched publication, and migration continuity (#15048); frozen-predecessor two-phase takeover, the MPS/process isolation switch, GPU fault watchdog, the standby-before-serving gate, the pod-local fast writer fence, kill-at-detection handoff, and the frontend hold for new requests (#15050); the logical failover instance with pod-local file discovery (#15913). Backend abstraction for v0 and v1 pools: #14814, #14818 |
+| vLLM | #12053 | The memory daemon and how engines attach to its memory (#12056, #14576, #14577); KV leases, the block directory, and adoption into vLLM's prefix cache (#13398); standby start-up and failover; an end-to-end test (#12032) |
+| SGLang | #14704 | The same for SGLang: KV identity, page leases, cache persistence, failover from TP1 to TP2, fencing, rank health checks, serving timeouts (#14706–#14719) |
+| Hardening | #15035 | Six PRs shared by both engines: safe start-up and low steady-state cost (#15036); ownership through takeover (#15040); stopping all ranks on a fault (#15044); warm-up, journaling, and keeping requests alive across the switch (#15048); a takeover that sets aside the old engine's memory, the isolation setting, a fast handoff, and waiting for new requests (#15050); one worker identity with local discovery (#15913). Memory-pool back ends: #14814, #14818 |
 
-**DEPs from this initiative.** This issue ties them together:
+**DEPs from this work**, tied together by this issue:
 
-| DEP | Scope | Train |
+| DEP | Topic | Train |
 |---|---|---|
-| #14832 | Persistent GPU allocation lifetime across engine sessions | vLLM base (#12056, #14576) |
-| #14833 | Failure-safe client and PyTorch attachment to persistent allocations | vLLM base (#14577) |
-| #14828 | Pluggable KV recovery strategies: lease-based versus whole-pool | vLLM and SGLang, pool backends (#14814, #14818) |
-| #15035 | Production hardening for persistent GMS KV failover | Hardening (#15036–#15050) |
+| #14832 | GPU memory that outlives engine sessions | vLLM (#12056, #14576) |
+| #14833 | Safe engine attachment to that memory | vLLM (#14577) |
+| #14828 | Ways to recover the KV cache: per block or whole pool | vLLM and SGLang (#14814, #14818) |
+| #15035 | Production hardening | Hardening (#15036–#15050, #15913) |
 
 ## Relation to KVCR
 
-KVCR, the KV Cache Runner behind DEP #11673 (KV Cache Controller), and this work both keep KV useful across failures. They cover different memory and different failures, and they are designed to compose.
+KVCR (the KV Cache Runner behind DEP #11673) also keeps KV useful across failures. The two cover different memory and different failures, and they are designed to work together.
 
-| | GMS warm failover (this DEP) | KVCR |
+| | This DEP | KVCR |
 |---|---|---|
-| Memory | Engine-owned HBM (G1) KV pages and weights, kept on the same GPUs | Controller-owned tiers: host DRAM, SSD, object store (G2–G4), plus remote peers |
-| Failure covered | Engine process dies; GPU and node healthy | Engine or GPU loss, cache capacity, cross-node reuse |
-| Recovery path | Standby on the same GPUs maps the surviving pages (zero copy) | Restarted or other engine fetches blocks from lower tiers or peers |
-| Recovery time | Seconds; no data movement | Bounded by transfer bandwidth |
-| Resilience process | Per-GPU GMS daemon | Optional memory-service side process (the KVCR Guard) |
+| Memory | KV and weights in GPU memory, on the same GPUs | KV in CPU memory, SSD, object storage, or on other nodes |
+| Failure covered | the engine process dies; GPU and node are fine | GPU or node loss, cache capacity, sharing across nodes |
+| How it recovers | the standby maps the surviving memory; nothing is copied | a restarted or different engine fetches blocks from those tiers |
+| Recovery time | seconds | limited by transfer speed |
 
-**How they fit together:**
-1. **Ownership is disjoint.** GMS owns G1 pages that the engine uses directly. KVCR owns G2 and below. Neither manages the other's memory, which avoids two owners of the same HBM.
-2. **Layered fallback.** After a takeover, the standby first adopts surviving G1 blocks from GMS. Misses can then be served from KVCR tiers or peers instead of being recomputed. If the GPU or node itself is lost, GMS has nothing to offer and KVCR, or a cold start, is the path.
-3. **Shared indexing, open question.** Both publish what is cached, keyed by prefix hash: GMS through its content directory, KVCR through router inventory and KV events (see also #13044). We propose converging on one block-identity and event format, so the router sees G1 survivors and KVCR tiers in one view.
-4. **Policy.** Choosing between standby takeover, a KVCR-backed restart, and a cold start belongs in the common recovery contract proposed in #15379. In that contract, this DEP is one strategy.
+How they fit together:
+1. **No shared ownership.** GMS owns GPU memory; KVCR owns everything below it. Neither manages the other's memory.
+2. **Layered fallback.** After a takeover, the standby first reuses the blocks GMS kept. Anything missing can come from KVCR instead of being recomputed. If the GPU or node is lost, KVCR or a cold start is the only path.
+3. **One view of the cache (open question).** Both publish what they hold by prefix hash. We propose one shared block identity and event format, so the router sees both in one place (see also #13044).
+4. **Choosing a strategy.** Picking between a standby takeover, a KVCR-backed restart, and a cold start belongs in the common recovery contract proposed in #15379.
 
 ## Alternate Solutions
 
-Several existing mechanisms are complements to standby failover, not replacements:
+These work alongside standby failover rather than replacing it:
+- **Snapshot (#12521, #13220):** starts the standby from a snapshot instead of from scratch, and re-arms a new standby after a takeover.
+- **KVCR (#11673):** covers GPU and node loss, which GMS cannot.
+- **Request migration:** required; GMS makes the resumed request hit cached KV.
+- **Cold restart:** the fallback when no standby or usable memory exists.
 
-- **Snapshot (#12521, #13220): used together with failover.** The standby is restored from a snapshot of an initialized engine instead of booting from scratch, then attaches to the weights and KV that GMS holds. After a takeover, a fresh standby is re-armed the same way. Snapshot shortens the time to have a standby; GMS makes the takeover itself fast and keeps the KV.
-- **KVCR (#11673): covers what GMS cannot.** It handles GPU or node loss and cache capacity through lower tiers and peers (see the KVCR section above).
-- **Request migration: required building block.** The frontend's migration replays interrupted streams. GMS makes that replay hit cached KV instead of recomputing the prompt.
-- **Cold restart: fallback.** Used when no standby or usable GMS state exists.
-
-These are real alternatives:
-
-- **A gateway in front of the pair** (the Bulwark gateway, #11049). A frontend sidecar re-published the pod to an external Dynamo frontend as one worker, over the request plane. This DEP keeps that PR's logical instance identity, but uses the local frontend's HTTP endpoint as the pod's stable face. The gateway mode would need discovery across pods, which the pod-local control plane deliberately avoids.
-- **Pre-registering the standby as not routable**, so that takeover flips a flag. A shared logical id gets the same result with fewer states, because routers never see a second worker.
-
-- **Weight-only resident daemons**, such as vLLM's `vllm preload`. They make restarts fast for weights only, with no KV, no standby, and no fencing. GMS could act as the backend for such loaders.
-- **Whole-pool recovery without per-block leases** (#14828). The same framework with a simpler strategy, but it needs stronger proof that the predecessor has stopped before any reuse.
-- **Copying KV off the GPU when a failure happens.** Not viable after a crash, because the process is already gone.
+Real alternatives we considered:
+- **A gateway in front of the pair** (the "Bulwark" gateway, #11049): a sidecar that presented the pair to an outside Dynamo frontend as one worker. We kept its single worker identity, but the local frontend serves clients directly, because the gateway would need discovery across pods.
+- **Registering the standby early but hidden**, so takeover just flips a flag. A shared worker ID gives the same result with fewer moving parts.
+- **Daemons that keep only weights in memory**, such as `vllm preload`. They make restarts faster but keep no KV, have no standby, and have no fencing. GMS could act as their memory back end.
+- **Recovering the whole KV pool without per-block leases** (#14828): simpler, but it needs stronger proof that the old engine has stopped before any reuse.
+- **Copying the KV cache out when a failure happens:** not possible after a crash, because the process is already gone.
 
 ## Requirements
 
-- A replacement never serves a block whose generation is stale, and never writes before predecessor writers are retired and their pages classified.
-- All TP ranks agree before allocation, adoption, reclamation, or takeover.
-- Ambiguous or incompatible recovery state fails closed: a cache miss or a startup refusal.
-- Coordination stays off the per-token hot path; steady-state TTFT, ITL and throughput stay within a small margin of the vanilla engine.
-- Engine-native scheduling, hashing, eviction, and capacity semantics are preserved.
-- A takeover never leaves callers without a worker: new requests wait for the standby, bounded by the failover grace, instead of failing.
-- A failover pod needs no external control plane: no etcd and no NATS.
+- The standby never serves an outdated block, and never writes before the old engine is shut out and its memory sorted into safe and quarantined.
+- All GPU ranks agree before memory is allocated, adopted, reclaimed, or taken over.
+- When recovery state is unclear or incompatible, the result is a cache miss or a refusal to start, never silent reuse.
+- Coordination stays off the per-token path. Normal latency (TTFT, ITL) and throughput stay close to the plain engine's.
+- The engines' own scheduling, hashing, eviction, and capacity rules are unchanged.
+- A takeover never leaves clients without a worker: new requests wait for the standby instead of failing.
+- A failover deployment needs no etcd and no NATS.
 
 **Known limitations:**
-- Under MPS isolation, after a hard crash the `gpu-proof` policy keeps the predecessor's pages quarantined until a restart, because MPS cannot certify the dead client. Process isolation reclaims them after the process dies, relying on the driver's context teardown instead of an MPS proof.
-- SGLang confirms live prefixes in batches after their tokens are released. After a crash inside that window, the replay recomputes those pages instead of reusing them.
-- Retiring capacity off the scheduler thread (`DYN_GMS_ASYNC_DIRECTORY_WORK=1`) is opt-in: it removes retirement stalls, but freed capacity arrives a few steps later and can delay admission under bursts.
-- SGLang cannot reproduce output byte for byte across a replay boundary, even without a fault.
+- With MPS isolation, after a hard crash MPS cannot confirm that the dead engine's GPU work is gone, so its memory stays quarantined until a restart. Process isolation reclaims that memory once the process has exited.
+- SGLang records finished prefixes in batches, slightly after their tokens are sent. After a crash inside that window, those blocks are recomputed instead of reused.
+- Moving memory bookkeeping off the scheduler thread (`DYN_GMS_ASYNC_DIRECTORY_WORK=1`) is opt-in. It removes pauses, but freed memory becomes available a few steps later, which can delay new requests under bursts.
+- SGLang does not reproduce output byte for byte when a request is resumed, even without a fault.
 - GPU reset and node loss are not covered.
-- File discovery is per host. Every process that registers or watches must share the pod's kernel, so multi-node data-parallel attention, which looks up its leader through discovery, still needs a cluster-wide backend.
-- Event channels (KV and load metrics) are still keyed per publisher, not by the logical id. That is harmless with round-robin routing; KV-aware routing inside the pod needs them to follow the logical id.
+- File-based discovery works within one host, since every process that uses it must see the same files. Multi-node SGLang data-parallel attention, which finds its leader through discovery, still needs a cluster-wide discovery back end.
+- KV and load events are still tagged per process, not with the shared worker ID. That is fine with round-robin routing, but KV-aware routing within the deployment needs them to follow the shared ID.
+
+## Key settings
+
+| Setting | Purpose |
+|---|---|
+| `DYN_GMS_GPU_ISOLATION=mps\|process` | How the old engine's GPU work is proven stopped |
+| `DYN_DISCOVERY_LOGICAL_INSTANCE_KEY` | The worker identity shared by the primary and standby |
+| `DYN_DISCOVERY_BACKEND=file`, `DYN_FILE_KV` | Local file-based discovery, with no etcd |
+| `DYN_HTTP_MODEL_FAILOVER_WAIT_MS` | How long new and in-flight requests wait for the standby |
 
 ## References
 
 - Train trackers: #12053 (vLLM), #14704 (SGLang), #15035 (hardening; also a DEP)
-- Prior art: #11049 (Bulwark gateway and logical instance identity)
-- DEPs from this initiative: #14832 (allocation lifetime), #14833 (attachment), #14828 (recovery strategies), #15035 (hardening)
-- Related: #11673 (KV Cache Controller / KVCR), #14888 (vLLM KV recovery after failover), #15379 (common recovery contract), #13044 (persistent KV events), #12521 (Snapshot-coupled GMS)
+- DEPs from this work: #14832, #14833, #14828, #15035
+- Prior art: #11049 (Bulwark gateway and shared worker identity)
+- Related: #11673 (KV Cache Controller / KVCR), #14888 (vLLM KV recovery after failover), #15379 (common recovery contract), #13044 (persistent KV events), #12521 (Snapshot with GMS)
