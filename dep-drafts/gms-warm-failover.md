@@ -71,6 +71,7 @@ Separate the lifetime of GPU memory from the lifetime of the engine process.
    - The primary and standby publish one logical discovery instance (`DYN_DISCOVERY_LOGICAL_INSTANCE_KEY`). Only the failover-lock owner registers, and a successor takes over the shared records with compare-and-replace. Routers therefore see one worker whose address moves, never a worker leaving and another joining.
    - Discovery uses the file backend on the pod's shared emptyDir, with the TCP request plane and ZMQ events. All registering processes share one kernel, so inotify delivers changes immediately and flock arbitrates writers. The failover pod runs no etcd and no NATS.
    - A dying predecessor cannot remove or refresh records its successor took over: the store deletes or refreshes a key only while it still holds the bytes it wrote.
+   - No operator is required. A failover deployment is plain Kubernetes objects: the leader pod (both GMS daemons, the frontend, and both engines), one pod per additional TP rank, a Service for the leader, and the GPU claims. A LeaderWorkerSet adds gang scheduling and in-place restarts. Rendering the same pod from a DynamoGraphDeployment is optional follow-up work.
 7. **Near-native steady state.** Keeping KV recoverable must not slow normal serving. Directory publication, confirmation and capacity retirement are batched and kept off the scheduler's critical path, in particular off the step that releases first tokens. Lease acquisition stays lock-free.
 
 ### The three PR trains
@@ -144,7 +145,6 @@ These are real alternatives:
 - GPU reset and node loss are not covered.
 - File discovery is per host. Every process that registers or watches must share the pod's kernel, so multi-node data-parallel attention, which looks up its leader through discovery, still needs a cluster-wide backend.
 - Event channels (KV and load metrics) are still keyed per publisher, not by the logical id. That is harmless with round-robin routing; KV-aware routing inside the pod needs them to follow the logical id.
-- The operator does not yet render the pod-local control plane: it still deploys etcd and NATS for failover pods.
 
 ## References
 
