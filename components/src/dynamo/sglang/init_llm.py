@@ -15,6 +15,7 @@ from dynamo.common.constants import DisaggregationMode
 from dynamo.common.gms_failover import (
     acquire_gms_failover_lock_before_init,
     arm_frozen_shadow_headroom,
+    claim_discovery_for_active_engine,
     frozen_predecessor_enabled,
     prepare_gms_failover,
     run_gms_failover_promotion_warmup,
@@ -468,6 +469,7 @@ async def init_decode(
         early_failover_activation.attach_to(handler)
         await promotion_warmup()
         await wait_for_armed_standby_before_serving("sglang")
+        claim_discovery_for_active_engine(handler)
     else:
         # Give the serving handler a quiesce-capable failover controller so a
         # shadow can quiesce (pause/release memory) before discovery; without it
