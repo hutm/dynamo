@@ -146,6 +146,9 @@ pub(crate) trait ControllerHost: Send + Sync + 'static {
         _observation: Option<WorkerGroupObservation>,
     ) {
     }
+    /// A serving group lost its last instance and is retained until `until`
+    /// (`Some`), or that hold ended (`None`).
+    fn set_failover_hold(&self, _key: &GroupKey, _until: Option<Instant>) {}
 
     fn discard_prepared(&self, prepared: Self::Prepared);
 
@@ -612,6 +615,8 @@ impl<H: ControllerHost> ModelDiscoveryController<H> {
                 // Keep the committed pipeline and its admission channel alive
                 // for in-flight migration. A compatible replacement can join
                 // this channel; a different fingerprint is rejected below.
+                // New requests may wait for that replacement until `deadline`.
+                self.host.set_failover_hold(key, Some(deadline));
                 group.status = GroupStatus::BlockedReady {
                     mdc_checksum,
                     committed_members: BTreeSet::new(),
@@ -620,11 +625,13 @@ impl<H: ControllerHost> ModelDiscoveryController<H> {
                 self.groups.insert(key.clone(), group);
                 return;
             }
+            self.host.set_failover_hold(key, None);
             if status_has_commit(&old_status) {
                 self.host.remove_group(key);
             }
             return;
         }
+        self.host.set_failover_hold(key, None);
 
         let mdc_checksum = group
             .selected_checksum()
@@ -1165,6 +1172,7 @@ impl<H: ControllerHost> ModelDiscoveryController<H> {
         }
         for key in expired_empty {
             self.groups.remove(&key);
+            self.host.set_failover_hold(&key, None);
             self.host.remove_group(&key);
         }
     }
@@ -1404,6 +1412,7 @@ mod tests {
         discarded: AtomicUsize,
         inventory: super::super::worker_inventory::WorkerInventory,
         prepared_replacements: AtomicUsize,
+        failover_holds: Mutex<HashMap<String, Instant>>,
     }
 
     impl FakeHost {
@@ -1425,6 +1434,7 @@ mod tests {
                     discarded: AtomicUsize::new(0),
                     inventory: Default::default(),
                     prepared_replacements: AtomicUsize::new(0),
+                    failover_holds: Mutex::new(HashMap::new()),
                 }),
                 start_rx,
             )
@@ -1611,6 +1621,18 @@ mod tests {
             let Prepared(_build) = prepared;
             self.prepared_replacements.fetch_add(1, Ordering::SeqCst);
             self.replace_group(&spec.key, members, adapters)
+        }
+
+        fn set_failover_hold(&self, key: &GroupKey, until: Option<Instant>) {
+            let mut holds = self.failover_holds.lock().unwrap();
+            match until {
+                Some(deadline) => {
+                    holds.insert(key.id(), deadline);
+                }
+                None => {
+                    holds.remove(&key.id());
+                }
+            }
         }
 
         fn remove_group(&self, key: &GroupKey) {
@@ -2113,11 +2135,21 @@ mod tests {
         finish_build(&mut controller).await;
         let old_admissions = host.admissions.lock().unwrap()[0].clone();
 
+        assert!(host.failover_holds.lock().unwrap().is_empty());
+
         controller.apply_removed(&primary.key);
         assert!(old_admissions.borrow().is_empty());
         assert_eq!(host.removed_groups.load(Ordering::SeqCst), 0);
+        // New requests may wait for the replacement during the grace period.
+        assert!(
+            host.failover_holds
+                .lock()
+                .unwrap()
+                .contains_key(&group_key().id())
+        );
 
         controller.apply_added(shadow.clone());
+        assert!(host.failover_holds.lock().unwrap().is_empty());
         assert_eq!(*old_admissions.borrow(), vec![2]);
         assert_eq!(host.members(&group_key()), BTreeSet::from([shadow.key]));
         assert_eq!(host.removed_groups.load(Ordering::SeqCst), 0);
@@ -2166,6 +2198,7 @@ mod tests {
         }
         controller.release_due_retries();
         assert_eq!(host.removed_groups.load(Ordering::SeqCst), 2);
+        assert!(host.failover_holds.lock().unwrap().is_empty());
         assert!(!controller.groups.contains_key(&group_key()));
     }
 
