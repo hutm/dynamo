@@ -49,11 +49,7 @@ The core idea: GPU memory should outlive the engine process.
 
 **5. Requests keep going.** Interrupted requests continue on the standby using their cached KV, and new requests just wait a moment instead of failing.
 
-**6. One worker identity, and no extra infrastructure.**
-- The primary and standby share one worker ID. Only the engine that currently holds the failover lock registers it, so the frontend sees one worker whose address changes, never one worker leaving and another joining.
-- Discovery uses plain files in a directory that all processes on the host share. Changes show up immediately through the operating system's file notifications, and file locks make sure only one process writes a record at a time. No etcd and no NATS are needed.
-- An old engine that is shutting down cannot delete or refresh records that its successor has taken over.
-- No Kubernetes operator is required. A deployment is plain Kubernetes objects: one pod with both GMS daemons, the frontend, and both engines, plus one pod per extra GPU rank, a Service, and the GPU claims. A LeaderWorkerSet adds gang scheduling and restarts in place. Support in the Dynamo operator can come later.
+**6. One worker, no extra infrastructure.** The primary and standby share one worker ID, so the frontend sees a single worker whose address changes on takeover. Discovery uses local files instead of etcd or NATS, and a deployment is just a few plain pods, with no operator required.
 
 **7. Normal serving stays fast.** The bookkeeping that makes the KV cache recoverable is batched and kept off the critical path of each step, especially the step that releases the first token. Taking a lease never waits on a lock.
 
