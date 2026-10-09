@@ -1,3 +1,5 @@
+# DEP: Warm failover with the GPU Memory Service
+
 ## Summary
 
 When an inference engine crashes today, its GPU memory is lost. Reloading the weights of a large model takes minutes, and the KV cache (every prompt prefix already computed) is gone, so in-flight requests fail or start over.
