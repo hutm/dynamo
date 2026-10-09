@@ -91,7 +91,27 @@ How they fit together:
 
 ## References
 
-- Train trackers: #12053 (vLLM), #14704 (SGLang), #15035 (hardening; also a DEP)
-- DEPs from this work: #14832, #14833, #14828, #15035
-- Prior art: #11049 (Bulwark gateway and shared worker identity)
-- Related: #11673 (KV Cache Controller / KVCR), #14888 (vLLM KV recovery after failover), #15379 (common recovery contract), #13044 (persistent KV events), #12521 (Snapshot with GMS)
+**PR trains (tracking issues)**
+- vLLM: #12053 — PRs #12056, #14576, #14577, #13398, #12032
+- SGLang: #14704 — PRs #14706 through #14719
+- Production hardening: #15035 — PRs #15036, #15040, #15044, #15048, #15050, #15913
+- Memory-pool back ends: #14814, #14818
+
+**DEPs from this work**
+- #14832 — GPU memory that outlives engine sessions
+- #14833 — Safe engine attachment to that memory
+- #14828 — KV recovery per block or for the whole pool
+- #15035 — Production hardening
+
+**Related DEPs**
+- #12521 — Snapshot-coupled GPU Memory Service
+- #12671 — Snapshot-compatible failover within a pod
+- #14888 — vLLM KV recovery after failover
+- #11673 — KV Cache Controller (KVCR)
+- #13044 — Persistent KV events across engine restarts
+- #15379 — Common recovery contract for Dynamo workloads
+
+**Earlier work**
+- #10450 — Stateless restartable inference engines with GMS-managed KV (closed tracker)
+- #10454 — Request replay and single-pod failover mode (closed)
+- #11049 — Bulwark gateway and shared worker identity (closed PR)
