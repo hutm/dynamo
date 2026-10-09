@@ -1,4 +1,4 @@
-# DEP: Warm failover with the GPU Memory Service
+# DEP: Engine failover without losing the KV cache
 
 ## Summary
 
