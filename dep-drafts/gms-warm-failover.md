@@ -87,16 +87,6 @@ How they fit together:
 3. **One view of the cache (open question).** Both publish what they hold by prefix hash. We propose one shared block identity and event format, so the router sees both in one place (see also #13044).
 4. **Choosing a strategy.** Picking between a standby takeover, a KVCR-backed restart, and a cold start belongs in the common recovery contract proposed in #15379.
 
-## Known limitations
-
-- With MPS isolation, after a hard crash MPS cannot confirm that the dead engine's GPU work is gone, so its memory stays quarantined until a restart. Process isolation reclaims that memory once the process has exited.
-- SGLang records finished prefixes in batches, slightly after their tokens are sent. After a crash inside that window, those blocks are recomputed instead of reused.
-- Moving memory bookkeeping off the scheduler thread (`DYN_GMS_ASYNC_DIRECTORY_WORK=1`) is opt-in. It removes pauses, but freed memory becomes available a few steps later, which can delay new requests under bursts.
-- SGLang does not reproduce output byte for byte when a request is resumed, even without a fault.
-- GPU reset and node loss are not covered.
-- File-based discovery works within one host, since every process that uses it must see the same files. Multi-node SGLang data-parallel attention, which finds its leader through discovery, still needs a cluster-wide discovery back end.
-- KV and load events are still tagged per process, not with the shared worker ID. That is fine with round-robin routing, but KV-aware routing within the deployment needs them to follow the shared ID.
-
 ## References
 
 - Train trackers: #12053 (vLLM), #14704 (SGLang), #15035 (hardening; also a DEP)
