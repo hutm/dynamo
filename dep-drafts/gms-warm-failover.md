@@ -47,7 +47,7 @@ The core idea: GPU memory should outlive the engine process.
 
 **4. The old engine can't corrupt the standby.** When a crash is detected, every process of the old engine is stopped at once, on all GPU ranks. Memory it might still have been writing is set aside and reused only once that is known to be safe. If anything is unclear, the standby treats the data as a cache miss rather than reuse it.
 
-**5. Requests keep going.** Dynamo resumes interrupted requests on the standby, which finds their KV still cached instead of recomputing the prompt. New requests that arrive during a takeover wait briefly instead of getting a "model not ready" error.
+**5. Requests keep going.** Interrupted requests continue on the standby using their cached KV, and new requests just wait a moment instead of failing.
 
 **6. One worker identity, and no extra infrastructure.**
 - The primary and standby share one worker ID. Only the engine that currently holds the failover lock registers it, so the frontend sees one worker whose address changes, never one worker leaving and another joining.
