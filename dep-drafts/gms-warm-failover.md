@@ -45,14 +45,7 @@ The core idea: GPU memory should outlive the engine process.
 
 **3. The KV cache survives in the engine's own format.** Every KV block carries a lease with a version number, and finished blocks are listed in a small directory by prefix hash. On takeover, the standby adds those blocks to its own prefix cache. The engine stays in charge of its cache; GMS does not keep a copy of its index.
 
-**4. Safety comes first: a dead or stuck primary must never write into memory the standby is using.**
-- On takeover, the standby bumps the block versions and shuts out every process of the old engine, on all GPU ranks. The rank processes coordinate over the network (TCP and the engine's own channels), not through a shared filesystem.
-- When a crash is detected, all of the old engine's processes are killed at once. The standby does not wait for the GPU driver's slow cleanup; it only waits until no old process can run code anymore.
-- Memory the old engine might still touch is set aside (quarantined) and reused only once its GPU work has provably stopped. One setting, `DYN_GMS_GPU_ISOLATION`, chooses how that is proven:
-  - `mps`: engines run under NVIDIA MPS, and GMS asks MPS to terminate the dead engine's GPU work first.
-  - `process`: engines run as plain CUDA processes, and memory is reused after the old process has exited, since the driver then tears down its GPU work.
-- A GPU fault on any rank stops the whole engine at once and tells the lead rank, in both modes.
-- When anything is unclear, the system is cautious: it treats the data as a cache miss or refuses to start, and never reuses memory silently.
+**4. The old engine can't corrupt the standby.** When a crash is detected, every process of the old engine is stopped at once, on all GPU ranks. Memory it might still have been writing is set aside and reused only once that is known to be safe. If anything is unclear, the standby treats the data as a cache miss rather than reuse it.
 
 **5. Requests keep going.** Dynamo resumes interrupted requests on the standby, which finds their KV still cached instead of recomputing the prompt. New requests that arrive during a takeover wait briefly instead of getting a "model not ready" error.
 
