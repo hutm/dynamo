@@ -87,32 +87,8 @@ How they fit together:
 3. **One view of the cache (open question).** Both publish what they hold by prefix hash. We propose one shared block identity and event format, so the router sees both in one place (see also #13044).
 4. **Choosing a strategy.** Picking between a standby takeover, a KVCR-backed restart, and a cold start belongs in the common recovery contract proposed in #15379.
 
-## Alternate Solutions
+## Known limitations
 
-These work alongside standby failover rather than replacing it:
-- **Snapshot (#12521, #13220):** starts the standby from a snapshot instead of from scratch, and re-arms a new standby after a takeover.
-- **KVCR (#11673):** covers GPU and node loss, which GMS cannot.
-- **Request migration:** required; GMS makes the resumed request hit cached KV.
-- **Cold restart:** the fallback when no standby or usable memory exists.
-
-Real alternatives we considered:
-- **A gateway in front of the pair** (the "Bulwark" gateway, #11049): a sidecar that presented the pair to an outside Dynamo frontend as one worker. We kept its single worker identity, but the local frontend serves clients directly, because the gateway would need discovery across pods.
-- **Registering the standby early but hidden**, so takeover just flips a flag. A shared worker ID gives the same result with fewer moving parts.
-- **Daemons that keep only weights in memory**, such as `vllm preload`. They make restarts faster but keep no KV, have no standby, and have no fencing. GMS could act as their memory back end.
-- **Recovering the whole KV pool without per-block leases** (#14828): simpler, but it needs stronger proof that the old engine has stopped before any reuse.
-- **Copying the KV cache out when a failure happens:** not possible after a crash, because the process is already gone.
-
-## Requirements
-
-- The standby never serves an outdated block, and never writes before the old engine is shut out and its memory sorted into safe and quarantined.
-- All GPU ranks agree before memory is allocated, adopted, reclaimed, or taken over.
-- When recovery state is unclear or incompatible, the result is a cache miss or a refusal to start, never silent reuse.
-- Coordination stays off the per-token path. Normal latency (TTFT, ITL) and throughput stay close to the plain engine's.
-- The engines' own scheduling, hashing, eviction, and capacity rules are unchanged.
-- A takeover never leaves clients without a worker: new requests wait for the standby instead of failing.
-- A failover deployment needs no etcd and no NATS.
-
-**Known limitations:**
 - With MPS isolation, after a hard crash MPS cannot confirm that the dead engine's GPU work is gone, so its memory stays quarantined until a restart. Process isolation reclaims that memory once the process has exited.
 - SGLang records finished prefixes in batches, slightly after their tokens are sent. After a crash inside that window, those blocks are recomputed instead of reused.
 - Moving memory bookkeeping off the scheduler thread (`DYN_GMS_ASYNC_DIRECTORY_WORK=1`) is opt-in. It removes pauses, but freed memory becomes available a few steps later, which can delay new requests under bursts.
@@ -120,15 +96,6 @@ Real alternatives we considered:
 - GPU reset and node loss are not covered.
 - File-based discovery works within one host, since every process that uses it must see the same files. Multi-node SGLang data-parallel attention, which finds its leader through discovery, still needs a cluster-wide discovery back end.
 - KV and load events are still tagged per process, not with the shared worker ID. That is fine with round-robin routing, but KV-aware routing within the deployment needs them to follow the shared ID.
-
-## Key settings
-
-| Setting | Purpose |
-|---|---|
-| `DYN_GMS_GPU_ISOLATION=mps\|process` | How the old engine's GPU work is proven stopped |
-| `DYN_DISCOVERY_LOGICAL_INSTANCE_KEY` | The worker identity shared by the primary and standby |
-| `DYN_DISCOVERY_BACKEND=file`, `DYN_FILE_KV` | Local file-based discovery, with no etcd |
-| `DYN_HTTP_MODEL_FAILOVER_WAIT_MS` | How long new and in-flight requests wait for the standby |
 
 ## References
 
