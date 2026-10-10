@@ -26,6 +26,10 @@ hooks = pytest.mark.skipif(
     not sleep_backend.vllm_supports_sleep_backend_hooks(),
     reason="vLLM without sleep-backend allocation hooks",
 )
+block_pool_hooks = pytest.mark.skipif(
+    not install_kv_leases.block_pool_cls_supported(),
+    reason="vLLM without --block-pool-cls",
+)
 
 
 @hooks
@@ -116,7 +120,46 @@ def test_reattached_kv_uses_vllm_contents_preservation():
         assert not kv_cache_contents_preserved()
 
 
-@hooks
+@block_pool_hooks
+def test_block_pool_class_is_selected_through_engine_args(monkeypatch):
+    monkeypatch.setattr(install_kv_leases, "kv_leases_enabled", lambda _engine: True)
+    engine_args = SimpleNamespace(block_pool_cls=None)
+    assert install_kv_leases.configure_engine_args(engine_args) is True
+    assert engine_args.block_pool_cls == install_kv_leases.GMS_BLOCK_POOL_QUALNAME
+
+    monkeypatch.setattr(install_kv_leases, "kv_leases_enabled", lambda _engine: False)
+    untouched = SimpleNamespace(block_pool_cls=None)
+    assert install_kv_leases.configure_engine_args(untouched) is False
+    assert untouched.block_pool_cls is None
+
+
+@block_pool_hooks
+def test_unresolved_gms_block_pool_falls_back_to_vllm(monkeypatch):
+    from vllm.v1.core.block_pool import BlockPool
+
+    monkeypatch.setattr(install_kv_leases, "_gms_block_pool_class", None)
+    assert install_kv_leases.GMSBlockPool is BlockPool
+
+
+@block_pool_hooks
+def test_scheduler_fails_closed_without_the_gms_block_pool(monkeypatch):
+    from vllm.v1.core.block_pool import BlockPool
+
+    class Pool(BlockPool):
+        pass
+
+    monkeypatch.setattr(install_kv_leases, "_gms_block_pool_class", Pool)
+    monkeypatch.setattr(install_kv_leases, "_selected_by_block_pool_cls", True)
+
+    def native_init(self, *args, **kwargs):
+        self.kv_cache_manager = SimpleNamespace(block_pool=object())
+
+    monkeypatch.setattr(install_kv_leases, "_original_scheduler_init", native_init)
+    with pytest.raises(RuntimeError, match="--block-pool-cls"):
+        install_kv_leases._scheduler_init_with_gms_completion_fence(SimpleNamespace())
+
+
+@block_pool_hooks
 def test_pause_flushes_the_gms_directory():
     from vllm.v1.core.block_pool import BlockPool
 

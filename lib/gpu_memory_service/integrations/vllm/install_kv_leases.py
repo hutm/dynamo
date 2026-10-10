@@ -32,6 +32,53 @@ _factory: Callable[[int], KVLeaseClient] | None = None
 _engine_core_hook_patched = False
 _original_run_engine_core = None
 _gms_block_pool_class = None
+# True when vLLM builds the pool from --block-pool-cls instead of the
+# module-level BlockPool rebinding older vLLM requires.
+_selected_by_block_pool_cls = False
+GMS_BLOCK_POOL_QUALNAME = f"{__name__}.GMSBlockPool"
+
+
+def block_pool_cls_supported() -> bool:
+    """Whether vLLM selects the KV block pool from ``--block-pool-cls``."""
+    try:
+        from vllm.config.cache import CacheConfig
+        from vllm.v1.core.block_pool import BlockPool
+    except Exception:  # noqa: BLE001
+        return False
+    return hasattr(CacheConfig, "get_block_pool_cls") and hasattr(
+        BlockPool, "on_blocks_allocated"
+    )
+
+
+def configure_engine_args(engine_args) -> bool:
+    """Select ``GMSBlockPool`` through ``--block-pool-cls`` when vLLM has it."""
+    if not (
+        block_pool_cls_supported()
+        and hasattr(engine_args, "block_pool_cls")
+        and kv_leases_enabled("vllm")
+    ):
+        return False
+    engine_args.block_pool_cls = GMS_BLOCK_POOL_QUALNAME
+    logger.info("[GMS-KVLease] vLLM block_pool_cls=%s", GMS_BLOCK_POOL_QUALNAME)
+    return True
+
+
+def __getattr__(name: str):
+    # Resolved by vLLM from --block-pool-cls in the scheduler process, after
+    # install() built the lease-aware class.
+    if name != "GMSBlockPool":
+        raise AttributeError(name)
+    if _gms_block_pool_class is None:
+        from vllm.v1.core.block_pool import BlockPool
+
+        logger.warning(
+            "[GMS-KVLease] --block-pool-cls selected GMSBlockPool but KV leases "
+            "are not installed in this process; using vLLM's BlockPool"
+        )
+        return BlockPool
+    return _gms_block_pool_class
+
+
 _original_scheduler_init = None
 
 
@@ -410,6 +457,17 @@ def _scheduler_init_with_gms_completion_fence(self, *args, **kwargs) -> None:
     """Keep freed blocks leased until the worker has completed their GPU step."""
     assert _original_scheduler_init is not None
     _original_scheduler_init(self, *args, **kwargs)
+    pool_in_use = getattr(getattr(self, "kv_cache_manager", None), "block_pool", None)
+    if (
+        _selected_by_block_pool_cls
+        and pool_in_use is not None
+        and not isinstance(pool_in_use, _gms_block_pool_class)
+    ):
+        raise RuntimeError(
+            "GMS KV leases need vLLM --block-pool-cls="
+            f"{GMS_BLOCK_POOL_QUALNAME}; the scheduler built "
+            f"{type(pool_in_use).__name__}"
+        )
     # vLLM already owns the correct scheduler/worker completion sequence for
     # overlapping batches. Bare GMS is not a KV consumer connector, so opt in
     # explicitly: completed full blocks are sealed after update_from_output,
@@ -2064,7 +2122,7 @@ def install(factory: Callable[[int], KVLeaseClient] | None = None) -> bool:
     """Install a lease-aware BlockPool at vLLM's construction site."""
 
     global _patched, _factory, _gms_block_pool_class, orig_allocate_slots
-    global _original_scheduler_init
+    global _original_scheduler_init, _selected_by_block_pool_cls
 
     if factory is not None:
         _factory = factory
@@ -2090,7 +2148,12 @@ def install(factory: Callable[[int], KVLeaseClient] | None = None) -> bool:
     _original_scheduler_init = Scheduler.__init__
     Scheduler.__init__ = _scheduler_init_with_gms_completion_fence
     _gms_block_pool_class = _build_gms_block_pool_class(BlockPool)
-    kv_cache_coordinator.BlockPool = _gms_block_pool_class
+    if block_pool_cls_supported():
+        # vLLM constructs it from --block-pool-cls (configure_engine_args);
+        # the scheduler init wrapper fails closed if it did not.
+        _selected_by_block_pool_cls = True
+    else:
+        kv_cache_coordinator.BlockPool = _gms_block_pool_class
     _patched = True
     logger.info("[GMS-KVLease] installed vLLM GMSBlockPool")
     return True
@@ -2105,7 +2168,11 @@ def lease_hooks_installed() -> bool:
         from vllm.v1.core.sched.scheduler import Scheduler
     except Exception:  # noqa: BLE001
         return False
-    installed = kv_cache_coordinator.BlockPool
+    installed = (
+        _gms_block_pool_class
+        if _selected_by_block_pool_cls
+        else kv_cache_coordinator.BlockPool
+    )
     return bool(
         installed is _gms_block_pool_class
         and installed is not BlockPool

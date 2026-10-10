@@ -213,6 +213,11 @@ def _configure_gms_vllm_worker(engine_args: Any) -> None:
     from gpu_memory_service.integrations.vllm.sleep_backend import configure_engine_args
 
     configure_engine_args(engine_args)
+    from gpu_memory_service.integrations.vllm.install_kv_leases import (
+        configure_engine_args as configure_block_pool,
+    )
+
+    configure_block_pool(engine_args)
 
     logger.info("[GMS] vLLM worker_cls configured as %s", GMS_VLLM_WORKER_CLS)
 

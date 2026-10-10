@@ -266,8 +266,14 @@ def test_block_pool_hbm_directory_survives_engine_replacement(monkeypatch):
         leases_mod._factory = None
         leases_mod.ContentDirectory = lambda *_args, **_kwargs: directory
         assert leases_mod.install(factory=lambda _total: Client())
-        GMSBlockPool = kv_cache_coordinator.BlockPool
+        if leases_mod.block_pool_cls_supported():
+            # vLLM builds the pool from --block-pool-cls; nothing is rebound.
+            assert kv_cache_coordinator.BlockPool is original_block_pool_binding
+            GMSBlockPool = leases_mod.GMSBlockPool
+        else:
+            GMSBlockPool = kv_cache_coordinator.BlockPool
         assert GMSBlockPool is leases_mod._gms_block_pool_class
+        assert leases_mod.lease_hooks_installed()
         assert issubclass(GMSBlockPool, BlockPool)
         assert dict(BlockPool.__dict__) == original_block_pool_methods
 
@@ -420,6 +426,7 @@ def test_block_pool_hbm_directory_survives_engine_replacement(monkeypatch):
         leases_mod._factory = original_factory
         leases_mod._patched = original_patched
         leases_mod._gms_block_pool_class = None
+        leases_mod._selected_by_block_pool_cls = False
 
 
 def test_dormant_headroom_preserves_concurrent_admission(monkeypatch):
