@@ -129,8 +129,19 @@ def _pause_resume_tags(tag: str | None) -> tuple[str, ...]:
     return ()
 
 
+def persistent_kv_reattaching() -> bool:
+    """Whether the active KV-pool constructor re-attaches existing pages."""
+    return _PERSISTENT_KV_SCOPE.get() is True
+
+
 def get_gms_memory_saver_impl() -> GMSMemorySaverImpl | None:
-    """Get or lazily initialize the GMS impl from torch_memory_saver."""
+    """Get or lazily initialize the GMS impl from the memory-saver backend
+    (SGLang with backend registry) or torch_memory_saver (older SGLang)."""
+    from gpu_memory_service.integrations.sglang import memory_saver_backend
+
+    impl = memory_saver_backend.current_impl()
+    if impl is not None:
+        return impl
     try:
         import torch_memory_saver
 
@@ -152,7 +163,11 @@ class GMSMemorySaverImpl:
         device_index: int,
         mode=None,
         ro_connect_timeout_ms=None,
+        native_kv_zero_skip: bool = False,
     ):
+        # SGLang with memory-saver backends skips KV zero-fill itself when the
+        # backend reports re-attached pages; older SGLang needs the zeros hook.
+        self._native_kv_zero_skip = native_kv_zero_skip
         self._device = torch.device(get_vmm_device_type().value, device_index)
         cohort = os.environ.get("GMS_SGLANG_WRITER_COHORT_PATH")
         crash_interlock_fd = None
@@ -305,7 +320,9 @@ class GMSMemorySaverImpl:
                 if tag == "kv_cache"
                 else gms_use_mem_pool(tag, self._device)
             )
-            with pool, _preserve_persistent_kv_zeros(bool(persistent_kv_reattach)):
+            with pool, _preserve_persistent_kv_zeros(
+                bool(persistent_kv_reattach) and not self._native_kv_zero_skip
+            ):
                 yield
             clean_exit = True
         finally:

@@ -24,6 +24,7 @@ from gpu_memory_service.integrations.common.utils import (
     strip_gms_model_loader_config,
     torch_device,
 )
+from gpu_memory_service.integrations.sglang import memory_saver_backend  # noqa: E402
 from gpu_memory_service.integrations.sglang import (
     install_gms_unified_cache,
     install_vmm_ipc_kv,
@@ -56,7 +57,9 @@ def _install_kv_allocator_hooks() -> None:
 # must run inside the child process.  The import chain that triggers this is:
 #   child unpickles server_args.load_format -> imports GMSModelLoader -> here.
 patch_empty_cache()
-patch_torch_memory_saver()
+if not memory_saver_backend.register():
+    # Older SGLang: route torch_memory_saver to GMS by patching it.
+    patch_torch_memory_saver()
 patch_model_runner()
 patch_shared_kv_pool_geometry()
 patch_failover_extend_warmup_for_gms()

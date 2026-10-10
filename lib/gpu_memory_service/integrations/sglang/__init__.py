@@ -77,12 +77,20 @@ def setup_gms(server_args) -> type[GMSModelLoader]:
             "Cannot use --enable-draft-weights-cpu-backup with --load-format gms."
         )
 
+    from gpu_memory_service.integrations.sglang import memory_saver_backend
+
+    memory_saver_fields = {"enable_memory_saver": True}
+    if memory_saver_backend.register() and hasattr(server_args, "memory_saver_backend"):
+        memory_saver_fields[
+            "memory_saver_backend"
+        ] = memory_saver_backend.GMS_MEMORY_SAVER_BACKEND
     if declare_resolution is not None:
-        declare_resolution(server_args, "dynamo.gms", enable_memory_saver=True)
+        declare_resolution(server_args, "dynamo.gms", **memory_saver_fields)
     else:
         # The separately pinned XPU image still uses SGLang 0.5.11, which
         # predates declarations. Remove when that pin is upgraded to 0.5.19+.
-        server_args.enable_memory_saver = True
+        for name, value in memory_saver_fields.items():
+            setattr(server_args, name, value)
 
     configure_shared_failover_env()
 
