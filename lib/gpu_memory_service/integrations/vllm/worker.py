@@ -57,6 +57,13 @@ from gpu_memory_service.integrations.vllm.model_loader import (
     register_gms_loader,
 )
 from gpu_memory_service.integrations.vllm.patches import patch_memory_snapshot
+from gpu_memory_service.integrations.vllm.sleep_backend import GMS_SLEEP_MODE_BACKEND
+from gpu_memory_service.integrations.vllm.sleep_backend import (
+    register as register_gms_sleep_backend,
+)
+from gpu_memory_service.integrations.vllm.sleep_backend import (
+    vllm_supports_sleep_backend_hooks,
+)
 from gpu_memory_service.integrations.vllm.startup import (
     install_and_verify_kv_failover_hooks,
 )
@@ -106,6 +113,8 @@ if os.environ.get("MX_ENABLED", "0") == "1":
 
 
 install_gms_engine_core_sleep()
+# Worker processes resolve the "gms" sleep backend by name.
+register_gms_sleep_backend()
 
 # Import the platform-specific worker after patches are applied.
 from vllm.platforms import current_platform as _cp  # noqa: E402
@@ -296,6 +305,8 @@ class GMSWorker(_BaseWorker):
 
         # Parent will set device again (harmless) and do memory checks
         super().init_device()
+        if self._gms_uses_sleep_backend():
+            self.sleep_mode_backend.bind_worker(self)
         if cohort:
             from gpu_memory_service.integrations.common.gpu_quiescence import (
                 arm_gpu_crash_interlock,
@@ -362,6 +373,10 @@ class GMSWorker(_BaseWorker):
             tag="kv_pool",
             shared=allocation_shared(),
         )
+        if self._gms_uses_sleep_backend():
+            # vLLM hands kv_cache_config to the sleep backend's allocation
+            # context; no worker-side stash is needed.
+            return super().initialize_from_config(kv_cache_config)
         self._gms_kv_cache_config = kv_cache_config
         try:
             super().initialize_from_config(kv_cache_config)
@@ -539,18 +554,25 @@ class GMSWorker(_BaseWorker):
                 self.model_runner.init_fp8_kv_scales()
                 logger.info("[GMS] vLLM init_fp8_kv_scales done")
 
-    def _maybe_get_memory_pool_context(self, tag: str):
-        """Route tag-scoped runtime allocations to the right allocator.
+    def _gms_uses_sleep_backend(self) -> bool:
+        """Whether vLLM routes allocations through the GMS sleep backend."""
+        model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+        return (
+            bool(getattr(model_config, "enable_sleep_mode", False))
+            and getattr(model_config, "sleep_mode_backend", None)
+            == GMS_SLEEP_MODE_BACKEND
+            and vllm_supports_sleep_backend_hooks()
+        )
+
+    def gms_allocation_context(self, tag: str, kv_cache_config=None):
+        """GMS placement for a vLLM allocation tag, or None for vLLM's default.
 
         Weight tensors are allocated explicitly in the GMS model-loader path,
-        not through vLLM's tagged runtime allocator hook. For `weights` we
-        therefore only suppress CuMemAllocator here so it does not interfere
-        with the loader-managed GMS allocations. `kv_cache` is the tag that
-        actually allocates through this hook, so it uses the dedicated GMS
-        mempool.
+        not through vLLM's tagged allocator hook, so `weights` only bypasses
+        the default pool. `kv_cache` allocates from the GMS persistent pool.
         """
         if tag == "weights":
-            logger.debug("[GMS] Skipping CuMemAllocator for weights")
+            logger.debug("[GMS] Skipping the default allocator for weights")
             return nullcontext()
         if tag == "kv_cache" and env_enabled_by_default(
             "GMS_VLLM_VMM_IPC_KV", default=True
@@ -558,8 +580,25 @@ class GMSWorker(_BaseWorker):
             return persistent_kv_allocation_context(
                 self._gms_kv_manager,
                 self._gms_kv_engine_id,
-                self._gms_kv_cache_config,
+                kv_cache_config,
                 self.vllm_config.model_config,
                 torch.device(get_vmm_device_type().value, self._gms_device),
             )
+        return None
+
+    def _maybe_get_memory_pool_context(self, tag: str, kv_cache_config=None):
+        """Route tag-scoped allocations through GMS.
+
+        With vLLM's sleep-backend hooks the base worker asks the GMS backend
+        (see ``sleep_backend``); older vLLM only offers this override.
+        """
+        if self._gms_uses_sleep_backend():
+            return super()._maybe_get_memory_pool_context(
+                tag, kv_cache_config=kv_cache_config
+            )
+        context = self.gms_allocation_context(
+            tag, kv_cache_config or getattr(self, "_gms_kv_cache_config", None)
+        )
+        if context is not None:
+            return context
         return super()._maybe_get_memory_pool_context(tag)

@@ -2045,6 +2045,15 @@ def _build_gms_block_pool_class(block_pool_class):
             _flush_completed_frees(self)
             return super().take_events()
 
+        def on_scheduler_paused(self):
+            # vLLM calls this once a pause or sleep has drained in-flight work
+            # and before memory is unmapped: the deferred directory mutations
+            # must reach the daemon first (gms_sleep_no_clear on older vLLM).
+            directory = getattr(self, "_gms_kv_directory", None)
+            flush = getattr(directory, "flush_deferred", None)
+            if flush is not None and not flush(timeout=2.0):
+                raise TimeoutError("GMS directory mutation flush timed out")
+
     GMSBlockPool.__name__ = "GMSBlockPool"
     GMSBlockPool.__qualname__ = "GMSBlockPool"
     GMSBlockPool.__module__ = __name__

@@ -34,7 +34,7 @@ import re
 import sys
 import time
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 
 from gpu_memory_service.client.rpc import GMS_ERR_IDENTITY_MISMATCH
@@ -68,6 +68,25 @@ def _install_contextual_zeros_hook(torch):
     contextual_zeros._gms_contextual_zeros = True
     contextual_zeros._gms_original = current_zeros
     torch.zeros = contextual_zeros
+
+
+def _preserve_reattached_kv(reattaching: bool):
+    """Keep re-attached KV pages from being zero-filled by vLLM.
+
+    vLLM versions with ``preserve_kv_cache_contents`` skip the fill when asked;
+    older ones only offer the scoped ``torch.zeros`` substitution below.
+    """
+    if not reattaching:
+        return nullcontext()
+    try:
+        from vllm.v1.worker.utils import preserve_kv_cache_contents
+    except ImportError:
+        return _persistent_kv_zeros_as_empty(True)
+    logger.info(
+        "[GMS-VMM-IPC] allocating persistent vLLM KV without zero-fill to "
+        "preserve existing pages"
+    )
+    return preserve_kv_cache_contents()
 
 
 @contextmanager
@@ -446,7 +465,7 @@ def persistent_kv_allocation_context(
     )
     try:
         with gms_use_persistent_pool("kv_pool", device):
-            with _persistent_kv_zeros_as_empty(reattaching):
+            with _preserve_reattached_kv(reattaching):
                 yield
     except BaseException:
         if not reattaching:

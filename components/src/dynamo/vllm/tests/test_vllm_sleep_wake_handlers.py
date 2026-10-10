@@ -312,3 +312,41 @@ async def test_sleep_with_handoff_releases_failover_lock():
     assert "handed off GMS KV writer ownership" in wake_result["message"]
     handler.engine_client.wake_up.assert_not_awaited()
     handler.generate_endpoint.register_endpoint_instance.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pause_flush_hook", [True, False])
+async def test_no_clear_sleep_uses_vllm_clear_cache_when_available(
+    monkeypatch, pause_flush_hook
+):
+    from dynamo.vllm import handlers
+
+    monkeypatch.setattr(
+        handlers, "_vllm_flushes_block_pool_on_pause", lambda: pause_flush_hook
+    )
+    calls = []
+
+    async def sleep(level=1, mode="abort", clear_cache=None):
+        calls.append((level, mode, clear_cache))
+
+    engine_core = SimpleNamespace(call_utility_async=AsyncMock())
+    engine_client = SimpleNamespace(
+        pause_generation=AsyncMock(),
+        sleep=sleep,
+        wake_up=AsyncMock(),
+        resume_generation=AsyncMock(),
+        engine_core=engine_core,
+    )
+    controller = VllmEnginePauseController(engine_client)
+
+    assert await controller.pause(1, clear_cache=False) is True
+
+    if pause_flush_hook:
+        assert calls == [(1, "abort", False)]
+        engine_core.call_utility_async.assert_not_awaited()
+    else:
+        # Without the pause hook nothing would flush the GMS directory.
+        assert calls == []
+        engine_core.call_utility_async.assert_awaited_once_with(
+            "gms_sleep_no_clear", 1, "abort"
+        )

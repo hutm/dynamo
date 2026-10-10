@@ -220,6 +220,32 @@ def _rl_init_weights_timeout_s() -> float:
     )
 
 
+def _sleep_accepts_clear_cache(engine_client) -> bool:
+    """Whether this vLLM's ``sleep`` takes ``clear_cache`` (keep the prefix
+    cache when the sleep backend preserves KV)."""
+    import inspect
+
+    sleep = getattr(engine_client, "sleep", None)
+    if sleep is None:
+        return False
+    try:
+        return "clear_cache" in inspect.signature(sleep).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _vllm_flushes_block_pool_on_pause() -> bool:
+    """Whether vLLM calls ``BlockPool.on_scheduler_paused``, where the GMS
+    block pool flushes its directory before a no-clear sleep unmaps memory.
+    vLLM with ``sleep(clear_cache=...)`` but without this hook keeps using the
+    ``gms_sleep_no_clear`` utility, which flushes explicitly."""
+    try:
+        from vllm.v1.core.block_pool import BlockPool
+    except Exception:  # noqa: BLE001
+        return False
+    return hasattr(BlockPool, "on_scheduler_paused")
+
+
 class _DeferredAbort:
     """Defers engine_client.abort(request_id) until the first engine output.
 
@@ -443,7 +469,17 @@ class VllmEnginePauseController:
         try:
             engine_core = getattr(self._engine_client, "engine_core", None)
             call_utility = getattr(engine_core, "call_utility_async", None)
-            if not clear_cache and level is not None and callable(call_utility):
+            if (
+                not clear_cache
+                and level is not None
+                and _sleep_accepts_clear_cache(self._engine_client)
+                and _vllm_flushes_block_pool_on_pause()
+            ):
+                # The GMS sleep backend declares that KV survives sleep, so
+                # vLLM keeps the prefix cache; the GMS block pool flushes its
+                # directory when the pause completes.
+                await self._engine_client.sleep(level, "abort", clear_cache=False)
+            elif not clear_cache and level is not None and callable(call_utility):
                 await call_utility("gms_sleep_no_clear", level, "abort")
             elif level is None:
                 await self._engine_client.sleep()
@@ -1228,6 +1264,7 @@ def _as_exact_int(value: object) -> Optional[int]:
         except ValueError:
             return None
     return None
+
 
 def engine_priority(engine_client, routing: dict) -> int:
     """vLLM priority for a request (lower is scheduled first).

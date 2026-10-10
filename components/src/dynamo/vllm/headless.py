@@ -42,6 +42,9 @@ def _configure_gms_vllm_worker(engine_args) -> None:
         )
     engine_args.worker_cls = GMS_VLLM_WORKER_CLS
     import gpu_memory_service.integrations.vllm.worker  # noqa: F401
+    from gpu_memory_service.integrations.vllm.sleep_backend import configure_engine_args
+
+    configure_engine_args(engine_args)
 
 
 def build_headless_namespace(config: Config) -> argparse.Namespace:

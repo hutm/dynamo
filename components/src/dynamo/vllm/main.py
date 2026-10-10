@@ -210,6 +210,9 @@ def _configure_gms_vllm_worker(engine_args: Any) -> None:
     # Import eagerly so model-loader/KV patches fail before vLLM starts worker
     # processes. Worker subprocesses still resolve the class by string.
     import gpu_memory_service.integrations.vllm.worker  # noqa: F401
+    from gpu_memory_service.integrations.vllm.sleep_backend import configure_engine_args
+
+    configure_engine_args(engine_args)
 
     logger.info("[GMS] vLLM worker_cls configured as %s", GMS_VLLM_WORKER_CLS)
 
