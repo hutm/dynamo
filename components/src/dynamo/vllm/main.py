@@ -100,6 +100,7 @@ from .state_agent import (
     start_attachment_owner,
     state_agent_settings,
 )
+from .upstream_memory import configure_kv_restore_role, upstream_memory_enabled
 
 configure_dynamo_logging()
 logger = logging.getLogger(__name__)
@@ -799,6 +800,9 @@ def setup_vllm_engine(
             os.environ["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "True"
         if "VLLM_LORA_MODULES_LOADING_TIMEOUT" not in os.environ:
             os.environ["VLLM_LORA_MODULES_LOADING_TIMEOUT"] = "600"
+
+    if config.gms_shadow_mode and upstream_memory_enabled(engine_args):
+        configure_kv_restore_role(engine_args)
 
     if _is_gms_load_format(engine_args):
         _configure_gms_vllm_worker(engine_args)

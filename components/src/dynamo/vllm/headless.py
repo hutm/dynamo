@@ -26,6 +26,7 @@ import time
 from dynamo.vllm.nixl_telemetry import allow_nixl_telemetry_capture
 
 from .args import Config
+from .upstream_memory import configure_kv_restore_role, upstream_memory_enabled
 
 logger = logging.getLogger(__name__)
 GMS_VLLM_WORKER_CLS = "gpu_memory_service.integrations.vllm.worker.GMSWorker"
@@ -78,6 +79,8 @@ async def run_dynamo_headless(config: Config) -> None:
 
     # Propagate worker_cls for custom load formats so headless workers use
     # the same model loader and patches as the leader node.
+    if config.gms_shadow_mode and upstream_memory_enabled(config.engine_args):
+        configure_kv_restore_role(config.engine_args)
     if config.engine_args.load_format == "gms":
         if config.gms_shadow_mode:
             from gpu_memory_service.integrations.vllm.writer_lifecycle import (

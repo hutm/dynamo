@@ -37,6 +37,7 @@ from dynamo.vllm.benchmark_points import RANDOM_KDA_WORKER
 from dynamo.vllm.constants import DisaggregationMode
 
 from . import envs
+from .upstream_memory import upstream_memory_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -237,10 +238,15 @@ def cross_validate_config(
         )
 
     # Validate --gms-shadow-mode requires --load-format gms
-    if dynamo_config.gms_shadow_mode and engine_config.load_format != "gms":
+    if (
+        dynamo_config.gms_shadow_mode
+        and engine_config.load_format != "gms"
+        and not upstream_memory_enabled(engine_config)
+    ):
         raise ValueError(
-            "--gms-shadow-mode requires --load-format gms. "
-            "Shadow mode depends on GMS for VA-stable weight sharing."
+            "--gms-shadow-mode requires --load-format gms, or --load-format "
+            "ipc_cache with the weight-cache daemon's kv_restore option. "
+            "Shadow mode needs weights and KV shared with the active engine."
         )
 
     if dynamo_config.gms_shadow_mode:

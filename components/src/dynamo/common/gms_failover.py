@@ -1907,6 +1907,7 @@ async def acquire_gms_failover_lock_before_init(
     *,
     backend_name: str,
     lock_factory: Callable[[str], Any] | None = None,
+    post_lock_fence: Callable[[str], Awaitable[None]] | None = None,
 ) -> GmsFailoverActivation:
     """Acquire the failover lock before engine initialization.
 
@@ -1933,7 +1934,10 @@ async def acquire_gms_failover_lock_before_init(
         role,
     )
     try:
-        await run_gms_failover_post_lock_fence(backend_name=backend_name, role=role)
+        if post_lock_fence is not None:
+            await post_lock_fence(role)
+        else:
+            await run_gms_failover_post_lock_fence(backend_name=backend_name, role=role)
     except BaseException:
         await _release_lock_after_activation_error(lock, backend_name=backend_name)
         raise
@@ -1953,13 +1957,25 @@ async def prepare_gms_failover(
     promotion_warmup: Callable[[], Awaitable[None]] | None = None,
     warm_standby_before_quiesce: bool = False,
     activation_barrier: Callable[[], Awaitable[None]] | None = None,
+    post_lock_fence: Callable[[str], Awaitable[None]] | None = None,
+    preconnect_gpu_proof: bool = True,
 ) -> GmsFailoverActivation:
     """Gate model registration until this engine owns the shared GMS namespace.
 
     Bulwark injects ``ENGINE_ID`` and ``FAILOVER_LOCK_PATH`` for all pods. This
     helper only activates when ``DYN_GMS_FAILOVER_SHADOW_MODE`` is true, so
     standalone GMS deployments keep the vanilla Dynamo registration path.
+
+    ``post_lock_fence`` replaces the GMS post-lock fence (``role`` is
+    ``"active"`` or ``"shadow"``) when another memory owner, such as the
+    engine's weight-cache daemon, fences KV ownership itself.
     """
+
+    async def fence(role: str) -> None:
+        if post_lock_fence is not None:
+            await post_lock_fence(role)
+        else:
+            await run_gms_failover_post_lock_fence(backend_name=backend_name, role=role)
 
     if not _truthy_env("DYN_GMS_FAILOVER_SHADOW_MODE"):
         return GmsFailoverActivation()
@@ -1975,10 +1991,7 @@ async def prepare_gms_failover(
     if await _try_acquire_active_lock(lock, engine_name):
         logger.info("[GMS failover] %s active", backend_name)
         try:
-            await run_gms_failover_post_lock_fence(
-                backend_name=backend_name,
-                role="active",
-            )
+            await fence("active")
             if activation_barrier is not None:
                 await activation_barrier()
             await wait_for_armed_standby_before_serving(backend_name, lock_path)
@@ -2021,20 +2034,21 @@ async def prepare_gms_failover(
     # Establish its proof channel before the failure so the 16-rank takeover
     # does not wait for a new GMS handshake. This is only a latency hint:
     # failure to preconnect never substitutes for the post-lock MPS proof.
-    from gpu_memory_service.integrations.common.gpu_quiescence import (
-        preconnect_gpu_quiescence_session,
-    )
+    if preconnect_gpu_proof:
+        from gpu_memory_service.integrations.common.gpu_quiescence import (
+            preconnect_gpu_quiescence_session,
+        )
 
-    try:
-        await asyncio.to_thread(
-            preconnect_gpu_quiescence_session, backend_name=backend_name
-        )
-    except OSError as exc:
-        logger.warning(
-            "[GMS failover] %s shadow proof preconnect unavailable: %s",
-            backend_name,
-            exc,
-        )
+        try:
+            await asyncio.to_thread(
+                preconnect_gpu_quiescence_session, backend_name=backend_name
+            )
+        except OSError as exc:
+            logger.warning(
+                "[GMS failover] %s shadow proof preconnect unavailable: %s",
+                backend_name,
+                exc,
+            )
 
     set_health_status = getattr(runtime, "set_health_status", None)
     keep_shadow_ready = _keep_shadow_ready()
@@ -2067,7 +2081,7 @@ async def prepare_gms_failover(
         # not distinguish a stale primary pin from a newly admitted shadow pin.
         # Classification and GPU-quiescence proof both finish before admission;
         # a failed proof leaves foreign pages quarantined and prevents resume.
-        await run_gms_failover_post_lock_fence(backend_name=backend_name, role=role)
+        await fence(role)
         if activation_barrier is not None:
             await activation_barrier()
 
