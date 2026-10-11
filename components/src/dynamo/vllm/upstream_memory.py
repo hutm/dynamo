@@ -49,6 +49,9 @@ def is_primary_engine() -> bool:
 def configure_kv_restore_role(engine_args: Any) -> str:
     """Attach the primary engine as the KV writer and every other engine
     (the shadow, or a restarted former primary) as a standby."""
+    from dynamo.common.upstream_failover import mark_upstream_memory_active
+
+    mark_upstream_memory_active("vllm")
     extra = _extra_config(engine_args)
     role = WRITER if is_primary_engine() else STANDBY
     extra[KV_RESTORE_ROLE_KEY] = role

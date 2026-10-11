@@ -114,6 +114,17 @@ async def run_dynamo_headless(config: Config) -> None:
 
     # Detect failed secondary ranks before the NCCL collective timeout.
     _maybe_start_vllm_rank_liveness_client(config)
+    from dynamo.common.upstream_failover import (
+        start_child_crash_watch,
+        upstream_memory_active,
+    )
+
+    if upstream_memory_active():
+        # No GMS crash interlock here: report this rank's own worker exit to
+        # the leader at once instead of waiting for heartbeat silence.
+        start_child_crash_watch(
+            "vllm", int(getattr(config.engine_args, "node_rank", 0) or 0)
+        )
 
     # Keep the upstream CLI import local so tests that only exercise
     # build_headless_namespace() do not pull in vLLM's full CLI import graph.
@@ -151,6 +162,12 @@ def _maybe_start_vllm_rank_liveness_client(config: Config) -> None:
             rank,
             reason,
         )
+        from dynamo.common.upstream_failover import fail_stop, upstream_memory_active
+
+        if upstream_memory_active():
+            # The engine's KV restore quarantines this cohort's in-flight
+            # blocks until its processes are gone; no GMS proof to wait for.
+            fail_stop(f"vLLM leader rank {rank} lost ({reason})")
         frozen = frozen_predecessor_enabled("vllm")
         if frozen and not frozen_kill_before_gpu_proof("vllm"):
             # Preserve the live CUDA client for GMS/MPS termination. Failure

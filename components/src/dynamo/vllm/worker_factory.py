@@ -2445,6 +2445,16 @@ class WorkerFactory:
                 rank,
                 reason,
             )
+            from dynamo.common.upstream_failover import (
+                fail_stop,
+                upstream_memory_active,
+            )
+
+            if upstream_memory_active():
+                # The successor's KV restore quarantines this cohort's
+                # in-flight blocks; release the lock by dying now.
+                fail_stop(f"vLLM worker rank {rank} lost ({reason})")
+                return
             if frozen_predecessor_enabled("vllm"):
                 # Unless killing first, give GMS a bounded chance to terminate
                 # the still-live local CUDA worker before the launcher kills
