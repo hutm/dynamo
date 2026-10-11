@@ -91,11 +91,25 @@ def _report_crash(backend_name: str, rank: int, pid: int, source: str) -> None:
         logger.warning("[upstream memory] could not send the crash hint")
 
 
+def _is_engine_worker(proc) -> bool:
+    """Engine workers are multiprocessing-spawned children (vLLM renames them
+    VLLM::...). Short-lived helpers, such as vLLM's model-inspection
+    subprocess, exit normally during startup and must not count as crashes."""
+    try:
+        if proc.name().startswith("VLLM::"):
+            return True
+        cmdline = " ".join(proc.cmdline())
+    except Exception:  # noqa: BLE001 - gone or inaccessible: not watchable
+        return False
+    return "multiprocessing" in cmdline and "resource_tracker" not in cmdline
+
+
 def start_child_crash_watch(
     backend_name: str, rank: int, poll_s: float = 0.02
 ) -> threading.Thread:
-    """Watch the engine processes this process spawns from now on; when one
-    exits, tell the TP leader and fail-stop (the cohort cannot make progress).
+    """Watch the engine worker processes this process spawns from now on; when
+    one exits, tell the TP leader and fail-stop (the cohort cannot make
+    progress).
 
     Children that already exist (e.g. the liveness helper) are not watched.
     """
@@ -108,7 +122,11 @@ def start_child_crash_watch(
         watched: dict[int, psutil.Process] = {}
         while True:
             for child in me.children():
-                if child.pid not in preexisting and child.pid not in watched:
+                if (
+                    child.pid not in preexisting
+                    and child.pid not in watched
+                    and _is_engine_worker(child)
+                ):
                     watched[child.pid] = child
             for pid, child in list(watched.items()):
                 try:
@@ -118,6 +136,7 @@ def start_child_crash_watch(
                 except psutil.NoSuchProcess:
                     dead = True
                 if dead:
+                    del watched[pid]
                     _report_crash(backend_name, rank, pid, "engine-worker-exit")
                     fail_stop(f"engine worker {pid} exited")
             time.sleep(poll_s)

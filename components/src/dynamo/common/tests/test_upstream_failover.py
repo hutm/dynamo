@@ -3,6 +3,7 @@
 
 """Fail-stop and crash hints for failover on engine weight-cache daemons."""
 
+import multiprocessing
 import subprocess
 import sys
 import threading
@@ -26,7 +27,13 @@ def test_mark_sets_mode_and_a_per_boot_crash_hint_cohort(monkeypatch, tmp_path):
     assert upstream_failover.os.environ["GMS_VLLM_WRITER_COHORT_PATH"] == cohort
 
 
-def test_child_exit_reports_and_fail_stops(monkeypatch):
+def _sleep(seconds):
+    import time
+
+    time.sleep(seconds)
+
+
+def _watch(monkeypatch):
     stopped = threading.Event()
     reports = []
     monkeypatch.setattr(
@@ -36,9 +43,23 @@ def test_child_exit_reports_and_fail_stops(monkeypatch):
     )
     monkeypatch.setattr(upstream_failover, "fail_stop", lambda reason: stopped.set())
     upstream_failover.start_child_crash_watch("vllm", 3, poll_s=0.01)
-    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.3)"])
+    return stopped, reports
+
+
+def test_worker_exit_reports_and_fail_stops(monkeypatch):
+    stopped, reports = _watch(monkeypatch)
+    worker = multiprocessing.get_context("spawn").Process(target=_sleep, args=(1.0,))
+    worker.start()
     try:
-        assert stopped.wait(10)
+        assert stopped.wait(20)
     finally:
-        child.wait()
+        worker.join()
     assert reports and reports[0] == ("vllm", 3, "engine-worker-exit")
+
+
+def test_short_lived_helper_subprocess_is_not_a_crash(monkeypatch):
+    # e.g. vLLM's model-inspection subprocess during config resolution
+    stopped, reports = _watch(monkeypatch)
+    subprocess.run([sys.executable, "-c", "import time; time.sleep(0.3)"], check=True)
+    assert not stopped.wait(0.5)
+    assert reports == []
