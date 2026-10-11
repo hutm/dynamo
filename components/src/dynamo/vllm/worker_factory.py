@@ -46,6 +46,7 @@ from dynamo.runtime import DistributedRuntime, Endpoint
 from dynamo.vllm.upstream_memory import is_primary_engine
 from dynamo.vllm.upstream_memory import promote_standby as upstream_promote_standby
 from dynamo.vllm.upstream_memory import upstream_memory_enabled
+from dynamo.vllm.upstream_memory import warm_up_standby as upstream_warm_up_standby
 
 from .args import Config
 from .cache_info import configure_kv_event_block_size
@@ -2853,6 +2854,17 @@ class WorkerFactory:
             claim_discovery_for_active_engine(handler)
             return False
 
+        # Before arming, as GMS mode prewarms its mapped standby: the primary
+        # serves only once a standby is armed, so this costs startup time, not
+        # live-traffic latency, and the promoted engine runs no first-use JIT.
+        started = _time.monotonic()
+        warmed = await upstream_warm_up_standby(handler.engine_client)
+        if warmed:
+            logger.info(
+                "[Shadow] Prewarmed %d batch sizes without KV writes in %.1f s",
+                warmed,
+                _time.monotonic() - started,
+            )
         await handler._pause_controller.pause_generation_only(clear_cache=False)
         if failover_metrics is not None:
             failover_metrics.set_state("standby")

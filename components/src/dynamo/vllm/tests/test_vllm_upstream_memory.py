@@ -63,3 +63,20 @@ async def test_promote_calls_the_engine_core_utility(monkeypatch):
     client = SimpleNamespace(engine_core=SimpleNamespace(call_utility_async=call))
     assert await upstream_memory.promote_standby(client) == 41
     call.assert_awaited_once_with("kv_restore_promote", 12.0, 3.0)
+
+
+@pytest.mark.asyncio
+async def test_standby_warmup_runs_dummy_batches_on_every_worker(monkeypatch):
+    monkeypatch.delenv("DYN_VLLM_UPSTREAM_STANDBY_WARMUP", raising=False)
+    monkeypatch.setenv("DYN_VLLM_GMS_FAILOVER_PROMOTION_WARMUP_TOKEN_COUNTS", "64,1,8,8")
+    rpc = AsyncMock(return_value=[3, 3])
+    assert await upstream_memory.warm_up_standby(SimpleNamespace(collective_rpc=rpc)) == 3
+    rpc.assert_awaited_once_with("kv_restore_warmup", args=([1, 8, 64],))
+
+
+@pytest.mark.asyncio
+async def test_standby_warmup_can_be_turned_off(monkeypatch):
+    monkeypatch.setenv("DYN_VLLM_UPSTREAM_STANDBY_WARMUP", "0")
+    rpc = AsyncMock()
+    assert await upstream_memory.warm_up_standby(SimpleNamespace(collective_rpc=rpc)) == 0
+    rpc.assert_not_awaited()

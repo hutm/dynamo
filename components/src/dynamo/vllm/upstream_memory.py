@@ -79,6 +79,42 @@ def quarantine_grace_s() -> float:
     return _float_env("DYN_GMS_FAILOVER_PROCESS_DEATH_GRACE_SECS", 2.0)
 
 
+_DEFAULT_WARMUP_TOKEN_COUNTS = "1,2,3,5,6,9,10,17,18,65,66,704,705"
+
+
+def standby_warmup_token_counts() -> list[int]:
+    """Batch sizes the standby compiles before it waits for the lock; empty
+    when DYN_VLLM_UPSTREAM_STANDBY_WARMUP is off. Defaults to the GMS
+    promotion warmup's token counts."""
+    if os.environ.get("DYN_VLLM_UPSTREAM_STANDBY_WARMUP", "1").strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        return []
+    raw = os.environ.get(
+        "DYN_VLLM_GMS_FAILOVER_PROMOTION_WARMUP_TOKEN_COUNTS",
+        _DEFAULT_WARMUP_TOKEN_COUNTS,
+    )
+    try:
+        return sorted({int(x) for x in raw.split(",") if x.strip()})
+    except ValueError:
+        logger.warning("Ignoring invalid warmup token counts %r", raw)
+        return sorted({int(x) for x in _DEFAULT_WARMUP_TOKEN_COUNTS.split(",")})
+
+
+async def warm_up_standby(engine_client: Any) -> int:
+    """Compile the standby's forward path on every rank with dummy batches,
+    which never write KV, so the writer's pool stays untouched while the
+    standby gets warm. Returns the number of batch sizes run."""
+    counts = standby_warmup_token_counts()
+    if not counts:
+        return 0
+    results = await engine_client.collective_rpc("kv_restore_warmup", args=(counts,))
+    return max((int(r or 0) for r in results or []), default=0)
+
+
 async def promote_standby(engine_client: Any) -> int:
     """Promote this engine's KV sessions on every rank; returns the number of
     adopted prefix-cache blocks."""
