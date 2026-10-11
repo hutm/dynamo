@@ -63,3 +63,29 @@ def test_short_lived_helper_subprocess_is_not_a_crash(monkeypatch):
     subprocess.run([sys.executable, "-c", "import time; time.sleep(0.3)"], check=True)
     assert not stopped.wait(0.5)
     assert reports == []
+
+
+def test_crash_hint_is_flushed_before_report_returns(monkeypatch, tmp_path):
+    # The caller SIGKILLs itself right after _report_crash, so the hint must
+    # already be on the wire when it returns.
+    zmq = pytest.importorskip("zmq")
+    ctx = zmq.Context()
+    router = ctx.socket(zmq.ROUTER)
+    port = router.bind_to_random_port("tcp://127.0.0.1")
+    monkeypatch.setenv("DYN_GMS_RANK_LIVENESS_CONNECT_ADDR", f"tcp://127.0.0.1:{port}")
+    cohort = str(tmp_path / "cohort")
+    monkeypatch.setenv("GMS_VLLM_WRITER_COHORT_PATH", cohort)
+    try:
+        upstream_failover._report_crash("vllm", 5, 4242, "engine-worker-exit")
+        assert router.poll(2000)
+        frames = router.recv_multipart()
+        assert frames[1:] == [
+            b"gpu-failed-v1",
+            cohort.encode(),
+            b"5",
+            b"4242",
+            b"engine-worker-exit",
+        ]
+    finally:
+        router.close(0)
+        ctx.term()

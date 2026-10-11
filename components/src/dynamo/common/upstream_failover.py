@@ -74,8 +74,13 @@ def _report_crash(backend_name: str, rank: int, pid: int, source: str) -> None:
     try:
         import zmq
 
-        sock = zmq.Context.instance().socket(zmq.DEALER)
-        sock.setsockopt(zmq.LINGER, 200)
+        # A private context: close() only hands the message to ZMQ's I/O
+        # thread, and the caller SIGKILLs this process right after. term()
+        # blocks until the hint is flushed (a fresh TCP connect to the leader
+        # in another pod) or LINGER expires.
+        ctx = zmq.Context()
+        sock = ctx.socket(zmq.DEALER)
+        sock.setsockopt(zmq.LINGER, 500)
         sock.connect(address)
         sock.send_multipart(
             [
@@ -86,7 +91,8 @@ def _report_crash(backend_name: str, rank: int, pid: int, source: str) -> None:
                 source.encode(),
             ]
         )
-        sock.close()  # LINGER flushes the hint before the fail-stop.
+        sock.close()
+        ctx.term()
     except Exception:  # noqa: BLE001 - best effort latency hint
         logger.warning("[upstream memory] could not send the crash hint")
 
