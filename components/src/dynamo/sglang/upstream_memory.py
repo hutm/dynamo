@@ -23,6 +23,10 @@ logger = logging.getLogger(__name__)
 ROLE_ENV = "SGLANG_WEIGHT_CACHE_KV_RESTORE_ROLE"
 WRITER = "writer"
 STANDBY = "standby"
+# CUDA module loading mode for standby engines (default EAGER); "off" leaves
+# CUDA's own default in place, any other value (e.g. LAZY) is used as given.
+STANDBY_CUDA_MODULE_LOADING_ENV = "DYN_SGLANG_STANDBY_CUDA_MODULE_LOADING"
+_DEFAULT_STANDBY_CUDA_MODULE_LOADING = "EAGER"
 
 
 def _truthy(value: Optional[str]) -> bool:
@@ -51,12 +55,38 @@ def configure_kv_restore_role() -> str:
     role = WRITER if is_primary_engine() else STANDBY
     os.environ[ROLE_ENV] = role
     os.environ["DYN_SGLANG_GMS_LOCK_BEFORE_INIT"] = "1" if role == WRITER else "0"
+    if role == STANDBY:
+        configure_standby_cuda_module_loading()
     logger.info(
         "[upstream memory] engine %s attaches to the weight-cache daemon as %s",
         os.environ.get("ENGINE_ID", "0"),
         role,
     )
     return role
+
+
+def configure_standby_cuda_module_loading() -> Optional[str]:
+    """Load every CUDA kernel at standby startup instead of on first use.
+
+    With CUDA's lazy loading, the first forward after promotion pays for
+    loading the kernels it touches (seconds), right on the failover path.
+    EAGER moves that to standby startup (~20 s and ~1.7 GiB per process).
+    Must run before the engine spawns its scheduler processes, which inherit
+    the environment and read it at CUDA initialization. A user-set
+    CUDA_MODULE_LOADING always wins. Returns the mode set, if any.
+    """
+    if os.environ.get("CUDA_MODULE_LOADING"):
+        return None
+    mode = os.environ.get(
+        STANDBY_CUDA_MODULE_LOADING_ENV, _DEFAULT_STANDBY_CUDA_MODULE_LOADING
+    ).strip()
+    if mode.lower() in {"", "0", "off", "false", "no", "none", "default"}:
+        return None
+    os.environ["CUDA_MODULE_LOADING"] = mode.upper()
+    logger.info(
+        "[upstream memory] standby engine uses CUDA_MODULE_LOADING=%s", mode.upper()
+    )
+    return mode.upper()
 
 
 def _float_env(name: str, default: float) -> float:

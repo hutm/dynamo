@@ -41,7 +41,7 @@ def test_role_and_mapped_standby(monkeypatch, engine_id, role):
     # the keys so monkeypatch restores them and later GMS-mode tests stay GMS.
     for key in ("DYN_FAILOVER_UPSTREAM_MEMORY", "GMS_VLLM_WRITER_COHORT_PATH",
                 "GMS_SGLANG_WRITER_COHORT_PATH", "SGLANG_WEIGHT_CACHE_KV_RESTORE_ROLE",
-                "DYN_SGLANG_GMS_LOCK_BEFORE_INIT",
+                "DYN_SGLANG_GMS_LOCK_BEFORE_INIT", "CUDA_MODULE_LOADING",
                 "DYN_FAILOVER_UPSTREAM_BOOT_COHORT"):
         # setenv first: delenv records nothing for an absent key.
         monkeypatch.setenv(key, "")
@@ -160,7 +160,37 @@ _ROLE_KEYS = (
     "GMS_SGLANG_WRITER_COHORT_PATH",
     "SGLANG_WEIGHT_CACHE_KV_RESTORE_ROLE",
     "DYN_SGLANG_GMS_LOCK_BEFORE_INIT",
+    "CUDA_MODULE_LOADING",
+    upstream_memory.STANDBY_CUDA_MODULE_LOADING_ENV,
 )
+
+
+@pytest.mark.parametrize(
+    "engine_id,preset,override,expected",
+    [
+        ("1", None, None, "EAGER"),  # standby: eager by default
+        ("2", None, None, "EAGER"),  # restarted former primary is a standby too
+        ("0", None, None, None),  # the writer keeps CUDA's default
+        ("1", "LAZY", None, "LAZY"),  # a user-set value always wins
+        ("1", None, "off", None),  # opt out
+        ("1", None, "lazy", "LAZY"),  # or choose another mode
+    ],
+)
+def test_standby_cuda_module_loading(
+    monkeypatch, tmp_path, engine_id, preset, override, expected
+):
+    _clear(monkeypatch, *_ROLE_KEYS)
+    monkeypatch.setenv("FAILOVER_LOCK_PATH", str(tmp_path / "failover.lock"))
+    monkeypatch.setenv("ENGINE_ID", engine_id)
+    monkeypatch.delenv("DYN_GMS_FAILOVER_PRIMARY_ENGINE_ID", raising=False)
+    if preset is not None:
+        monkeypatch.setenv("CUDA_MODULE_LOADING", preset)
+    if override is not None:
+        monkeypatch.setenv(upstream_memory.STANDBY_CUDA_MODULE_LOADING_ENV, override)
+    upstream_memory.configure_kv_restore_role()
+    import os
+
+    assert os.environ.get("CUDA_MODULE_LOADING") == expected
 
 
 @pytest.mark.asyncio
