@@ -1411,6 +1411,86 @@ mod tests {
         shadow_cancel.cancel();
     }
 
+    /// A predecessor that shuts down gracefully after its successor claimed the
+    /// identical cohort records must not delete them: the bytes are the same,
+    /// but the records are the successor's now.
+    #[tokio::test]
+    async fn graceful_predecessor_keeps_identical_records_claimed_by_successor() {
+        let root = tempfile::tempdir().unwrap();
+        let primary_cancel = CancellationToken::new();
+        let shadow_cancel = CancellationToken::new();
+        let member = |cancel: &CancellationToken| {
+            KVStoreDiscovery::new(
+                kv::Manager::file(cancel.clone(), root.path()),
+                cancel.clone(),
+            )
+            .with_logical_instance_id(Some(0x2b))
+        };
+        let (primary, shadow) = (member(&primary_cancel), member(&shadow_cancel));
+        let endpoint = EndpointId {
+            namespace: "ns".to_string(),
+            component: "backend".to_string(),
+            name: "generate".to_string(),
+        };
+        let specs = || {
+            vec![
+                DiscoverySpec::Endpoint {
+                    namespace: "ns".to_string(),
+                    component: "backend".to_string(),
+                    endpoint: "generate".to_string(),
+                    device_type: None,
+                    request_plane_codec: None,
+                    transport: TransportType::Nats("same".to_string()),
+                },
+                DiscoverySpec::EventChannel {
+                    scope: EventScope::Endpoint {
+                        endpoint: endpoint.clone(),
+                    },
+                    topic: "kv/events".to_string(),
+                    publisher_id: 0x2b,
+                    transport: EventTransport::zmq("tcp://127.0.0.1:5043".to_string()),
+                },
+            ]
+        };
+        let mut predecessor_instances = Vec::new();
+        for spec in specs() {
+            predecessor_instances.push(primary.register(spec).await.unwrap());
+        }
+        for spec in specs() {
+            shadow.register(spec).await.unwrap();
+        }
+        let records = || {
+            let mut files = Vec::new();
+            let mut dirs = vec![root.path().to_path_buf()];
+            while let Some(dir) = dirs.pop() {
+                for entry in std::fs::read_dir(dir).unwrap() {
+                    let entry = entry.unwrap();
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if entry.file_type().unwrap().is_dir() {
+                        dirs.push(entry.path());
+                    } else if !name.starts_with('.') {
+                        files.push((entry.path(), std::fs::read(entry.path()).unwrap()));
+                    }
+                }
+            }
+            files.sort();
+            files
+        };
+        let published = records();
+        assert_eq!(published.len(), 2, "{published:?}");
+
+        // Graceful predecessor shutdown: unregister everything, then the
+        // store's shutdown cleanup of the files it wrote.
+        for instance in predecessor_instances {
+            primary.unregister(instance).await.unwrap();
+        }
+        primary.shutdown();
+        primary_cancel.cancel();
+
+        assert_eq!(records(), published);
+        shadow_cancel.cancel();
+    }
+
     #[tokio::test]
     async fn test_kv_store_discovery_list() {
         let store = kv::Manager::memory();
