@@ -216,6 +216,21 @@ fn is_failover_unavailable(err: &(dyn StdError + 'static), failover_wait: Durati
     !failover_wait.is_zero() && error::match_error_chain(err, &[ErrorType::Unavailable], &[])
 }
 
+/// Whether a failure is the signature of a worker that is gone or failing, as opposed
+/// to a slow, overloaded, or semantically rejected one.
+///
+/// This covers both "no routable instance" (`Unavailable`) and worker-scoped faults
+/// whose canonical class is `Unavailable` (cannot connect, disconnected, engine
+/// shutdown, stream incomplete, worker unavailable). During a warm-standby failover the
+/// broken instance stays listed until its successor takes over the discovery record,
+/// so these fail fast and repeatedly; they must not drain the retry budget.
+fn is_failover_failure(err: &(dyn StdError + 'static), failover_wait: Duration) -> bool {
+    is_failover_unavailable(err, failover_wait)
+        || (!failover_wait.is_zero()
+            && migratable_error_in_chain(err)
+                .is_some_and(|error| error.class() == ErrorType::Unavailable))
+}
+
 fn request_allows_migration(request: &PreprocessedRequest) -> bool {
     let allows_phase = |phase| match explicit_target(request, phase) {
         Ok(None) => true,
@@ -432,6 +447,11 @@ where
     /// Failure that caused the next physical dispatch to be a migration retry.
     pending_migration: Option<MigrationCause>,
     failover_wait: Duration,
+    /// Request-scoped bound on failover holds. Armed by the first failover-class
+    /// failure and cleared once a replacement stream delivers tokens, so a run of
+    /// fast failures against a still-listed broken instance waits at most
+    /// `failover_wait` for its successor instead of spending the retry budget.
+    failover_deadline: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -517,6 +537,7 @@ where
             completed_tokens: 0,
             pending_migration: None,
             failover_wait: migration_failover_wait(),
+            failover_deadline: None,
         };
         slf.new_stream(None).await?;
         slf.exceed_max_seq_len(0); // disable migration if prompt len > max_seq_len
@@ -543,6 +564,19 @@ where
                             tracing::warn!(error = %err, "Migration eligibility had no semantic error");
                             continue;
                         };
+                        // A zero budget here means migration is exhausted or disabled
+                        // (guided decoding, n>1, max_seq_len); never re-enable it.
+                        let failover_pause = if self.retries_left > 0 {
+                            self.failover_hold(err)
+                        } else {
+                            None
+                        };
+                        if failover_pause.is_some() {
+                            // `new_stream` charges the replacement dispatch; refund it so
+                            // a fast-failing instance awaiting its successor does not
+                            // exhaust the budget.
+                            self.retries_left += 1;
+                        }
                         if self.retries_left == 0 {
                             let route_trace = self.active_route_trace.clone();
                             self.record_migration_exhausted(MigrationCause {
@@ -572,6 +606,18 @@ where
                         // Release it before dispatching the replacement, or the retry
                         // can wait indefinitely for its own predecessor.
                         self.next_stream.take();
+                        if let Some(delay) = failover_pause
+                            && let Err(err) = wait_for_failover_poll(&self.context, delay).await
+                        {
+                            self.record_migration_outcome(
+                                Some(&migration_event),
+                                frontend_service::migration_outcome::CANCELLED,
+                            );
+                            self.abort_request_lifecycle(err.as_ref());
+                            self.terminal_after_error = true;
+                            self.track_response(&response);
+                            return Some(response);
+                        }
                         // NOTE: Delegate exhaustion to new_stream so retry accounting has one owner.
                         // When no replacement is established, preserve the triggering stream error.
                         if let Err(err) = self.new_stream(Some(migration_event)).await {
@@ -617,9 +663,6 @@ where
             self.abort_request_lifecycle(error.as_ref());
             return Err(error);
         }
-        let mut failover_deadline = migration_event
-            .as_ref()
-            .map(|_| Instant::now() + self.failover_wait);
         while self.retries_left > 0 {
             self.retries_left -= 1;
             // Once any chunks have arrived from a previous attempt, stamp
@@ -761,30 +804,19 @@ where
                         migration_event = Some(MigrationEvent::new(
                             frontend_service::migration_type::NEW_REQUEST,
                         ));
-                        failover_deadline = Some(Instant::now() + self.failover_wait);
                     }
-                    if matches!(reason, ErrorType::Unavailable)
-                        && failover_deadline.is_some_and(|deadline| Instant::now() < deadline)
-                    {
+                    if let Some(delay) = self.failover_hold(err.as_ref()) {
                         // A warm replacement can register shortly after the old
-                        // endpoint disappears. Waiting here preserves the
-                        // migration budget and avoids exposing that control-plane
-                        // interval to an already-streaming client.
+                        // endpoint disappears or while the failed one is still
+                        // listed. Waiting here preserves the migration budget and
+                        // avoids exposing that control-plane interval to the client.
                         self.retries_left += 1;
                         self.pending_migration = Some(MigrationCause {
                             reason,
                             from_worker_id: route_trace.selected_worker_id(),
                             attempt: route_trace.attempt(),
                         });
-                        let remaining = failover_deadline
-                            .expect("checked above")
-                            .saturating_duration_since(Instant::now());
-                        if let Err(err) = wait_for_failover_poll(
-                            &self.context,
-                            std::cmp::min(migration_failover_poll(), remaining),
-                        )
-                        .await
-                        {
+                        if let Err(err) = wait_for_failover_poll(&self.context, delay).await {
                             self.record_migration_outcome(
                                 migration_event.as_ref(),
                                 frontend_service::migration_outcome::CANCELLED,
@@ -832,6 +864,21 @@ where
         let error = Error::msg("Migration limit exhausted");
         self.abort_request_lifecycle(error.as_ref());
         Err(error)
+    }
+
+    /// If `err` is a failover-class failure and the request's failover window is still
+    /// open, return how long to pause before redispatching. Arms the window on the
+    /// first such failure; the window is bounded by `failover_wait`.
+    fn failover_hold(&mut self, err: &(dyn StdError + 'static)) -> Option<Duration> {
+        if !is_failover_failure(err, self.failover_wait) {
+            return None;
+        }
+        let now = Instant::now();
+        let deadline = *self
+            .failover_deadline
+            .get_or_insert_with(|| now + self.failover_wait);
+        let remaining = deadline.saturating_duration_since(now);
+        (!remaining.is_zero()).then(|| std::cmp::min(migration_failover_poll(), remaining))
     }
 
     /// The attempt a failure belongs to. Prefers the attempt's own trace
@@ -896,6 +943,10 @@ where
             None => return,
         };
         let token_ids = llm_engine_output.token_ids();
+        if !token_ids.is_empty() {
+            // A stream is making progress again; a later failure is a new failover.
+            self.failover_deadline = None;
+        }
         // Pure telemetry for the migration lifecycle events, so it has to count
         // the final allowed attempt as well. `new_stream` decrements
         // `retries_left` *before* dispatching, so that attempt runs with the
@@ -1207,7 +1258,9 @@ mod tests {
 
         let engine = Arc::new(DiscoveryGapEngine {
             calls: AtomicU32::new(0),
-            ready_at: Instant::now() + Duration::from_millis(20),
+            // Longer than one failover poll, so the replacement is only found
+            // after several `Unavailable` discovery polls.
+            ready_at: Instant::now() + Duration::from_millis(120),
         });
         let next_generate: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> =
             engine.clone();
@@ -1231,7 +1284,8 @@ mod tests {
             next_attempt: 0,
             completed_tokens: 0,
             pending_migration: None,
-            failover_wait: Duration::from_millis(200),
+            failover_wait: Duration::from_secs(2),
+            failover_deadline: None,
         };
 
         manager
@@ -1249,6 +1303,144 @@ mod tests {
             ),
             1
         );
+    }
+
+    /// Engine double for a warm-standby failover: a still-listed instance whose
+    /// engine fails every request fast, then refuses connections after it is
+    /// killed, until a successor takes over its discovery record.
+    struct FastFailoverEngine {
+        calls: AtomicU32,
+        started: Instant,
+        /// Until here, dispatch succeeds but the stream fails at once (broken TP).
+        engine_broken_until: Duration,
+        /// Until here, dispatch is refused (killed, record not yet taken over).
+        successor_at: Option<Duration>,
+    }
+
+    #[async_trait]
+    impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, Error>
+        for FastFailoverEngine
+    {
+        async fn generate(
+            &self,
+            request: SingleIn<PreprocessedRequest>,
+        ) -> Result<ManyOut<Annotated<BackendOutput>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let elapsed = self.started.elapsed();
+            if elapsed < self.engine_broken_until {
+                // ~25 ms request round trip against the broken leader.
+                sleep(Duration::from_millis(22)).await;
+                let responses: dynamo_runtime::engine::DataStream<Annotated<BackendOutput>> =
+                    Box::pin(stream::once(async {
+                        Annotated::from_err(migratable_error(ErrorType::Backend(
+                            BackendError::StreamIncomplete,
+                        )))
+                    }));
+                return Ok(ResponseStream::new(responses, request.context()));
+            }
+            if self.successor_at.is_none_or(|at| elapsed < at) {
+                return Err(migratable_error(ErrorType::CannotConnect).into());
+            }
+            let responses: dynamo_runtime::engine::DataStream<Annotated<BackendOutput>> =
+                Box::pin(stream::iter([create_mock_output(7), create_mock_output(8)]));
+            Ok(ResponseStream::new(responses, request.context()))
+        }
+    }
+
+    /// Reproduces the warm-standby 503: the active instance fails every request
+    /// within ~25 ms while it stays registered, is killed at ~0.73 s, and its
+    /// successor registers at ~0.93 s. Fast failures must wait for the successor
+    /// (bounded by the failover wait) instead of exhausting the retry budget.
+    #[tokio::test]
+    async fn fast_failures_on_listed_instance_wait_for_successor() {
+        let engine = Arc::new(FastFailoverEngine {
+            calls: AtomicU32::new(0),
+            started: Instant::now(),
+            engine_broken_until: Duration::from_millis(730),
+            successor_at: Some(Duration::from_millis(930)),
+        });
+        // A deliberately small budget: the run makes far more failed attempts
+        // than this, which only succeeds if failover-class failures are refunded.
+        let migration_limit = 3;
+        let mut manager = RetryManager::build(
+            Arc::new(Controller::new(uuid::Uuid::new_v4().to_string())),
+            BTreeMap::new(),
+            create_mock_request(2),
+            engine.clone(),
+            migration_limit,
+            None,
+            Arc::new(TEST_MODEL.to_string()),
+            Arc::new(Metrics::new()),
+            None,
+        )
+        .await
+        .expect("initial dispatch reaches the broken instance");
+        manager.failover_wait = Duration::from_secs(15);
+
+        let mut tokens = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(response) = manager.next().await {
+                assert!(
+                    response.err().is_none(),
+                    "request failed before the successor registered: {:?}",
+                    response.err()
+                );
+                if let Some(data) = response.data {
+                    tokens.extend(data.token_ids);
+                }
+            }
+        })
+        .await
+        .expect("request must complete once the successor registers");
+
+        assert_eq!(tokens, vec![7, 8]);
+        let calls = engine.calls.load(Ordering::SeqCst);
+        assert!(
+            calls > migration_limit + 1,
+            "expected more failed attempts ({calls}) than the retry budget"
+        );
+        assert!(engine.started.elapsed() >= Duration::from_millis(930));
+    }
+
+    /// A model whose only instance keeps failing never gets a successor: the
+    /// failover hold is bounded, after which the normal budget applies.
+    #[tokio::test]
+    async fn fast_failures_without_successor_fail_after_failover_wait() {
+        let engine = Arc::new(FastFailoverEngine {
+            calls: AtomicU32::new(0),
+            started: Instant::now(),
+            engine_broken_until: Duration::from_millis(100),
+            successor_at: None,
+        });
+        let mut manager = RetryManager::build(
+            Arc::new(Controller::new(uuid::Uuid::new_v4().to_string())),
+            BTreeMap::new(),
+            create_mock_request(2),
+            engine.clone(),
+            64,
+            None,
+            Arc::new(TEST_MODEL.to_string()),
+            Arc::new(Metrics::new()),
+            None,
+        )
+        .await
+        .unwrap();
+        let failover_wait = Duration::from_millis(300);
+        manager.failover_wait = failover_wait;
+
+        let mut last_error = None;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(response) = manager.next().await {
+                if response.err().is_some() {
+                    last_error = response.err();
+                }
+            }
+        })
+        .await
+        .expect("a dead model must not hold the request indefinitely");
+
+        assert!(last_error.is_some(), "dead model must surface an error");
+        assert!(engine.started.elapsed() >= failover_wait);
     }
 
     #[test]
