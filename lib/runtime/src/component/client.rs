@@ -812,6 +812,31 @@ impl Client {
         tracing::debug!("inhibiting instance {instance_id}");
     }
 
+    /// Mark an instance down for a failure observed at `transport`.
+    ///
+    /// A failover successor can take over an instance id (a shared logical
+    /// instance) at a new address while requests to its predecessor are still
+    /// in flight. Their failures describe the predecessor's address; when
+    /// discovery already points the id elsewhere they must not quarantine the
+    /// successor. A takeover that arrives after this check reconciles the
+    /// routable set anyway.
+    pub fn report_instance_down_at(
+        &self,
+        instance_id: u64,
+        transport: &crate::component::TransportType,
+    ) {
+        if let Some(current) = self.instance_by_id(instance_id)
+            && current.transport != *transport
+        {
+            tracing::debug!(
+                instance_id,
+                "ignoring a failure at a superseded address; the instance has moved"
+            );
+            return;
+        }
+        self.report_instance_down(instance_id);
+    }
+
     /// Replace the set of overloaded instances reported by the worker monitor.
     /// Returns true when this changes the effective overloaded set.
     pub fn set_overloaded_instances(&self, overloaded_instance_ids: &[u64]) -> bool {
@@ -1347,6 +1372,139 @@ mod tests {
             .await
             .expect("the backend watch outlives the source that established it")
             .unwrap();
+    }
+
+    /// A client over a hand-fed discovery source whose periodic reconciliation
+    /// never fires within a test, so only discovery changes can clear a down-mark.
+    async fn fed_client(
+        endpoint: &Endpoint,
+    ) -> (
+        Client,
+        tokio::sync::mpsc::UnboundedSender<Result<DiscoveryEvent>>,
+        ParkedProducerDiscovery,
+    ) {
+        let discovery = ParkedProducerDiscovery {
+            inner: MockDiscovery::new(Some(1), SharedMockRegistry::new()),
+            producers: StdMutex::default(),
+            feeds: StdMutex::default(),
+        };
+        let token = endpoint.drt().primary_token().child_token();
+        let source = Client::spawn_dynamic_discovery_source(endpoint, &discovery, token.clone())
+            .await
+            .unwrap();
+        let feed = discovery.feeds.lock().unwrap().pop().unwrap();
+        let instance_source = Arc::new(source.instance_receiver());
+        let (routing_instances, instance_avail_owner) = RoutingInstancesState::new(Vec::new());
+        let client = Client {
+            endpoint: endpoint.clone(),
+            endpoint_discovery_source: source,
+            instance_source,
+            routing_instances: Arc::new(routing_instances),
+            instance_avail_owner: Arc::new(instance_avail_owner),
+            reconcile_interval: Duration::from_secs(3600),
+        };
+        client.monitor_instance_source_with_cancellation(token, true);
+        (client, feed, discovery)
+    }
+
+    fn moved(instance: &Instance, port: u16) -> Instance {
+        Instance {
+            transport: TransportType::Tcp(format!("127.0.0.2:{port}")),
+            ..instance.clone()
+        }
+    }
+
+    /// A failover successor takes over a down-marked instance id at a new address:
+    /// the id must become routable at once, at the new address.
+    #[tokio::test]
+    async fn same_id_takeover_clears_down_mark_and_moves_address() {
+        let rt = Runtime::from_current().unwrap();
+        let drt = DistributedRuntime::new(rt.clone(), DistributedConfig::process_local())
+            .await
+            .unwrap();
+        let endpoint = drt
+            .namespace("test_same_id_takeover".to_string())
+            .unwrap()
+            .component("test_component".to_string())
+            .unwrap()
+            .endpoint("generate".to_string());
+        let (base, feed, _discovery) = fed_client(&endpoint).await;
+        let (_admission_tx, admission_rx) = tokio::sync::watch::channel(vec![7]);
+        let client = base.with_admitted_instances(admission_rx);
+        let mut avail = client.instance_avail_watcher();
+
+        let predecessor = endpoint_instance(&endpoint, 7);
+        feed.send(Ok(DiscoveryEvent::Added(DiscoveryInstance::Endpoint(
+            predecessor.clone(),
+        ))))
+        .unwrap();
+        wait_for_watch_state(&mut avail, |ids| ids == [7]).await;
+
+        // The predecessor fails; the router quarantines its id.
+        client.report_instance_down(7);
+        wait_for_watch_state(&mut avail, |ids| ids.is_empty()).await;
+
+        // The successor takes over the same id at a new address.
+        let successor = moved(&predecessor, 9007);
+        feed.send(Ok(DiscoveryEvent::Added(DiscoveryInstance::Endpoint(
+            successor.clone(),
+        ))))
+        .unwrap();
+        wait_for_watch_state(&mut avail, |ids| ids == [7]).await;
+        assert_eq!(client.instance_by_id(7), Some(successor));
+
+        rt.shutdown();
+    }
+
+    /// A request that was dispatched to the predecessor can fail after its
+    /// successor has already taken over the id. That late failure belongs to
+    /// the old address and must not quarantine the successor.
+    #[tokio::test]
+    async fn late_failure_of_predecessor_does_not_quarantine_successor() {
+        let rt = Runtime::from_current().unwrap();
+        let drt = DistributedRuntime::new(rt.clone(), DistributedConfig::process_local())
+            .await
+            .unwrap();
+        let endpoint = drt
+            .namespace("test_late_predecessor_failure".to_string())
+            .unwrap()
+            .component("test_component".to_string())
+            .unwrap()
+            .endpoint("generate".to_string());
+        let (base, feed, _discovery) = fed_client(&endpoint).await;
+        let (_admission_tx, admission_rx) = tokio::sync::watch::channel(vec![7]);
+        let client = base.with_admitted_instances(admission_rx);
+        let mut avail = client.instance_avail_watcher();
+
+        let predecessor = endpoint_instance(&endpoint, 7);
+        feed.send(Ok(DiscoveryEvent::Added(DiscoveryInstance::Endpoint(
+            predecessor.clone(),
+        ))))
+        .unwrap();
+        wait_for_watch_state(&mut avail, |ids| ids == [7]).await;
+
+        let successor = moved(&predecessor, 9007);
+        feed.send(Ok(DiscoveryEvent::Added(DiscoveryInstance::Endpoint(
+            successor.clone(),
+        ))))
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while client.instance_by_id(7).as_ref() != Some(&successor) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        // The in-flight request to the predecessor's address fails now.
+        client.report_instance_down_at(7, &predecessor.transport);
+        assert_eq!(client.instance_ids_avail(), vec![7]);
+
+        // A failure at the successor's own address still quarantines it.
+        client.report_instance_down_at(7, &successor.transport);
+        assert!(client.instance_ids_avail().is_empty());
+
+        rt.shutdown();
     }
 
     fn endpoint_instance(endpoint: &Endpoint, instance_id: u64) -> Instance {
