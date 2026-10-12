@@ -25,10 +25,13 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 UPSTREAM_MEMORY_ENV = "DYN_FAILOVER_UPSTREAM_MEMORY"
-# The crash-hint cohort path this process generated for its own boot. Only a
-# path generated here is known to be unique to this engine boot, which is
-# what makes a takeover hint safe to send (see advertise_crash_hint_target).
-_BOOT_COHORT_ENV = "DYN_FAILOVER_UPSTREAM_BOOT_COHORT"
+# A cohort path configured for this process from outside (present before it
+# marked upstream mode). Unlike the per-boot paths generated here or by the GMS
+# writer lifecycle (prepare_writer_cohort, which SGLang's guarded engine runs
+# after this marks), a configured path may be reused by a later boot, so it is
+# never advertised as a takeover-hint target (see advertise_crash_hint_target).
+_CONFIGURED_COHORT_ENV = "DYN_FAILOVER_UPSTREAM_CONFIGURED_COHORT"
+_marked_pid: int | None = None
 CRASH_HINT_TARGET_SUFFIX = ".crash-hint-target"
 TAKEOVER_SOURCE = "failover-lock-takeover"
 _COHORT_ENVS = {
@@ -44,15 +47,21 @@ def mark_upstream_memory_active(backend_name: str) -> None:
     marker path a rank advertises in its heartbeats; without GMS writer
     cohorts there is none, so use a unique per-boot path for that purpose.
     """
+    global _marked_pid
     os.environ[UPSTREAM_MEMORY_ENV] = "1"
     env = _COHORT_ENVS[backend_name]
+    first_mark = _marked_pid != os.getpid()
+    _marked_pid = os.getpid()
     if os.environ.get(env):
+        if first_mark:
+            os.environ[_CONFIGURED_COHORT_ENV] = os.environ[env]
         return
+    if first_mark:
+        os.environ.pop(_CONFIGURED_COHORT_ENV, None)
     lock_path = os.environ.get("FAILOVER_LOCK_PATH", "/tmp/dynamo-failover.lock")
     directory = Path(lock_path).resolve().parent / ".upstream-crash-hints"
     directory.mkdir(parents=True, exist_ok=True)
     os.environ[env] = str(directory / uuid.uuid4().hex)
-    os.environ[_BOOT_COHORT_ENV] = os.environ[env]
 
 
 def upstream_memory_active() -> bool:
@@ -227,16 +236,36 @@ def advertise_crash_hint_target(
 ) -> bool:
     """Record this rank's crash-hint identity next to its failover lock.
 
-    Call only while holding the rank's failover lock, after the liveness
-    client (which advertises the same cohort path in its heartbeats) is
-    configured for ``address``. Returns whether a record was written.
+    Call only while holding the rank's failover lock, right after starting
+    the liveness client for ``address``: the client advertises the same
+    cohort (read from this process's environment at the same moment) in its
+    heartbeats. Returns whether a record was written.
     """
-    if not upstream_memory_active() or rank < 1 or not address:
+    if not upstream_memory_active():
+        logger.debug("[upstream memory] crash-hint target: not in upstream mode")
+        return False
+    if rank < 1 or not address:
+        logger.info(
+            "[upstream memory] no crash-hint target for rank %d (leader %r)",
+            rank,
+            address,
+        )
         return False
     cohort = os.environ.get(_COHORT_ENVS[backend_name])
-    if not cohort or cohort != os.environ.get(_BOOT_COHORT_ENV):
+    if not cohort:
+        logger.info(
+            "[upstream memory] no crash-hint target for rank %d: no cohort path", rank
+        )
+        return False
+    if cohort == os.environ.get(_CONFIGURED_COHORT_ENV):
         # A configured (not per-boot) cohort path could be shared by a later
         # boot; a hint naming it might match a healthy cohort.
+        logger.info(
+            "[upstream memory] no crash-hint target for rank %d: cohort %s is "
+            "configured, not unique to this boot",
+            rank,
+            cohort,
+        )
         return False
     target = crash_hint_target_path(lock_path)
     record = {
@@ -275,7 +304,15 @@ def take_crash_hint_target(
     target = crash_hint_target_path(lock_path)
     try:
         raw = target.read_text()
+    except FileNotFoundError:
+        logger.info("[upstream memory] no crash-hint target at %s", target)
+        return None
     except OSError:
+        logger.warning(
+            "[upstream memory] could not read the crash-hint target at %s",
+            target,
+            exc_info=True,
+        )
         return None
     try:
         target.unlink()
@@ -310,12 +347,14 @@ def hint_predecessor_lost(
     delay this engine's own takeover.
     """
     if not upstream_memory_active():
+        logger.debug("[upstream memory] takeover hint: not in upstream mode")
         return None
     record = take_crash_hint_target(backend_name, lock_path)
     if record is None:
         return None
     if record["cohort"] == os.environ.get(_COHORT_ENVS[backend_name]):
-        return None  # our own record: nothing to report
+        logger.info("[upstream memory] crash-hint target is our own; not reporting")
+        return None
     rank, pid = int(record["rank"]), int(record["pid"])
     logger.warning(
         "[upstream memory] took over rank %d from engine pid %d; sending its "

@@ -18,6 +18,14 @@ pytestmark = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def _fresh_process(monkeypatch):
+    # Each test models a fresh engine process for mark_upstream_memory_active.
+    from dynamo.common import upstream_failover
+
+    monkeypatch.setattr(upstream_failover, "_marked_pid", None)
+
+
 def test_enabled_only_for_client_mode_with_kv_restore(monkeypatch):
     monkeypatch.setenv("SGLANG_WEIGHT_CACHE_KV_RESTORE", "1")
     assert upstream_memory.upstream_memory_enabled(
@@ -42,7 +50,7 @@ def test_role_and_mapped_standby(monkeypatch, engine_id, role):
     for key in ("DYN_FAILOVER_UPSTREAM_MEMORY", "GMS_VLLM_WRITER_COHORT_PATH",
                 "GMS_SGLANG_WRITER_COHORT_PATH", "SGLANG_WEIGHT_CACHE_KV_RESTORE_ROLE",
                 "DYN_SGLANG_GMS_LOCK_BEFORE_INIT", "CUDA_MODULE_LOADING",
-                "DYN_FAILOVER_UPSTREAM_BOOT_COHORT"):
+                "DYN_FAILOVER_UPSTREAM_CONFIGURED_COHORT"):
         # setenv first: delenv records nothing for an absent key.
         monkeypatch.setenv(key, "")
         monkeypatch.delenv(key)
@@ -155,7 +163,7 @@ def _clear(monkeypatch, *keys):
 
 _ROLE_KEYS = (
     "DYN_FAILOVER_UPSTREAM_MEMORY",
-    "DYN_FAILOVER_UPSTREAM_BOOT_COHORT",
+    "DYN_FAILOVER_UPSTREAM_CONFIGURED_COHORT",
     "GMS_VLLM_WRITER_COHORT_PATH",
     "GMS_SGLANG_WRITER_COHORT_PATH",
     "SGLANG_WEIGHT_CACHE_KV_RESTORE_ROLE",

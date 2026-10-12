@@ -15,11 +15,23 @@ from dynamo.common import upstream_failover
 pytestmark = [pytest.mark.unit, pytest.mark.gpu_0, pytest.mark.pre_merge]
 
 
+@pytest.fixture(autouse=True)
+def _fresh_process(monkeypatch):
+    # Each test models a fresh engine process for mark_upstream_memory_active.
+    monkeypatch.setattr(upstream_failover, "_marked_pid", None)
+
+
 def test_mark_sets_mode_and_a_per_boot_crash_hint_cohort(monkeypatch, tmp_path):
     monkeypatch.setenv("FAILOVER_LOCK_PATH", str(tmp_path / "locks" / "failover.lock"))
-    monkeypatch.delenv(upstream_failover.UPSTREAM_MEMORY_ENV, raising=False)
-    monkeypatch.delenv("GMS_VLLM_WRITER_COHORT_PATH", raising=False)
-    monkeypatch.setenv(upstream_failover._BOOT_COHORT_ENV, "")
+    for key in (
+        upstream_failover.UPSTREAM_MEMORY_ENV,
+        "GMS_VLLM_WRITER_COHORT_PATH",
+        upstream_failover._CONFIGURED_COHORT_ENV,
+    ):
+        # setenv first: delenv records nothing for an absent key, and mark
+        # sets these in os.environ.
+        monkeypatch.setenv(key, "")
+        monkeypatch.delenv(key)
     upstream_failover.mark_upstream_memory_active("vllm")
     assert upstream_failover.upstream_memory_active()
     cohort = upstream_failover.os.environ["GMS_VLLM_WRITER_COHORT_PATH"]
@@ -112,8 +124,11 @@ def _boot(monkeypatch, tmp_path, backend="sglang"):
     lock = tmp_path / "locks" / "failover.lock.rank-3"
     monkeypatch.setenv("FAILOVER_LOCK_PATH", str(lock))
     env = upstream_failover._COHORT_ENVS[backend]
-    for key in (upstream_failover.UPSTREAM_MEMORY_ENV, env,
-                upstream_failover._BOOT_COHORT_ENV):
+    # Clear every backend's cohort: the liveness client reports the first one
+    # set, and other test modules may leave one behind in os.environ.
+    for key in (upstream_failover.UPSTREAM_MEMORY_ENV,
+                *upstream_failover._COHORT_ENVS.values(),
+                upstream_failover._CONFIGURED_COHORT_ENV):
         # setenv first: delenv records nothing for an absent key.
         monkeypatch.setenv(key, "")
         monkeypatch.delenv(key)
@@ -125,6 +140,7 @@ def _new_boot(monkeypatch, backend="sglang"):
     """Start the next engine boot on the same lock (a new process)."""
     env = upstream_failover._COHORT_ENVS[backend]
     monkeypatch.delenv(env)
+    monkeypatch.setattr(upstream_failover, "_marked_pid", None)
     upstream_failover.mark_upstream_memory_active(backend)
     return upstream_failover.os.environ[env]
 
@@ -155,6 +171,11 @@ def test_no_crash_hint_target_without_a_per_boot_cohort(monkeypatch, tmp_path):
     # A configured (shared across boots) cohort path could name a healthy
     # later boot: never advertise it.
     monkeypatch.setenv("GMS_SGLANG_WRITER_COHORT_PATH", str(tmp_path / "configured"))
+    monkeypatch.setattr(upstream_failover, "_marked_pid", None)
+    upstream_failover.mark_upstream_memory_active("sglang")
+    assert upstream_failover.os.environ["GMS_SGLANG_WRITER_COHORT_PATH"] == str(
+        tmp_path / "configured"
+    )
     assert not upstream_failover.advertise_crash_hint_target("sglang", 3, "tcp://x:1")
     monkeypatch.delenv(upstream_failover.UPSTREAM_MEMORY_ENV)
     assert not upstream_failover.advertise_crash_hint_target("sglang", 3, "tcp://x:1")
@@ -287,3 +308,80 @@ def test_takeover_hint_needs_upstream_mode(monkeypatch, tmp_path):
     monkeypatch.delenv(upstream_failover.UPSTREAM_MEMORY_ENV)
     assert upstream_failover.hint_predecessor_lost("sglang") is None
     assert upstream_failover.crash_hint_target_path(lock).exists()
+
+
+@pytest.mark.asyncio
+async def test_deployed_sglang_path_hints_through_the_isolated_liveness_client(
+    monkeypatch, tmp_path
+):
+    """The deployed SGLang order: mark upstream mode, then the guarded engine
+    replaces the cohort with a GMS writer cohort (prepare_writer_cohort), then
+    the non-leader starts its process-isolated liveness client and records
+    the target. The standby that wins the lock must fail-stop the leader.
+
+    Regression: the target used to be skipped silently because the cohort
+    no longer equalled the path generated at mark time.
+    """
+    pytest.importorskip("zmq")
+    pytest.importorskip("gpu_memory_service")
+    import asyncio
+    import threading as _threading
+    import time
+    from types import SimpleNamespace
+
+    from gpu_memory_service.integrations.sglang import writer_lifecycle
+
+    from dynamo.common import rank_liveness as rl
+    from dynamo.sglang import failover_watchdog
+
+    endpoint = _endpoint()
+    lock, _ = _boot(monkeypatch, tmp_path)
+    monkeypatch.setattr(writer_lifecycle, "_boot", None)
+    monkeypatch.setattr(writer_lifecycle, "_writer_fds", [])
+    writers = writer_lifecycle.prepare_writer_cohort()  # create_guarded_engine
+    cohort = upstream_failover.os.environ["GMS_SGLANG_WRITER_COHORT_PATH"]
+    assert cohort == str(writers)
+
+    calls, fired = [], _threading.Event()
+    monitor = rl.RankLivenessMonitor(
+        lambda r, reason: (calls.append((r, reason)), fired.set()),
+        bind_addr=endpoint,
+        timeout_ms_override=10_000,
+        expected_ranks={3},
+        broadcast_fence=True,
+    )
+    monitor.start()
+    monkeypatch.setenv("DYN_GMS_RANK_LIVENESS", "1")
+    monkeypatch.setenv("DYN_GMS_FAILOVER_SHADOW_MODE", "1")
+    monkeypatch.setenv("DYN_GMS_RANK_LIVENESS_ISOLATED", "1")
+    monkeypatch.setenv("DYN_GMS_RANK_LIVENESS_CONNECT_ADDR", endpoint)
+    client = failover_watchdog.maybe_start_rank_liveness(
+        SimpleNamespace(), object(), node_rank=3, leader_host="127.0.0.1"
+    )
+    try:
+        assert isinstance(client, rl.IsolatedRankLivenessClient)
+        assert upstream_failover.crash_hint_target_path(lock).exists()
+        from gpu_memory_service.common.gpu_failure_marker import (
+            gpu_failure_marker_path,
+        )
+
+        marker = str(gpu_failure_marker_path(cohort))
+        deadline = time.monotonic() + 20.0
+        while (
+            monitor._rank_failure_marker_paths.get(3) != marker
+            and time.monotonic() < deadline
+        ):
+            await asyncio.sleep(0.05)
+        assert monitor._rank_failure_marker_paths.get(3) == marker
+        # The engine-0 tree dies; the standby (a new process) wins the lock.
+        _new_boot(monkeypatch)
+        sender = upstream_failover.hint_predecessor_lost("sglang")
+        assert sender is not None
+        sender.join(2.0)
+        assert fired.wait(1.0)
+        assert calls == [(3, "gpu-crash-interlock-zmq")]
+    finally:
+        client.stop()
+        monitor.stop()
+        for fd in writer_lifecycle._writer_fds:
+            upstream_failover.os.close(fd)
