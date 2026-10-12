@@ -57,9 +57,10 @@ DEFAULT_LIVENESS_PORT = 29555
 DEFAULT_STARTUP_GRACE_MS = 30_000
 # Limit receive work per poll so a busy peer cannot starve lost-rank deadlines.
 _MAX_HEARTBEATS_PER_POLL = 64
-# Crash-hint sources whose reporting rank fail-stops itself right after the
-# hint (upstream_failover's engine-worker crash watch).
-_SELF_FAIL_STOP_SOURCES = frozenset({"engine-worker-exit"})
+# Crash-hint sources whose reported rank will not acknowledge a fence: the
+# engine-worker crash watch fail-stops its own rank right after the hint, and
+# a takeover hint reports a rank whose engine already lost its failover lock.
+_SELF_FAIL_STOP_SOURCES = frozenset({"engine-worker-exit", "failover-lock-takeover"})
 
 
 def _gpu_failure_marker_path(cohort: str):

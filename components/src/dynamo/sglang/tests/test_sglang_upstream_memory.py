@@ -41,7 +41,8 @@ def test_role_and_mapped_standby(monkeypatch, engine_id, role):
     # the keys so monkeypatch restores them and later GMS-mode tests stay GMS.
     for key in ("DYN_FAILOVER_UPSTREAM_MEMORY", "GMS_VLLM_WRITER_COHORT_PATH",
                 "GMS_SGLANG_WRITER_COHORT_PATH", "SGLANG_WEIGHT_CACHE_KV_RESTORE_ROLE",
-                "DYN_SGLANG_GMS_LOCK_BEFORE_INIT"):
+                "DYN_SGLANG_GMS_LOCK_BEFORE_INIT",
+                "DYN_FAILOVER_UPSTREAM_BOOT_COHORT"):
         # setenv first: delenv records nothing for an absent key.
         monkeypatch.setenv(key, "")
         monkeypatch.delenv(key)
@@ -143,3 +144,72 @@ def test_fence_kills_children_without_gms_proof_in_upstream_mode(monkeypatch):
     )
     assert failover_watchdog._fence_children(object())
     assert sorted(killed) == [11, 12]
+
+
+def _clear(monkeypatch, *keys):
+    for key in keys:
+        # setenv first: delenv records nothing for an absent key.
+        monkeypatch.setenv(key, "")
+        monkeypatch.delenv(key)
+
+
+_ROLE_KEYS = (
+    "DYN_FAILOVER_UPSTREAM_MEMORY",
+    "DYN_FAILOVER_UPSTREAM_BOOT_COHORT",
+    "GMS_VLLM_WRITER_COHORT_PATH",
+    "GMS_SGLANG_WRITER_COHORT_PATH",
+    "SGLANG_WEIGHT_CACHE_KV_RESTORE_ROLE",
+    "DYN_SGLANG_GMS_LOCK_BEFORE_INIT",
+)
+
+
+@pytest.mark.asyncio
+async def test_post_lock_fence_reports_the_previous_lock_holder(monkeypatch):
+    from dynamo.common import upstream_failover
+
+    calls = []
+    monkeypatch.setattr(
+        upstream_failover, "hint_predecessor_lost", lambda backend: calls.append(backend)
+    )
+    await upstream_memory.upstream_post_lock_fence("shadow")
+    assert calls == ["sglang"]
+
+
+@pytest.mark.asyncio
+async def test_worker_rank_liveness_advertises_its_crash_hint_target(
+    monkeypatch, tmp_path
+):
+    from dynamo.common import rank_liveness, upstream_failover
+    from dynamo.sglang import failover_watchdog
+
+    _clear(monkeypatch, *_ROLE_KEYS)
+    lock = tmp_path / "failover.lock.rank-2"
+    monkeypatch.setenv("FAILOVER_LOCK_PATH", str(lock))
+    monkeypatch.setenv("ENGINE_ID", "0")
+    monkeypatch.delenv("DYN_GMS_FAILOVER_PRIMARY_ENGINE_ID", raising=False)
+    upstream_memory.configure_kv_restore_role()
+
+    class Client:
+        def __init__(self, leader_host, rank, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setenv("DYN_GMS_RANK_LIVENESS", "1")
+    monkeypatch.setenv("DYN_GMS_FAILOVER_SHADOW_MODE", "1")
+    monkeypatch.setenv("DYN_GMS_RANK_LIVENESS_ISOLATED", "0")
+    monkeypatch.setenv(
+        "DYN_GMS_RANK_LIVENESS_CONNECT_ADDR", "tcp://{leader_host}:29555"
+    )
+    monkeypatch.setattr(rank_liveness, "RankLivenessClient", Client)
+    failover_watchdog.maybe_start_rank_liveness(
+        SimpleNamespace(), object(), node_rank=2, leader_host="leader.example"
+    )
+    record = upstream_failover.take_crash_hint_target("sglang", str(lock))
+    import os
+
+    assert record is not None
+    assert record["rank"] == 2
+    assert record["address"] == "tcp://leader.example:29555"
+    assert record["cohort"] == os.environ["GMS_SGLANG_WRITER_COHORT_PATH"]

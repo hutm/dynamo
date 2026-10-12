@@ -51,8 +51,8 @@ from dynamo.sglang.request_handlers import DecodeWorkerHandler, PrefillWorkerHan
 from dynamo.sglang.upstream_memory import (
     PromotingController,
     configure_kv_restore_role,
-    no_post_lock_fence,
     upstream_memory_enabled,
+    upstream_post_lock_fence,
 )
 
 
@@ -242,7 +242,7 @@ async def _prepare_non_leader_failover(
     }
     if upstream_memory_enabled(getattr(engine, "server_args", None)):
         # The leader promotes every rank's KV session in one collective.
-        failover_kwargs["post_lock_fence"] = no_post_lock_fence
+        failover_kwargs["post_lock_fence"] = upstream_post_lock_fence
         failover_kwargs["preconnect_gpu_proof"] = False
     if activation_barrier is not None:
         failover_kwargs["activation_barrier"] = activation_barrier
@@ -340,7 +340,9 @@ async def init_decode(
             prepare_writer_cohort()
         early_failover_activation = await acquire_gms_failover_lock_before_init(
             backend_name="sglang",
-            **({"post_lock_fence": no_post_lock_fence} if upstream_memory else {}),
+            **(
+                {"post_lock_fence": upstream_post_lock_fence} if upstream_memory else {}
+            ),
         )
 
     # Use pre-created engine if provided (snapshot mode)
@@ -500,7 +502,7 @@ async def init_decode(
                 handler._quiesce_controller, engine
             )
             upstream_failover_kwargs = {
-                "post_lock_fence": no_post_lock_fence,
+                "post_lock_fence": upstream_post_lock_fence,
                 "preconnect_gpu_proof": False,
             }
         activation_barrier = None

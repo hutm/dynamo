@@ -13,6 +13,7 @@ TP leader directly instead of waiting for heartbeat silence.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
@@ -24,6 +25,12 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 UPSTREAM_MEMORY_ENV = "DYN_FAILOVER_UPSTREAM_MEMORY"
+# The crash-hint cohort path this process generated for its own boot. Only a
+# path generated here is known to be unique to this engine boot, which is
+# what makes a takeover hint safe to send (see advertise_crash_hint_target).
+_BOOT_COHORT_ENV = "DYN_FAILOVER_UPSTREAM_BOOT_COHORT"
+CRASH_HINT_TARGET_SUFFIX = ".crash-hint-target"
+TAKEOVER_SOURCE = "failover-lock-takeover"
 _COHORT_ENVS = {
     "vllm": "GMS_VLLM_WRITER_COHORT_PATH",
     "sglang": "GMS_SGLANG_WRITER_COHORT_PATH",
@@ -45,6 +52,7 @@ def mark_upstream_memory_active(backend_name: str) -> None:
     directory = Path(lock_path).resolve().parent / ".upstream-crash-hints"
     directory.mkdir(parents=True, exist_ok=True)
     os.environ[env] = str(directory / uuid.uuid4().hex)
+    os.environ[_BOOT_COHORT_ENV] = os.environ[env]
 
 
 def upstream_memory_active() -> bool:
@@ -71,6 +79,12 @@ def _report_crash(backend_name: str, rank: int, pid: int, source: str) -> None:
     address = os.environ.get("DYN_GMS_RANK_LIVENESS_CONNECT_ADDR", "")
     if not address:
         return
+    _send_crash_hint(address, cohort, rank, pid, source)
+
+
+def _send_crash_hint(
+    address: str, cohort: str, rank: int, pid: int, source: str
+) -> None:
     try:
         import zmq
 
@@ -175,5 +189,146 @@ def start_child_crash_watch(
             time.sleep(poll_s)
 
     thread = threading.Thread(target=run, name="upstream-crash-watch", daemon=True)
+    thread.start()
+    return thread
+
+
+# ---------------------------------------------------------------------------
+# Takeover hint: a standby that wins a rank's failover lock reports that rank's
+# previous active engine as lost to that engine's TP leader.
+#
+# When the fault kills the active engine's whole process tree on a rank, the
+# crash watch dies with it and the leader would notice only at the liveness
+# timeout. The rank's standby, however, wins the per-rank lock as soon as the
+# kernel releases the dead holder's flock. The active engine therefore leaves
+# its crash-hint identity (its per-boot cohort path and its leader's liveness
+# address) next to that lock, and whoever acquires the lock next consumes it
+# and sends the hint.
+#
+# Safety: the leader's monitor accepts a hint only when its cohort path equals
+# the marker the reported rank advertised in its own heartbeats, and that path
+# is a fresh UUID per engine boot. A stale record (from a holder whose cohort
+# is long gone, or an address now bound by another cohort's leader) can only
+# name a boot that no live monitor still tracks for that rank, so it is
+# ignored. Losing the lock means the named engine no longer owns its rank, so
+# the hint is true whenever it is accepted.
+# ---------------------------------------------------------------------------
+
+
+def crash_hint_target_path(lock_path: str | None = None) -> Path:
+    lock_path = lock_path or os.environ.get(
+        "FAILOVER_LOCK_PATH", "/tmp/dynamo-failover.lock"
+    )
+    return Path(lock_path + CRASH_HINT_TARGET_SUFFIX)
+
+
+def advertise_crash_hint_target(
+    backend_name: str, rank: int, address: str, lock_path: str | None = None
+) -> bool:
+    """Record this rank's crash-hint identity next to its failover lock.
+
+    Call only while holding the rank's failover lock, after the liveness
+    client (which advertises the same cohort path in its heartbeats) is
+    configured for ``address``. Returns whether a record was written.
+    """
+    if not upstream_memory_active() or rank < 1 or not address:
+        return False
+    cohort = os.environ.get(_COHORT_ENVS[backend_name])
+    if not cohort or cohort != os.environ.get(_BOOT_COHORT_ENV):
+        # A configured (not per-boot) cohort path could be shared by a later
+        # boot; a hint naming it might match a healthy cohort.
+        return False
+    target = crash_hint_target_path(lock_path)
+    record = {
+        "version": 1,
+        "backend": backend_name,
+        "cohort": cohort,
+        "rank": int(rank),
+        "pid": os.getpid(),
+        "address": address,
+    }
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(record))
+        os.replace(tmp, target)
+    except OSError:
+        logger.warning(
+            "[upstream memory] could not record the crash-hint target at %s",
+            target,
+            exc_info=True,
+        )
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return False
+    logger.info(
+        "[upstream memory] rank %d crash-hint target recorded at %s", rank, target
+    )
+    return True
+
+
+def take_crash_hint_target(
+    backend_name: str, lock_path: str | None = None
+) -> dict | None:
+    """Consume the previous lock holder's crash-hint record, if valid."""
+    target = crash_hint_target_path(lock_path)
+    try:
+        raw = target.read_text()
+    except OSError:
+        return None
+    try:
+        target.unlink()
+    except OSError:
+        pass
+    try:
+        record = json.loads(raw)
+        if (
+            record.get("version") != 1
+            or record.get("backend") != backend_name
+            or not isinstance(record.get("cohort"), str)
+            or not record["cohort"]
+            or not isinstance(record.get("address"), str)
+            or not record["address"]
+            or int(record.get("rank", -1)) < 1
+            or int(record.get("pid", 0)) <= 0
+        ):
+            raise ValueError("invalid record")
+    except (ValueError, TypeError, AttributeError):
+        logger.warning("[upstream memory] ignoring a malformed crash-hint target")
+        return None
+    return record
+
+
+def hint_predecessor_lost(
+    backend_name: str, lock_path: str | None = None
+) -> threading.Thread | None:
+    """Right after this engine won its rank's failover lock, tell the previous
+    holder's TP leader that the holder's rank is lost.
+
+    Sends in the background: the hint is a latency optimisation and must not
+    delay this engine's own takeover.
+    """
+    if not upstream_memory_active():
+        return None
+    record = take_crash_hint_target(backend_name, lock_path)
+    if record is None:
+        return None
+    if record["cohort"] == os.environ.get(_COHORT_ENVS[backend_name]):
+        return None  # our own record: nothing to report
+    rank, pid = int(record["rank"]), int(record["pid"])
+    logger.warning(
+        "[upstream memory] took over rank %d from engine pid %d; sending its "
+        "leader a crash hint at %s",
+        rank,
+        pid,
+        record["address"],
+    )
+    thread = threading.Thread(
+        target=_send_crash_hint,
+        args=(record["address"], record["cohort"], rank, pid, TAKEOVER_SOURCE),
+        name="upstream-takeover-hint",
+        daemon=True,
+    )
     thread.start()
     return thread

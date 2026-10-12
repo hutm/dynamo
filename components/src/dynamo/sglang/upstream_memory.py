@@ -67,8 +67,17 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
-async def no_post_lock_fence(role: str) -> None:
-    """The daemon's promotion fences KV ownership; nothing GMS-side to do."""
+async def upstream_post_lock_fence(role: str) -> None:
+    """Runs right after this engine wins its rank's failover lock.
+
+    The daemon's promotion fences KV ownership, so there is nothing GMS-side
+    to do. If the lock's previous holder left a crash-hint target (its engine
+    tree died with it, so its own crash watch could not report), tell that
+    holder's TP leader now instead of letting it wait for heartbeat silence.
+    """
+    from dynamo.common.upstream_failover import hint_predecessor_lost
+
+    hint_predecessor_lost("sglang")
 
 
 class PromotingController:
