@@ -110,6 +110,28 @@ def _is_engine_worker(proc) -> bool:
     return "multiprocessing" in cmdline and "resource_tracker" not in cmdline
 
 
+_PF_EXITING = 0x4
+
+
+def _exiting(pid: int) -> bool:
+    """Whether the process has started to exit (or is gone). The kernel sets
+    PF_EXITING when do_exit begins; tearing down a worker's GPU mappings
+    can take another ~0.5 s before the process is reaped, and the crash hint
+    should not wait for that."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            stat = f.read()
+    except OSError:
+        return True
+    # Fields after the parenthesised comm: state ppid pgrp session tty_nr
+    # tpgid flags ...
+    fields = stat[stat.rindex(b")") + 2 :].split()
+    try:
+        return bool(int(fields[6]) & _PF_EXITING)
+    except (IndexError, ValueError):
+        return False
+
+
 def start_child_crash_watch(
     backend_name: str, rank: int, poll_s: float = 0.02
 ) -> threading.Thread:
@@ -137,7 +159,9 @@ def start_child_crash_watch(
             for pid, child in list(watched.items()):
                 try:
                     dead = (
-                        not child.is_running() or child.status() == psutil.STATUS_ZOMBIE
+                        _exiting(pid)
+                        or not child.is_running()
+                        or child.status() == psutil.STATUS_ZOMBIE
                     )
                 except psutil.NoSuchProcess:
                     dead = True

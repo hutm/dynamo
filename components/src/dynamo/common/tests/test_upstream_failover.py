@@ -89,3 +89,10 @@ def test_crash_hint_is_flushed_before_report_returns(monkeypatch, tmp_path):
     finally:
         router.close(0)
         ctx.term()
+
+
+def test_exiting_is_false_for_a_live_process_and_true_once_gone():
+    assert not upstream_failover._exiting(upstream_failover.os.getpid())
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait()
+    assert upstream_failover._exiting(child.pid)
