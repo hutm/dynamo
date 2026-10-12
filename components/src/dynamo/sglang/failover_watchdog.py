@@ -164,6 +164,13 @@ def _scheduler_dead(engine: Any) -> bool:
     return bool(pids) and any(not _pid_running(pid) for pid in pids)
 
 
+def _engine_child_pids(engine: Any) -> set[int]:
+    pids = set(_child_pids(engine))
+    processes, _names = _watchdog_processes(engine)
+    pids.update(int(proc.pid) for proc in processes if getattr(proc, "pid", None))
+    return pids
+
+
 def _fence_children(engine: Any, *, wait_s: float = 0.25) -> bool:
     # MPS can certify a survivor only while its CUDA client is still alive.
     # Attempt that proof before killing the CPU submitters in either mode.
@@ -176,6 +183,18 @@ def _fence_children(engine: Any, *, wait_s: float = 0.25) -> bool:
         cannot_run_user_code,
     )
 
+    from dynamo.common.upstream_failover import upstream_memory_active
+
+    if upstream_memory_active():
+        # The weight-cache daemon's KV restore fences the old writer itself:
+        # the successor's promotion revokes this session and quarantines its
+        # uncommitted pages until it is gone. There is no GMS/MPS proof to
+        # wait for, so kill the children and hand off at once.
+        for pid in _engine_child_pids(engine):
+            if _pid_running(pid):
+                _terminate_pid(pid)
+        return True
+
     frozen = frozen_predecessor_enabled("sglang")
     mps_enabled = gms_mps_provider_enabled("sglang")
     quiesced = not frozen_kill_before_gpu_proof(
@@ -187,9 +206,7 @@ def _fence_children(engine: Any, *, wait_s: float = 0.25) -> bool:
         # Do not destroy the registered CUDA client or relinquish the lock
         # after an uncertified MPS result. A retry may still obtain proof.
         return False
-    pids = set(_child_pids(engine))
-    processes, _names = _watchdog_processes(engine)
-    pids.update(int(proc.pid) for proc in processes if getattr(proc, "pid", None))
+    pids = _engine_child_pids(engine)
     kill_issued = True
     for pid in pids:
         if _pid_running(pid):
