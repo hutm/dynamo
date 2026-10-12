@@ -33,7 +33,7 @@ def _sleep(seconds):
     time.sleep(seconds)
 
 
-def _watch(monkeypatch):
+def _watch(monkeypatch, request):
     stopped = threading.Event()
     reports = []
     monkeypatch.setattr(
@@ -42,12 +42,20 @@ def _watch(monkeypatch):
         lambda backend, rank, pid, source: reports.append((backend, rank, source)),
     )
     monkeypatch.setattr(upstream_failover, "fail_stop", lambda reason: stopped.set())
-    upstream_failover.start_child_crash_watch("vllm", 3, poll_s=0.01)
+    # Stop the watch with the test: once monkeypatch restores the real
+    # fail_stop, a leftover watch would SIGKILL the test runner on the next
+    # multiprocessing child exit.
+    halt = threading.Event()
+    request.addfinalizer(halt.set)
+    thread = upstream_failover.start_child_crash_watch(
+        "vllm", 3, poll_s=0.01, stop=halt
+    )
+    request.addfinalizer(lambda: thread.join(timeout=1.0))
     return stopped, reports
 
 
-def test_worker_exit_reports_and_fail_stops(monkeypatch):
-    stopped, reports = _watch(monkeypatch)
+def test_worker_exit_reports_and_fail_stops(monkeypatch, request):
+    stopped, reports = _watch(monkeypatch, request)
     worker = multiprocessing.get_context("spawn").Process(target=_sleep, args=(1.0,))
     worker.start()
     try:
@@ -57,9 +65,9 @@ def test_worker_exit_reports_and_fail_stops(monkeypatch):
     assert reports and reports[0] == ("vllm", 3, "engine-worker-exit")
 
 
-def test_short_lived_helper_subprocess_is_not_a_crash(monkeypatch):
+def test_short_lived_helper_subprocess_is_not_a_crash(monkeypatch, request):
     # e.g. vLLM's model-inspection subprocess during config resolution
-    stopped, reports = _watch(monkeypatch)
+    stopped, reports = _watch(monkeypatch, request)
     subprocess.run([sys.executable, "-c", "import time; time.sleep(0.3)"], check=True)
     assert not stopped.wait(0.5)
     assert reports == []

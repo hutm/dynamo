@@ -133,7 +133,10 @@ def _exiting(pid: int) -> bool:
 
 
 def start_child_crash_watch(
-    backend_name: str, rank: int, poll_s: float = 0.02
+    backend_name: str,
+    rank: int,
+    poll_s: float = 0.02,
+    stop: threading.Event | None = None,
 ) -> threading.Thread:
     """Watch the engine worker processes this process spawns from now on; when
     one exits, tell the TP leader and fail-stop (the cohort cannot make
@@ -148,7 +151,7 @@ def start_child_crash_watch(
 
     def run() -> None:
         watched: dict[int, psutil.Process] = {}
-        while True:
+        while stop is None or not stop.is_set():
             for child in me.children():
                 if (
                     child.pid not in preexisting
