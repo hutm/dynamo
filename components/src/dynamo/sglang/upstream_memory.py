@@ -45,6 +45,9 @@ def configure_kv_restore_role() -> str:
     """Primary attaches as the KV writer, every other engine as a standby.
     The primary takes its failover lock before engine init (as in GMS mode);
     the standby pre-initializes with the pool mapped and paused."""
+    from dynamo.common.upstream_failover import mark_upstream_memory_active
+
+    mark_upstream_memory_active("sglang")
     role = WRITER if is_primary_engine() else STANDBY
     os.environ[ROLE_ENV] = role
     os.environ["DYN_SGLANG_GMS_LOCK_BEFORE_INIT"] = "1" if role == WRITER else "0"

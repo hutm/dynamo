@@ -746,6 +746,68 @@ def test_direct_gpu_crash_notification_accepts_registered_remote_rank(tmp_path):
         monitor.stop()
 
 
+def test_self_fail_stopping_crash_reporter_is_fenced_without_waiting_for_its_ack(
+    tmp_path,
+):
+    # The upstream-memory crash watch sends engine-worker-exit and then
+    # SIGKILLs its own launcher: it never acknowledges the fence, so waiting
+    # for its ack would only add the full ack deadline to every failover.
+    import zmq
+    from gpu_memory_service.common.gpu_failure_marker import gpu_failure_marker_path
+
+    leader_cohort = tmp_path / "rank-0-cohort"
+    remote_cohort = tmp_path / "rank-7-cohort"
+    leader_cohort.touch(mode=0o600)
+    remote_cohort.touch(mode=0o600)
+    remote_marker = str(gpu_failure_marker_path(remote_cohort))
+    endpoint = _endpoint()
+    fired = threading.Event()
+    calls: list[tuple[int, str]] = []
+    monitor = rl.RankLivenessMonitor(
+        lambda rank, reason: (calls.append((rank, reason)), fired.set()),
+        bind_addr=endpoint,
+        timeout_ms_override=5_000,
+        expected_ranks={7},
+        failure_marker_path=str(gpu_failure_marker_path(leader_cohort)),
+        broadcast_fence=True,
+    )
+
+    sender = zmq.Context.instance().socket(zmq.DEALER)
+    sender.setsockopt(zmq.IDENTITY, b"rank-7")
+    sender.setsockopt(zmq.LINGER, 0)
+    sender.connect(endpoint)
+    monitor.start()
+    try:
+        sender.send_multipart([remote_marker.encode(), b"hb"])
+        deadline = time.monotonic() + 0.5
+        while (
+            monitor._rank_failure_marker_paths.get(7) != remote_marker
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert monitor._rank_failure_marker_paths[7] == remote_marker
+        assert sender.poll(500)
+        assert sender.recv_multipart() in ([b"ack"], [b"startup-ack"])
+
+        sender.send_multipart(
+            [
+                b"gpu-failed-v1",
+                str(remote_cohort).encode(),
+                b"7",
+                b"1234",
+                b"engine-worker-exit",
+            ]
+        )
+        assert sender.poll(500)
+        assert sender.recv_multipart() == [b"fence"]
+        # No fence-ack: the monitor must fire well before its 100 ms deadline.
+        assert fired.wait(0.08)
+        assert calls == [(7, "gpu-crash-interlock-zmq")]
+    finally:
+        sender.close(0)
+        monitor.stop()
+
+
 def _tcp_endpoint() -> str:
     import socket
 

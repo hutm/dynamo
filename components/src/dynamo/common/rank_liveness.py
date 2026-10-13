@@ -57,6 +57,9 @@ DEFAULT_LIVENESS_PORT = 29555
 DEFAULT_STARTUP_GRACE_MS = 30_000
 # Limit receive work per poll so a busy peer cannot starve lost-rank deadlines.
 _MAX_HEARTBEATS_PER_POLL = 64
+# Crash-hint sources whose reporting rank fail-stops itself right after the
+# hint (upstream_failover's engine-worker crash watch).
+_SELF_FAIL_STOP_SOURCES = frozenset({"engine-worker-exit"})
 
 
 def _gpu_failure_marker_path(cohort: str):
@@ -538,7 +541,14 @@ class RankLivenessMonitor:
                                 source,
                             )
                             if self._broadcast_fence_enabled:
-                                self._broadcast_fence(sock, poller, last_seen)
+                                self._broadcast_fence(
+                                    sock,
+                                    poller,
+                                    last_seen,
+                                    no_ack_from=(
+                                        rank if source in _SELF_FAIL_STOP_SOURCES else None
+                                    ),
+                                )
                             self._fire(rank, "gpu-crash-interlock-zmq")
                             return
 
@@ -636,7 +646,9 @@ class RankLivenessMonitor:
             return None
         return rank, pid, source
 
-    def _broadcast_fence(self, sock, poller, last_seen) -> None:
+    def _broadcast_fence(
+        self, sock, poller, last_seen, no_ack_from: int | None = None
+    ) -> None:
         """Prompt surviving ranks to fail-stop before the leader releases ownership.
 
         The writer-cohort lock remains the correctness fence: takeover still waits
@@ -665,6 +677,9 @@ class RankLivenessMonitor:
                     rank,
                     exc_info=True,
                 )
+        # A rank whose crash hint says it fail-stops itself still gets the
+        # fence, but it will not live to acknowledge it.
+        pending.discard(no_ack_from)
 
         # Bound this optimization well below the normal heartbeat deadline. Ranks
         # that do not acknowledge still fail-stop when the leader disappears, and
