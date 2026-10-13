@@ -41,6 +41,14 @@ def test_enabled_only_for_ipc_cache_with_kv_restore():
     ],
 )
 def test_role_follows_the_primary_engine_id(monkeypatch, engine_id, primary_id, role):
+    # configure_kv_restore_role marks upstream mode in os.environ; register
+    # the keys so monkeypatch restores them and later GMS-mode tests stay GMS.
+    for key in ("DYN_FAILOVER_UPSTREAM_MEMORY", "GMS_VLLM_WRITER_COHORT_PATH",
+                "GMS_SGLANG_WRITER_COHORT_PATH", "SGLANG_WEIGHT_CACHE_KV_RESTORE_ROLE",
+                "DYN_SGLANG_GMS_LOCK_BEFORE_INIT"):
+        # setenv first: delenv records nothing for an absent key.
+        monkeypatch.setenv(key, "")
+        monkeypatch.delenv(key)
     monkeypatch.setenv("ENGINE_ID", engine_id)
     if primary_id is None:
         monkeypatch.delenv("DYN_GMS_FAILOVER_PRIMARY_ENGINE_ID", raising=False)

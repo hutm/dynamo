@@ -37,6 +37,14 @@ def test_enabled_only_for_client_mode_with_kv_restore(monkeypatch):
     "engine_id,role", [("0", "writer"), ("1", "standby"), ("2", "standby")]
 )
 def test_role_and_mapped_standby(monkeypatch, engine_id, role):
+    # configure_kv_restore_role marks upstream mode in os.environ; register
+    # the keys so monkeypatch restores them and later GMS-mode tests stay GMS.
+    for key in ("DYN_FAILOVER_UPSTREAM_MEMORY", "GMS_VLLM_WRITER_COHORT_PATH",
+                "GMS_SGLANG_WRITER_COHORT_PATH", "SGLANG_WEIGHT_CACHE_KV_RESTORE_ROLE",
+                "DYN_SGLANG_GMS_LOCK_BEFORE_INIT"):
+        # setenv first: delenv records nothing for an absent key.
+        monkeypatch.setenv(key, "")
+        monkeypatch.delenv(key)
     monkeypatch.setenv("ENGINE_ID", engine_id)
     monkeypatch.delenv("DYN_GMS_FAILOVER_PRIMARY_ENGINE_ID", raising=False)
     assert upstream_memory.configure_kv_restore_role() == role
@@ -108,3 +116,30 @@ async def test_prepare_failover_uses_the_injected_fence(monkeypatch):
     assert activation.enabled
     assert fences == ["active"]
     gms_fence.assert_not_awaited()
+
+
+def test_fence_kills_children_without_gms_proof_in_upstream_mode(monkeypatch):
+    # The cluster keeps the gms-mps provider for MPS recycling, but with
+    # upstream memory there is no GMS server to certify quiescence: waiting
+    # for that proof retained the active lock forever and blocked takeover.
+    import gpu_memory_service.integrations.common.gpu_quiescence as quiescence
+
+    from dynamo.common import upstream_failover
+    from dynamo.sglang import failover_watchdog
+
+    monkeypatch.setenv(upstream_failover.UPSTREAM_MEMORY_ENV, "1")
+    monkeypatch.setattr(quiescence, "gms_mps_provider_enabled", lambda _b: True)
+    monkeypatch.setattr(
+        failover_watchdog,
+        "quiesce_local_gpu_cohort_after_rank_loss",
+        lambda *a, **k: pytest.fail("upstream mode must not ask GMS for GPU proof"),
+    )
+    monkeypatch.setattr(failover_watchdog, "_child_pids", lambda _e: [11, 12])
+    monkeypatch.setattr(failover_watchdog, "_watchdog_processes", lambda _e: ([], []))
+    monkeypatch.setattr(failover_watchdog, "_pid_running", lambda _pid: True)
+    killed = []
+    monkeypatch.setattr(
+        failover_watchdog, "_terminate_pid", lambda pid: killed.append(pid) or True
+    )
+    assert failover_watchdog._fence_children(object())
+    assert sorted(killed) == [11, 12]
