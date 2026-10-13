@@ -201,11 +201,47 @@ pub struct Directory {
     root: PathBuf,
     p: PathBuf,
     ttl: Duration,
-    /// These are the files we created and hence must delete on shutdown
-    /// Files this process published, with the bytes it wrote. A file whose
-    /// contents changed belongs to another writer (a failover successor that
-    /// took over a shared logical-instance key) and is left alone.
-    owned_files: Arc<Mutex<HashMap<PathBuf, bytes::Bytes>>>,
+    /// Files this process published, and hence must keep alive and delete on
+    /// shutdown. Each entry holds an open handle on the inode this process
+    /// published. Every write publishes a fresh inode (temp file + rename or
+    /// link), so a path that no longer resolves to that inode belongs to
+    /// another writer, such as a failover successor that took over a shared
+    /// logical-instance key, even when it wrote identical bytes.
+    owned_files: Arc<Mutex<HashMap<PathBuf, OwnedFile>>>,
+}
+
+/// The inode this process published at a path. Holding the handle keeps the
+/// inode allocated, so its number cannot be reused by a later file at the
+/// same path while we still compare against it. `None` once keep-alive found
+/// the path taken over or removed: the key stays known as one this process
+/// wrote but no longer owns, so a later delete or shutdown leaves it alone.
+#[derive(Clone)]
+struct OwnedFile {
+    file: Option<Arc<File>>,
+}
+
+impl OwnedFile {
+    fn new(file: File) -> Self {
+        Self {
+            file: Some(Arc::new(file)),
+        }
+    }
+
+    fn lost() -> Self {
+        Self { file: None }
+    }
+
+    /// Whether `path` still resolves to the inode this process published.
+    fn still_at(&self, path: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt as _;
+        let Some(file) = &self.file else {
+            return false;
+        };
+        let (Ok(current), Ok(ours)) = (fs::metadata(path), file.metadata()) else {
+            return false;
+        };
+        current.dev() == ours.dev() && current.ino() == ours.ino()
+    }
 }
 
 struct DirectoryMutationLock {
@@ -249,19 +285,23 @@ impl Directory {
     /// touch the files we own so they don't get deleted by a different FileStore
     fn keep_alive(&self) {
         let owned_files = self.owned_files.lock().clone();
-        for (path, written) in owned_files {
-            if !still_ours(&path, &written) {
-                // Taken over (or removed): stop refreshing it.
-                self.owned_files.lock().remove(&path);
+        for (path, owned) in owned_files {
+            let Some(file) = owned.file.as_ref() else {
+                continue;
+            };
+            if !owned.still_at(&path) {
+                // Taken over (or removed): stop refreshing it, and never
+                // delete it later. Drop our handle on the replaced inode.
+                let mut owned_files = self.owned_files.lock();
+                if let Some(entry) = owned_files.get_mut(&path)
+                    && entry.file.as_ref().is_some_and(|f| Arc::ptr_eq(f, file))
+                {
+                    *entry = OwnedFile::lost();
+                }
                 continue;
             }
-            let file = match OpenOptions::new().write(true).open(&path) {
-                Ok(f) => f,
-                Err(err) => {
-                    tracing::error!(path = %path.display(), error = %err, "FileStore::keep_alive failed opening owned file");
-                    continue;
-                }
-            };
+            // Touch through our own handle: should the path be taken over in
+            // the meantime, this refreshes only our orphaned inode.
             if let Err(err) = file.set_modified(SystemTime::now()) {
                 tracing::error!(path = %path.display(), error = %err, "FileStore::keep_alive failed set_modified on owned file");
                 continue;
@@ -324,8 +364,8 @@ impl Directory {
             .lock_mutations_blocking()
             .map_err(anyhow::Error::from)?;
         let mut errs = Vec::new();
-        for (p, written) in self.owned_files.lock().drain() {
-            if !still_ours(&p, &written) {
+        for (p, owned) in self.owned_files.lock().drain() {
+            if !owned.still_at(&p) {
                 continue;
             }
             if let Err(err) = fs::remove_file(&p) {
@@ -358,12 +398,12 @@ impl Directory {
         )))
     }
 
-    fn write_temp_file(&self, value: &[u8]) -> Result<PathBuf, StoreError> {
+    fn write_temp_file(&self, value: &[u8]) -> Result<(PathBuf, OwnedFile), StoreError> {
         for _ in 0..TEMP_FILE_CREATE_ATTEMPTS {
             let temp_name = format!("{TEMP_FILE_PREFIX}{:016x}", rand::random::<u64>());
             let temp_path = self.p.join(&temp_name);
-            if write_temp_file_at(&temp_path, value)? {
-                return Ok(temp_path);
+            if let Some(file) = write_temp_file_at(&temp_path, value)? {
+                return Ok((temp_path, OwnedFile::new(file)));
             }
         }
 
@@ -398,7 +438,7 @@ impl Bucket for Directory {
         let str_path = full_path.display().to_string();
 
         let _mutation_lock = self.lock_mutations().await?;
-        let temp_path = self.write_temp_file(&value)?;
+        let (temp_path, owned) = self.write_temp_file(&value)?;
 
         if revision == 0 {
             // No-clobber publish for revision-zero inserts: the link fails if another
@@ -412,9 +452,7 @@ impl Bucket for Directory {
                             "Failed to remove FileStore temp file after create-if-absent publish"
                         );
                     }
-                    self.owned_files
-                        .lock()
-                        .insert(full_path.clone(), value.clone());
+                    self.owned_files.lock().insert(full_path.clone(), owned);
                     return Ok(StoreOutcome::Created(0));
                 }
                 Err(err) if err.kind() == ErrorKind::AlreadyExists => {
@@ -445,7 +483,7 @@ impl Bucket for Directory {
             .with_context(|| format!("renaming {} to {}", temp_path.display(), str_path))
             .map_err(a_to_fs_err)?;
 
-        self.owned_files.lock().insert(full_path.clone(), value);
+        self.owned_files.lock().insert(full_path.clone(), owned);
         Ok(StoreOutcome::Created(revision))
     }
 
@@ -470,7 +508,7 @@ impl Bucket for Directory {
             return Err(StoreError::Retry);
         }
 
-        let temp_path = self.write_temp_file(&value)?;
+        let (temp_path, owned) = self.write_temp_file(&value)?;
         if let Err(error) = fs::rename(&temp_path, &full_path) {
             if let Err(remove_error) = fs::remove_file(&temp_path) {
                 tracing::warn!(path = %temp_path.display(), %remove_error, "Failed to remove FileStore temp file after replace error");
@@ -482,7 +520,7 @@ impl Bucket for Directory {
             ))));
         }
 
-        self.owned_files.lock().insert(full_path, value);
+        self.owned_files.lock().insert(full_path, owned);
         Ok(StoreOutcome::Created(1))
     }
 
@@ -511,8 +549,8 @@ impl Bucket for Directory {
             return Err(StoreError::MissingKey(str_path));
         }
 
-        if let Some(written) = self.owned_files.lock().remove(&full_path)
-            && !still_ours(&full_path, &written)
+        if let Some(owned) = self.owned_files.lock().remove(&full_path)
+            && !owned.still_at(&full_path)
         {
             // Our record was taken over by a failover successor; deleting the
             // key now would unregister the successor.
@@ -687,19 +725,16 @@ impl Bucket for Directory {
     }
 }
 
-/// Whether `path` still holds exactly the bytes this process wrote.
-fn still_ours(path: &Path, written: &[u8]) -> bool {
-    fs::read(path).is_ok_and(|current| current == written)
-}
-
-fn write_temp_file_at(temp_path: &Path, value: &[u8]) -> Result<bool, StoreError> {
+/// Create `temp_path` holding `value`. Returns the open file, or `None` when
+/// the path already exists.
+fn write_temp_file_at(temp_path: &Path, value: &[u8]) -> Result<Option<File>, StoreError> {
     let mut file = match OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(temp_path)
     {
         Ok(file) => file,
-        Err(err) if err.kind() == ErrorKind::AlreadyExists => return Ok(false),
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => return Ok(None),
         Err(err) => {
             let err = anyhow::Error::new(err)
                 .context(format!("creating temp file {}", temp_path.display()));
@@ -720,7 +755,7 @@ fn write_temp_file_at(temp_path: &Path, value: &[u8]) -> Result<bool, StoreError
         return Err(a_to_fs_err(err));
     }
 
-    Ok(true)
+    Ok(Some(file))
 }
 
 fn canonicalize_event_path(path: &Path) -> PathBuf {
@@ -881,6 +916,90 @@ mod tests {
         );
     }
 
+    /// A successor that claims a record with identical bytes owns it: neither
+    /// the predecessor's delete nor its shutdown cleanup may remove it, and
+    /// the predecessor stops refreshing it.
+    #[tokio::test]
+    async fn successor_claim_of_identical_record_survives_predecessor_shutdown() {
+        let t = tempfile::tempdir().unwrap();
+        let predecessor_cancel = CancellationToken::new();
+        let successor_cancel = CancellationToken::new();
+        let predecessor = FileStore::new(predecessor_cancel.clone(), t.path());
+        let successor = FileStore::new(successor_cancel.clone(), t.path());
+        let predecessor_bucket = predecessor
+            .get_or_create_bucket("v1/tests", None)
+            .await
+            .unwrap();
+        let successor_bucket = successor
+            .get_or_create_bucket("v1/tests", None)
+            .await
+            .unwrap();
+        let deleted = Key::new("deleted".to_string());
+        let shut_down = Key::new("shut-down".to_string());
+        for key in [&deleted, &shut_down] {
+            predecessor_bucket
+                .insert(key, "same".into(), 0)
+                .await
+                .unwrap();
+            successor_bucket
+                .compare_and_replace(key, "same".into(), "same".into())
+                .await
+                .unwrap();
+        }
+
+        let path = |key: &Key| predecessor_bucket.p.join(key.url_safe().as_ref());
+        // The predecessor's keep-alive notices the takeover first (it runs
+        // every few seconds, so usually does before a graceful shutdown).
+        predecessor_bucket.keep_alive();
+        assert!(
+            predecessor_bucket
+                .owned_files
+                .lock()
+                .values()
+                .all(|owned| owned.file.is_none()),
+            "the predecessor still refreshes a record its successor claimed"
+        );
+
+        predecessor_bucket.delete(&deleted).await.unwrap();
+        predecessor.shutdown();
+        predecessor_cancel.cancel();
+
+        for key in [&deleted, &shut_down] {
+            assert_eq!(
+                successor_bucket.get(key).await.unwrap().as_deref(),
+                Some(b"same".as_slice()),
+                "{key} was deleted by its predecessor"
+            );
+        }
+        // The successor still owns them and deletes them on its own shutdown.
+        successor.shutdown();
+        successor_cancel.cancel();
+        assert!(!path(&deleted).exists());
+        assert!(!path(&shut_down).exists());
+    }
+
+    /// Records this process wrote and still owns are refreshed and deleted as
+    /// before.
+    #[tokio::test]
+    async fn owned_record_is_deleted_on_shutdown() {
+        let t = tempfile::tempdir().unwrap();
+        let cancel = CancellationToken::new();
+        let store = FileStore::new(cancel.clone(), t.path());
+        let bucket = store.get_or_create_bucket("v1/tests", None).await.unwrap();
+        let key = Key::new("mine".to_string());
+        bucket.insert(&key, "v1".into(), 0).await.unwrap();
+        bucket
+            .compare_and_replace(&key, "v1".into(), "v2".into())
+            .await
+            .unwrap();
+        bucket.keep_alive();
+        let path = bucket.p.join(key.url_safe().as_ref());
+        assert!(bucket.owned_files.lock()[&path].file.is_some());
+        store.shutdown();
+        cancel.cancel();
+        assert!(!path.exists());
+    }
+
     #[test]
     fn deleted_event_path_canonicalizes_existing_parent() {
         let t = tempfile::tempdir().unwrap();
@@ -985,7 +1104,7 @@ mod tests {
         fs::write(&temp_path, b"sentinel").unwrap();
         let created = super::write_temp_file_at(&temp_path, b"new").unwrap();
 
-        assert!(!created);
+        assert!(created.is_none());
         assert_eq!(fs::read(&temp_path).unwrap(), b"sentinel");
     }
 

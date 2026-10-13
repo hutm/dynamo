@@ -26,6 +26,12 @@ const EVENT_SOURCES_BUCKET: &str = "v1/event_sources";
 const UPDATE_MODEL_TAINTS_MAX_ATTEMPTS: usize = 8;
 
 /// Replace a failover-cohort record under the shared logical id with ours.
+///
+/// Always writes, even when the existing bytes already equal ours: cohort
+/// members publish the same logical id and often the same payload, and a
+/// record this process never wrote is not one it owns. The FileStore keeps
+/// alive only files it wrote, so a skipped write left the record refreshed
+/// by the fenced predecessor alone and swept 10 s after it died.
 async fn take_over_cohort_record(
     bucket: &dyn kv::Bucket,
     key: &kv::Key,
@@ -39,17 +45,19 @@ async fn take_over_cohort_record(
                 kv::StoreOutcome::Exists(_) => continue,
             }
         };
-        if existing == value {
-            return Ok(());
-        }
         // A successor's model card may differ from its predecessor's; watchers
         // see a same-id card replacement as the card removed and re-added.
+        let identical = existing == value;
         match bucket
             .compare_and_replace(key, existing, value.clone())
             .await
         {
             Ok(_) => {
-                tracing::info!(%key, "Took over failover-cohort discovery record");
+                if identical {
+                    tracing::info!(%key, "Claimed identical failover-cohort discovery record");
+                } else {
+                    tracing::info!(%key, "Took over failover-cohort discovery record");
+                }
                 return Ok(());
             }
             Err(kv::StoreError::Retry) | Err(kv::StoreError::MissingKey(_)) => continue,
@@ -574,6 +582,12 @@ impl Discovery for KVStoreDiscovery {
         if is_event_source && let Some(existing) = bucket.get(&key).await? {
             let existing: DiscoveryInstance = serde_json::from_slice(existing.as_ref())?;
             validate_event_source_reregistration(&existing, &instance)?;
+            if self.logical_instance_id.is_some() {
+                // The descriptor is identical, but a cohort member re-registering
+                // under the shared id must own the record, or it expires with its
+                // predecessor.
+                take_over_cohort_record(bucket.as_ref(), &key, &instance).await?;
+            }
             return Ok(existing);
         }
 
@@ -591,6 +605,9 @@ impl Discovery for KVStoreDiscovery {
                 };
                 let existing: DiscoveryInstance = serde_json::from_slice(existing.as_ref())?;
                 validate_event_source_reregistration(&existing, &instance)?;
+                if self.logical_instance_id.is_some() {
+                    take_over_cohort_record(bucket.as_ref(), &key, &instance).await?;
+                }
                 return Ok(existing);
             }
             Err(error) => return Err(error.into()),
@@ -601,6 +618,18 @@ impl Discovery for KVStoreDiscovery {
             key_path,
             outcome
         );
+
+        if self.logical_instance_id.is_some()
+            && is_event_source
+            && matches!(outcome, kv::StoreOutcome::Exists(_))
+            && let Some(existing) = bucket.get(&key).await?
+        {
+            // Lost a registration race to an identical cohort record: own it too.
+            let existing: DiscoveryInstance = serde_json::from_slice(existing.as_ref())?;
+            validate_event_source_reregistration(&existing, &instance)?;
+            take_over_cohort_record(bucket.as_ref(), &key, &instance).await?;
+            return Ok(existing);
+        }
 
         if self.logical_instance_id.is_some()
             && !is_event_source
@@ -1273,6 +1302,193 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert!(listed[0].1.contains("shadow"), "{listed:?}");
         cancel.cancel();
+    }
+
+    /// A cohort successor that publishes the same bytes as its predecessor must
+    /// still own every shared record, or the records expire with the
+    /// predecessor's last keep-alive once it is killed.
+    #[tokio::test]
+    async fn cohort_successor_owns_identical_records_after_predecessor_dies() {
+        let root = tempfile::tempdir().unwrap();
+        let primary_cancel = CancellationToken::new();
+        let shadow_cancel = CancellationToken::new();
+        let member = |cancel: &CancellationToken| {
+            KVStoreDiscovery::new(
+                kv::Manager::file(cancel.clone(), root.path()),
+                cancel.clone(),
+            )
+            .with_logical_instance_id(Some(0x2a))
+        };
+        let (primary, shadow) = (member(&primary_cancel), member(&shadow_cancel));
+        let endpoint = EndpointId {
+            namespace: "ns".to_string(),
+            component: "backend".to_string(),
+            name: "generate".to_string(),
+        };
+        let specs = || {
+            vec![
+                DiscoverySpec::Endpoint {
+                    namespace: "ns".to_string(),
+                    component: "backend".to_string(),
+                    endpoint: "generate".to_string(),
+                    device_type: None,
+                    request_plane_codec: None,
+                    // Both members publish the same address for the shared id.
+                    transport: TransportType::Nats("same".to_string()),
+                },
+                DiscoverySpec::EventChannel {
+                    scope: EventScope::Endpoint {
+                        endpoint: endpoint.clone(),
+                    },
+                    topic: "kv/events".to_string(),
+                    publisher_id: 0x2a,
+                    transport: EventTransport::zmq("tcp://127.0.0.1:5042".to_string()),
+                },
+                DiscoverySpec::EventSource {
+                    scope: EventScope::Endpoint {
+                        endpoint: endpoint.clone(),
+                    },
+                    topic: "kv/events".to_string(),
+                    publisher_id: 0x2a,
+                    metadata: serde_json::json!({"dp_rank": 0}),
+                },
+            ]
+        };
+        for spec in specs() {
+            primary.register(spec).await.unwrap();
+        }
+        for spec in specs() {
+            shadow.register(spec).await.unwrap();
+        }
+
+        let records = || {
+            let mut files = Vec::new();
+            let mut dirs = vec![root.path().to_path_buf()];
+            while let Some(dir) = dirs.pop() {
+                for entry in std::fs::read_dir(dir).unwrap() {
+                    let entry = entry.unwrap();
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if entry.file_type().unwrap().is_dir() {
+                        dirs.push(entry.path());
+                    } else if !name.starts_with(".tmp") && !name.starts_with('.') {
+                        files.push(entry.path());
+                    }
+                }
+            }
+            files.sort();
+            files
+        };
+        let published = records();
+        assert_eq!(published.len(), 3, "{published:?}");
+
+        // SIGKILL the predecessor: its keep-alive stops, and it deletes nothing.
+        primary_cancel.cancel();
+        // Age every record past the TTL, as if only the predecessor had ever
+        // refreshed them. The successor's next keep-alive must refresh them
+        // before its sweeper runs.
+        let aged = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        for path in &published {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(aged)
+                .unwrap();
+        }
+        let refreshed = |path: &std::path::PathBuf| {
+            std::fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .is_ok_and(|modified| modified > aged + std::time::Duration::from_secs(30))
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !published.iter().all(refreshed) {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("successor did not keep its records alive: {:?}", records()));
+        assert_eq!(records(), published);
+        shadow_cancel.cancel();
+    }
+
+    /// A predecessor that shuts down gracefully after its successor claimed the
+    /// identical cohort records must not delete them: the bytes are the same,
+    /// but the records are the successor's now.
+    #[tokio::test]
+    async fn graceful_predecessor_keeps_identical_records_claimed_by_successor() {
+        let root = tempfile::tempdir().unwrap();
+        let primary_cancel = CancellationToken::new();
+        let shadow_cancel = CancellationToken::new();
+        let member = |cancel: &CancellationToken| {
+            KVStoreDiscovery::new(
+                kv::Manager::file(cancel.clone(), root.path()),
+                cancel.clone(),
+            )
+            .with_logical_instance_id(Some(0x2b))
+        };
+        let (primary, shadow) = (member(&primary_cancel), member(&shadow_cancel));
+        let endpoint = EndpointId {
+            namespace: "ns".to_string(),
+            component: "backend".to_string(),
+            name: "generate".to_string(),
+        };
+        let specs = || {
+            vec![
+                DiscoverySpec::Endpoint {
+                    namespace: "ns".to_string(),
+                    component: "backend".to_string(),
+                    endpoint: "generate".to_string(),
+                    device_type: None,
+                    request_plane_codec: None,
+                    transport: TransportType::Nats("same".to_string()),
+                },
+                DiscoverySpec::EventChannel {
+                    scope: EventScope::Endpoint {
+                        endpoint: endpoint.clone(),
+                    },
+                    topic: "kv/events".to_string(),
+                    publisher_id: 0x2b,
+                    transport: EventTransport::zmq("tcp://127.0.0.1:5043".to_string()),
+                },
+            ]
+        };
+        let mut predecessor_instances = Vec::new();
+        for spec in specs() {
+            predecessor_instances.push(primary.register(spec).await.unwrap());
+        }
+        for spec in specs() {
+            shadow.register(spec).await.unwrap();
+        }
+        let records = || {
+            let mut files = Vec::new();
+            let mut dirs = vec![root.path().to_path_buf()];
+            while let Some(dir) = dirs.pop() {
+                for entry in std::fs::read_dir(dir).unwrap() {
+                    let entry = entry.unwrap();
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if entry.file_type().unwrap().is_dir() {
+                        dirs.push(entry.path());
+                    } else if !name.starts_with('.') {
+                        files.push((entry.path(), std::fs::read(entry.path()).unwrap()));
+                    }
+                }
+            }
+            files.sort();
+            files
+        };
+        let published = records();
+        assert_eq!(published.len(), 2, "{published:?}");
+
+        // Graceful predecessor shutdown: unregister everything, then the
+        // store's shutdown cleanup of the files it wrote.
+        for instance in predecessor_instances {
+            primary.unregister(instance).await.unwrap();
+        }
+        primary.shutdown();
+        primary_cancel.cancel();
+
+        assert_eq!(records(), published);
+        shadow_cancel.cancel();
     }
 
     #[tokio::test]

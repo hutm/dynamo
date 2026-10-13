@@ -1795,6 +1795,7 @@ where
                 return Err(error);
             }
         };
+        let transport = instance.transport.clone();
         let establish_timeout = self
             .establish_timeout
             .filter(|_| self.fault_detection_enabled);
@@ -1813,7 +1814,7 @@ where
             .generate(request)
             .instrument(route_span.clone())
             .await;
-        let stream = self.wrap_with_fault_detection(stream, instance_id, route_span)?;
+        let stream = self.wrap_with_fault_detection(stream, instance_id, transport, route_span)?;
         Ok((metadata, stream))
     }
 
@@ -1957,6 +1958,7 @@ where
         &self,
         stream: anyhow::Result<ManyOut<U>>,
         instance_id: u64,
+        transport: crate::component::TransportType,
         route_span: tracing::Span,
     ) -> anyhow::Result<ManyOut<U>> {
         let stream = match stream {
@@ -1968,7 +1970,7 @@ where
                         tracing::debug!(
                             "Reporting instance {instance_id} down due to error: {err}"
                         );
-                        self.client.report_instance_down(instance_id);
+                        self.client.report_instance_down_at(instance_id, &transport);
                     } else if match_error_chain(err.as_ref(), &[ErrorType::WorkerOverloaded], &[]) {
                         // Backpressure: the worker said "my queue is full,
                         // retry later". A bounded lease prevents an immediate
@@ -1992,6 +1994,7 @@ where
         let engine_ctx = stream.context();
         let client = self.client.clone();
         let client_for_timeout = self.client.clone();
+        let transport_for_timeout = transport.clone();
         let stream = stream.map(move |res| {
             if let Some(err) = res.err()
                 && is_inhibited(&err)
@@ -1999,7 +2002,7 @@ where
                 tracing::debug!(
                     "Reporting instance {instance_id} down due to migratable error: {err}"
                 );
-                client.report_instance_down(instance_id);
+                client.report_instance_down_at(instance_id, &transport);
             }
             res
         });
@@ -2023,7 +2026,8 @@ where
                                     timeout_secs = timeout.as_secs(),
                                     "backend response inactivity timeout — quarantining worker"
                                 );
-                                client_for_timeout.report_instance_down(instance_id);
+                                client_for_timeout
+                                    .report_instance_down_at(instance_id, &transport_for_timeout);
                                 yield U::from_err(
                                     crate::error::DynamoError::builder()
                                         .error_type(crate::error::ErrorType::ResponseTimeout)
@@ -2125,12 +2129,13 @@ where
             .observe(route_start.elapsed().as_secs_f64());
 
         let _nvtx_transport = dynamo_nvtx_range!(transport_kind);
+        let transport = instance.transport.clone();
         let stream: anyhow::Result<ManyOut<U>> = self
             .addressed
             .generate_bidirectional(instance, address, input)
             .instrument(route_span.clone())
             .await;
-        self.wrap_with_fault_detection(stream, instance_id, route_span)
+        self.wrap_with_fault_detection(stream, instance_id, transport, route_span)
     }
 }
 
