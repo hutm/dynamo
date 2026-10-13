@@ -648,15 +648,22 @@ def maybe_start_rank_liveness(
         def on_leader_lost(rank: int, reason: str) -> None:
             trigger_handoff(f"cross-node leader rank {rank} liveness lost ({reason})")
 
+        connect_addr = rl.leader_connect_addr(leader_host, cohort_identity)
         client = rl.new_client(
             leader_host,
             node_rank,
-            connect_addr=rl.leader_connect_addr(leader_host, cohort_identity),
+            connect_addr=connect_addr,
             on_leader_lost=on_leader_lost,
         )
         if target is not None:
             target._gms_rank_liveness_client = client
         client.start()
+        # This engine holds the rank's failover lock here. Should its whole
+        # process tree die, the standby that wins the lock reports it to this
+        # leader (no-op outside upstream-memory mode).
+        from dynamo.common.upstream_failover import advertise_crash_hint_target
+
+        advertise_crash_hint_target("sglang", node_rank, connect_addr)
         return client
 
     def on_rank_lost(rank: int, reason: str) -> None:

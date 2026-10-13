@@ -57,9 +57,10 @@ DEFAULT_LIVENESS_PORT = 29555
 DEFAULT_STARTUP_GRACE_MS = 30_000
 # Limit receive work per poll so a busy peer cannot starve lost-rank deadlines.
 _MAX_HEARTBEATS_PER_POLL = 64
-# Crash-hint sources whose reporting rank fail-stops itself right after the
-# hint (upstream_failover's engine-worker crash watch).
-_SELF_FAIL_STOP_SOURCES = frozenset({"engine-worker-exit"})
+# Crash-hint sources whose reported rank will not acknowledge a fence: the
+# engine-worker crash watch fail-stops its own rank right after the hint, and
+# a takeover hint reports a rank whose engine already lost its failover lock.
+_SELF_FAIL_STOP_SOURCES = frozenset({"engine-worker-exit", "failover-lock-takeover"})
 
 
 def _gpu_failure_marker_path(cohort: str):
@@ -181,9 +182,13 @@ class RankLivenessClient:
         timeout_ms_override: Optional[int] = None,
         startup_grace_ms_override: Optional[int] = None,
         startup_timeout_ms_override: Optional[int] = None,
+        failure_marker_path: Optional[str] = None,
     ):
         self._leader_host = leader_host
         self._rank = int(rank)
+        # The crash marker advertised in heartbeats; None reads this process's
+        # configured cohort when the heartbeat loop starts.
+        self._failure_marker_path = failure_marker_path
         self._interval = (interval_ms or heartbeat_ms()) / 1000.0
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -253,7 +258,11 @@ class RankLivenessClient:
         started = time.monotonic()
         last_ack: float | None = None
         previous_cycle_started = started
-        failure_marker = configured_gpu_failure_marker()
+        failure_marker = (
+            self._failure_marker_path
+            if self._failure_marker_path is not None
+            else configured_gpu_failure_marker()
+        )
         heartbeat = None if failure_marker is None else [failure_marker.encode(), b"hb"]
         try:
             while not self._stop.is_set():
@@ -1036,6 +1045,7 @@ class IsolatedRankLivenessClient:
         timeout_ms_override: Optional[int] = None,
         startup_grace_ms_override: Optional[int] = None,
         startup_timeout_ms_override: Optional[int] = None,
+        failure_marker_path: Optional[str] = None,
     ):
         self._rank = int(rank)
         self._on_leader_lost = on_leader_lost
@@ -1056,6 +1066,14 @@ class IsolatedRankLivenessClient:
                 timeout_ms_override=timeout_ms_override,
                 startup_grace_ms_override=startup_grace_ms_override,
                 startup_timeout_ms_override=startup_timeout_ms_override,
+                # Resolve the advertised crash marker here, from the cohort
+                # this process holds now: a helper (possibly prewarmed earlier)
+                # would otherwise read the cohort from its spawn-time env.
+                failure_marker_path=(
+                    configured_gpu_failure_marker()
+                    if failure_marker_path is None
+                    else failure_marker_path
+                ),
                 tick_ms=interval_ms or heartbeat_ms(),
             ),
             self._on_event,
@@ -1161,6 +1179,7 @@ def _helper_main(role: str, spec_json: str) -> None:
             timeout_ms_override=spec.get("timeout_ms_override"),
             startup_grace_ms_override=spec.get("startup_grace_ms_override"),
             startup_timeout_ms_override=spec.get("startup_timeout_ms_override"),
+            failure_marker_path=spec.get("failure_marker_path"),
         )
         inner.start()
 
