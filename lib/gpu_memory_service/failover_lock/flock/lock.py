@@ -65,6 +65,8 @@ class FlockFailoverLock(FailoverLock):
         fd: int | None = None
         start = time.monotonic()
         try:
+            # The lock directory may not exist yet on a fresh shared volume.
+            os.makedirs(os.path.dirname(self._lock_path) or ".", exist_ok=True)
             fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR)
             while True:
                 with self._state_lock:

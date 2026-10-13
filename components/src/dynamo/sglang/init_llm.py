@@ -48,6 +48,12 @@ from dynamo.sglang.publisher import (
 )
 from dynamo.sglang.register import register_model_with_readiness_gate
 from dynamo.sglang.request_handlers import DecodeWorkerHandler, PrefillWorkerHandler
+from dynamo.sglang.upstream_memory import (
+    PromotingController,
+    configure_kv_restore_role,
+    no_post_lock_fence,
+    upstream_memory_enabled,
+)
 
 
 def _shadow_mode_enabled() -> bool:
@@ -234,6 +240,10 @@ async def _prepare_non_leader_failover(
         "tags": ["kv_cache"],
         "promotion_warmup": None,
     }
+    if upstream_memory_enabled(getattr(engine, "server_args", None)):
+        # The leader promotes every rank's KV session in one collective.
+        failover_kwargs["post_lock_fence"] = no_post_lock_fence
+        failover_kwargs["preconnect_gpu_proof"] = False
     if activation_barrier is not None:
         failover_kwargs["activation_barrier"] = activation_barrier
     failover_activation = await prepare_gms_failover(
@@ -295,7 +305,11 @@ async def init_decode(
 ) -> None:
     server_args, dynamo_args = config.server_args, config.dynamo_args
     _scope_failover_lock_to_node_rank(server_args)
-    if _shadow_mode_enabled():
+    upstream_memory = _shadow_mode_enabled() and upstream_memory_enabled(server_args)
+    if upstream_memory:
+        # Before the engine starts: the daemon session's role is read at init.
+        configure_kv_restore_role()
+    elif _shadow_mode_enabled():
         arm_frozen_shadow_headroom("sglang")
     _validate_gms_tp_topology(server_args)
     _enable_gms_nccl_prewarm(server_args)
@@ -314,7 +328,7 @@ async def init_decode(
     early_failover_activation = None
     lock_before_init = os.environ.get("DYN_SGLANG_GMS_LOCK_BEFORE_INIT", "1").lower()
     if lock_before_init not in {"0", "false", "no", "off"}:
-        if _shadow_mode_enabled():
+        if _shadow_mode_enabled() and not upstream_memory:
             from gpu_memory_service.integrations.sglang.writer_lifecycle import (
                 prepare_writer_cohort,
             )
@@ -325,7 +339,8 @@ async def init_decode(
             # successor will fence. vLLM follows the same ordering.
             prepare_writer_cohort()
         early_failover_activation = await acquire_gms_failover_lock_before_init(
-            backend_name="sglang"
+            backend_name="sglang",
+            **({"post_lock_fence": no_post_lock_fence} if upstream_memory else {}),
         )
 
     # Use pre-created engine if provided (snapshot mode)
@@ -479,6 +494,15 @@ async def init_decode(
                 engine,
                 release_memory_on_quiesce=not _uses_mapped_sleeping_standby(),
             )
+        upstream_failover_kwargs = {}
+        if upstream_memory:
+            handler._quiesce_controller = PromotingController(
+                handler._quiesce_controller, engine
+            )
+            upstream_failover_kwargs = {
+                "post_lock_fence": no_post_lock_fence,
+                "preconnect_gpu_proof": False,
+            }
         activation_barrier = None
         if server_args.nnodes and server_args.nnodes > 1:
             # Bind the shadow leader's liveness endpoint before waiting for its
@@ -524,8 +548,11 @@ async def init_decode(
             # namespace so promotion does not remap weights on the hot path.
             tags=["kv_cache"],
             promotion_warmup=promotion_warmup,
-            warm_standby_before_quiesce=_can_prewarm_mapped_standby(),
+            warm_standby_before_quiesce=(
+                not upstream_memory and _can_prewarm_mapped_standby()
+            ),
             activation_barrier=activation_barrier,
+            **upstream_failover_kwargs,
         )
         failover_activation.attach_to(handler)
     maybe_start_gms_failover_child_watchdog(handler, engine)

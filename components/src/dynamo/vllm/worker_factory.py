@@ -43,6 +43,10 @@ from dynamo.common.utils.prometheus import (
 )
 from dynamo.llm import ModelInput, ModelType, WorkerType, register_model
 from dynamo.runtime import DistributedRuntime, Endpoint
+from dynamo.vllm.upstream_memory import is_primary_engine
+from dynamo.vllm.upstream_memory import promote_standby as upstream_promote_standby
+from dynamo.vllm.upstream_memory import upstream_memory_enabled
+from dynamo.vllm.upstream_memory import warm_up_standby as upstream_warm_up_standby
 
 from .args import Config
 from .cache_info import configure_kv_event_block_size
@@ -2548,6 +2552,19 @@ class WorkerFactory:
         """
         if not config.gms_shadow_mode:
             return None, False
+        if upstream_memory_enabled(getattr(config, "engine_args", None)):
+            if not is_primary_engine():
+                # The standby maps the daemon's weights and KV pool and stays
+                # paused; it takes the lock only on takeover.
+                self._maybe_start_rank_liveness_monitor(None, config)
+                return None, False
+            # Like GMS mode, the primary owns the lock before engine init so a
+            # standby that finishes init first cannot win the initial election.
+            runtime.set_health_status(True)
+            lock = await self._acquire_failover_lock()
+            self._maybe_start_rank_liveness_monitor(None, config, failover_lock=lock)
+            logger.info("[Primary] Failover lock acquired before vLLM engine init")
+            return lock, True
         recovery_mode = (
             os.environ.setdefault("GMS_VLLM_KV_RECOVERY_MODE", "granular")
             .strip()
@@ -2637,6 +2654,15 @@ class WorkerFactory:
         """Elect one active GMS writer and prepare it before discovery registration."""
         if not config.gms_shadow_mode:
             return False
+        if upstream_memory_enabled(getattr(config, "engine_args", None)):
+            return await self._upstream_memory_failover(
+                handler,
+                runtime,
+                config,
+                failover_metrics,
+                promotion_warmup=promotion_warmup,
+                lock_already_acquired=lock_already_acquired,
+            )
         arm_frozen_shadow_headroom("vllm")
 
         if lock_already_acquired:
@@ -2796,6 +2822,92 @@ class WorkerFactory:
             raise
         claim_discovery_for_active_engine(handler)
         logger.info("[Shadow] Engine awake, registering with discovery")
+        return was_contended
+
+    async def _upstream_memory_failover(
+        self,
+        handler,
+        runtime: DistributedRuntime,
+        config: Config,
+        failover_metrics=None,
+        *,
+        promotion_warmup: Callable[[], Awaitable[None]] | None = None,
+        lock_already_acquired: bool = False,
+    ) -> bool:
+        """Active/standby election when vLLM's weight-cache daemon owns memory.
+
+        The primary takes the lock and serves. The standby already maps the
+        daemon's weights and the primary's KV pool; it stays paused and
+        undiscoverable until it holds the lock, then promotes its KV sessions
+        (adopting the committed prefix directory, quarantining the dead
+        writer's in-flight blocks) and resumes.
+        """
+        if is_primary_engine():
+            if not lock_already_acquired:
+                logger.info("[Primary] Acquiring active failover lock before discovery")
+                lock = await self._acquire_failover_lock()
+                setattr(handler, "_gms_failover_lock", lock)
+            if promotion_warmup is not None:
+                await promotion_warmup()
+            self._maybe_start_rank_liveness_monitor(handler, config)
+            await wait_for_armed_standby_before_serving("vllm")
+            claim_discovery_for_active_engine(handler)
+            return False
+
+        # Before arming, as GMS mode prewarms its mapped standby: the primary
+        # serves only once a standby is armed, so this costs startup time, not
+        # live-traffic latency, and the promoted engine runs no first-use JIT.
+        started = _time.monotonic()
+        warmed = await upstream_warm_up_standby(handler.engine_client)
+        if warmed:
+            logger.info(
+                "[Shadow] Prewarmed %d batch sizes without KV writes in %.1f s",
+                warmed,
+                _time.monotonic() - started,
+            )
+        await handler._pause_controller.pause_generation_only(clear_cache=False)
+        if failover_metrics is not None:
+            failover_metrics.set_state("standby")
+        runtime.set_health_status(True)
+        logger.info(
+            "[Shadow] Engine sleeping, waiting for failover lock "
+            "(standby paused on the weight-cache daemon's weights and KV pool)"
+        )
+        lock = await acquire_lock_while_armed(
+            f"engine-{os.environ.get('ENGINE_ID', '0')}", self._acquire_failover_lock
+        )
+        setattr(handler, "_gms_failover_lock", lock)
+        was_contended = bool(getattr(lock, "was_contended", False))
+        if failover_metrics is not None:
+            failover_metrics.set_state("waking")
+            if was_contended:
+                failover_metrics.record_switch_attempt()
+        try:
+            started = _time.monotonic()
+            adopted = await upstream_promote_standby(handler.engine_client)
+            logger.info(
+                "[Shadow] KV sessions promoted: adopted %d prefix blocks in %.1f ms",
+                adopted,
+                (_time.monotonic() - started) * 1000.0,
+            )
+            await handler._pause_controller.resume([])
+            handler._pause_controller.mark_resumed()
+            if promotion_warmup is not None:
+                await promotion_warmup()
+            self._maybe_start_rank_liveness_monitor(handler, config, failover_lock=lock)
+        except BaseException:
+            # A half-promoted standby may already write the shared pool; keep
+            # the lock until this process is gone rather than admit a second
+            # writer.
+            runtime.set_health_status(False)
+            logger.critical(
+                "[Shadow] Upstream-memory promotion failed; exiting with the lock held",
+                exc_info=True,
+            )
+            os.kill(os.getpid(), signal.SIGTERM)
+            raise
+        claim_discovery_for_active_engine(handler)
+        logger.info("[Shadow] Engine promoted, registering with discovery")
         return was_contended
 
     async def _create_decode_worker(
